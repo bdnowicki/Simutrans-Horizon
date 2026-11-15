@@ -528,6 +528,7 @@ SOURCES += src/simutrans/network/network_cmp_pakset.cc
 SOURCES += src/simutrans/network/network_file_transfer.cc
 SOURCES += src/simutrans/network/network_packet.cc
 SOURCES += src/simutrans/network/network_socket_list.cc
+SOURCES += src/simutrans/network/remote_control.cc
 SOURCES += src/simutrans/network/pakset_info.cc
 SOURCES += src/simutrans/obj/baum.cc
 SOURCES += src/simutrans/obj/bruecke.cc

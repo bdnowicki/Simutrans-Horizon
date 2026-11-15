@@ -44,6 +44,25 @@ void gui_tab_panel_t::add_tab(gui_component_t *c, const char *name, const skin_d
 }
 
 
+void gui_tab_panel_t::get_tab_headers(vector_tpl<tab_header_t> &headers) const
+{
+	// same layout as in infowin_event() and draw()
+	int text_x = (required_size.w>size.w ? D_ARROW_LEFT_WIDTH : 0) + D_H_SPACE - tab_offset_x;
+	const gui_component_t *active = get_aktives_tab();
+	for(tab const& i : tabs) {
+		if (!i.component->is_visible()) {
+			continue;
+		}
+		tab_header_t h;
+		h.title = i.title;
+		h.tooltip = i.tooltip;
+		h.area = scr_rect(text_x, 0, i.width, required_size.h);
+		h.active = i.component == active;
+		headers.append(h);
+		text_x += i.width;
+	}
+}
+
 
 
 void gui_tab_panel_t::set_size(scr_size size)

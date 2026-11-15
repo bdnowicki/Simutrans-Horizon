@@ -80,6 +80,7 @@
 #include "dataobj/settings.h"
 #include "dataobj/translator.h"
 #include "network/pakset_info.h"
+#include "network/remote_control.h"
 
 #include "descriptor/reader/obj_reader.h"
 #include "descriptor/sound_desc.h"
@@ -415,6 +416,8 @@ void print_help()
 		" -res N              starts in specified resolution: \n"
 		"                      1=640x480, 2=800x600, 3=1024x768, 4=1280x1024\n"
 		" -scenario NAME      Load scenario NAME\n"
+		" -remote_control [PORT] accept automation commands on 127.0.0.1\n"
+		"                     (see tools/mcp/README.md), default port 13360\n"
 		" -screensize WxH     set screensize to width W and height H\n"
 		" -server [PORT]      starts program as server (for network game)\n"
 		"                     without port specified uses 13353\n"
@@ -1687,6 +1690,18 @@ int simu_main(int argc, char** argv)
 
 	simachievements_t::check_pakset_ach();
 
+	if(  args.has_arg("-remote_control")  ) {
+		// local automation interface, see network/remote_control.h
+		const char *p = args.gimme_arg("-remote_control", 1);
+		int port = (p  &&  *p != '-') ? atoi(p) : 0;
+		if(  port <= 0  ||  port > 65535  ) {
+			port = 13360;
+		}
+		if(  !remote_control_init(port)  ) {
+			dbg->error("simu_main()", "Could not start remote control on port %d", port);
+		}
+	}
+
 	while(  !env_t::quit_simutrans  ) {
 		// play next tune?
 		check_midi();
@@ -1727,6 +1742,8 @@ int simu_main(int argc, char** argv)
 
 		dbg->message("simu_main()", "World finished ..." );
 	}
+
+	remote_control_shutdown();
 
 	intr_disable();
 

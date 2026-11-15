@@ -235,6 +235,7 @@
     <ClCompile Include="$(MSBuildThisFileDirectory)src\simutrans\network\network_file_transfer.cc" />
     <ClCompile Include="$(MSBuildThisFileDirectory)src\simutrans\network\network_packet.cc" />
     <ClCompile Include="$(MSBuildThisFileDirectory)src\simutrans\network\network_socket_list.cc" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)src\simutrans\network\remote_control.cc" />
     <ClCompile Include="$(MSBuildThisFileDirectory)src\simutrans\network\pakset_info.cc" />
     <ClCompile Include="$(MSBuildThisFileDirectory)src\simutrans\obj\baum.cc" />
     <ClCompile Include="$(MSBuildThisFileDirectory)src\simutrans\obj\bruecke.cc" />
@@ -616,6 +617,7 @@
     <ClInclude Include="$(MSBuildThisFileDirectory)src\simutrans\network\network.h" />
     <ClInclude Include="$(MSBuildThisFileDirectory)src\simutrans\network\network_packet.h" />
     <ClInclude Include="$(MSBuildThisFileDirectory)src\simutrans\network\network_socket_list.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)src\simutrans\network\remote_control.h" />
     <ClInclude Include="$(MSBuildThisFileDirectory)src\simutrans\network\pakset_info.h" />
     <ClInclude Include="$(MSBuildThisFileDirectory)src\simutrans\obj\baum.h" />
     <ClInclude Include="$(MSBuildThisFileDirectory)src\simutrans\obj\bruecke.h" />

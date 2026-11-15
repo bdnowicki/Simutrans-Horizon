@@ -72,6 +72,18 @@ public:
 
 	gui_component_t* get_tab( uint8 i ) const { return i < tabs.get_count() ? tabs.at(i).component : NULL; }
 
+	/// a visible tab header, area is relative to the tab panel
+	struct tab_header_t
+	{
+		const char *title;
+		const char *tooltip;
+		scr_rect area;
+		bool active;
+	};
+
+	/// visible tab headers, e.g. for GUI inspection by remote control
+	void get_tab_headers(vector_tpl<tab_header_t> &headers) const;
+
 	int get_active_tab_index() const { return min((int)tabs.get_count()-1,active_tab); }
 	void set_active_tab_index( int i ) { active_tab = min((int)tabs.get_count()-1,i); }
 

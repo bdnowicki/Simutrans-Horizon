@@ -129,6 +129,9 @@ protected:
 	 */
 	void reset_min_windowsize();
 public:
+	/// read only access to the top level components, e.g. for GUI inspection by remote control
+	using gui_aligned_container_t::get_components;
+
 	/**
 	 * Get minimum size of the window
 	 */

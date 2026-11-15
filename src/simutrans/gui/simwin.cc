@@ -19,6 +19,7 @@
 #include "../simintr.h"
 #include "../simhalt.h"
 #include "../world/simworld.h"
+#include "../network/remote_control.h"
 #include "../utils/simrandom.h"
 
 #include "../dataobj/translator.h"
@@ -2675,6 +2676,9 @@ void modal_dialogue(gui_frame_t* gui, ptrdiff_t magic, karte_t* welt, bool (*qui
 
 		while (gui && win_is_open(gui) && !env_t::quit_simutrans && !quit()) {
 			frame_start_time = dr_time();
+
+			// requests from the local automation interface (-remote_control)
+			remote_control_poll();
 
 			do {
 				DBG_DEBUG4("modal_dialogue", "calling win_poll_event");

@@ -41,6 +41,9 @@ public:
 	// needed for WIN_OPEN events
 	void clear_dirty() { list_dirty=false; }
 
+	/// read only access to the children, e.g. for GUI inspection by remote control
+	const vector_tpl<gui_component_t *> &get_components() const { return components; }
+
 	void set_checkered(bool c) { checkered = c; }
 
 	/**

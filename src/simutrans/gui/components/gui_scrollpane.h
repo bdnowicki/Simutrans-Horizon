@@ -57,6 +57,7 @@ public:
 	gui_scrollpane_t(gui_component_t *comp, bool b_scroll_x = false, bool b_scroll_y = true);
 
 	void set_component(gui_component_t *comp) { this->comp = comp; }
+	gui_component_t *get_component() const { return comp; }
 
 	void set_allow_dragging(bool b) { b_can_drag = b;  }
 

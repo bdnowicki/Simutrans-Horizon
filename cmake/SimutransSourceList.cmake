@@ -219,6 +219,7 @@ target_sources(simutrans PRIVATE
 	src/simutrans/network/network_file_transfer.cc
 	src/simutrans/network/network_packet.cc
 	src/simutrans/network/network_socket_list.cc
+	src/simutrans/network/remote_control.cc
 	src/simutrans/network/pakset_info.cc
 	src/simutrans/obj/baum.cc
 	src/simutrans/obj/bruecke.cc

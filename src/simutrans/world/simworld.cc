@@ -77,6 +77,7 @@
 #include "../network/network_file_transfer.h"
 #include "../network/network_socket_list.h"
 #include "../network/network_cmd_ingame.h"
+#include "../network/remote_control.h"
 
 #include "../dataobj/height_map_loader.h"
 #include "../dataobj/ribi.h"
@@ -6331,6 +6332,9 @@ bool karte_t::interactive(uint32 quit_month)
 		if (env_t::quit_simutrans){
 			break;
 		}
+
+		// requests from the local automation interface (-remote_control)
+		remote_control_poll();
 
 		if (next_deferred_move_to != koord3d::invalid) {
 			// some tool movement is expensive (like route search) and must be done outsied sync_step
