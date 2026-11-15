@@ -117,13 +117,12 @@ void bridge_builder_t::fill_menu(tool_selector_t *tool_selector, const waytype_t
 	}
 	bool enable = welt->get_scenario()->is_tool_enabled(welt->get_active_player(), TOOL_BUILD_BRIDGE | GENERAL_TOOL, wtyp, 0);
 
-	const uint16 time = welt->get_timeline_year_month();
 	vector_tpl<const bridge_desc_t*> matching(desc_table.get_count());
 
 	// list of matching types (sorted by speed)
 	for(auto const& i : desc_table) {
 		bridge_desc_t const* const b = i.value;
-		if (  b->get_waytype()==wtyp  &&  b->is_available(time)  ) {
+		if (  b->get_waytype()==wtyp  &&  welt->is_available_for_players(b)  ) {
 			if (welt->get_scenario()->is_tool_allowed(welt->get_active_player(), TOOL_BUILD_BRIDGE | GENERAL_TOOL, wtyp,b->get_name())) {
 				matching.insert_ordered(b, compare_bridges);
 			}

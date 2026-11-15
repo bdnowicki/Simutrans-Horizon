@@ -587,13 +587,11 @@ void wayobj_t::fill_menu(tool_selector_t *tool_selector, waytype_t wtyp, sint16 
 	}
 	bool enable = welt->get_scenario()->is_tool_enabled(welt->get_active_player(), TOOL_BUILD_WAYOBJ | GENERAL_TOOL, wtyp, 0 );
 
-	const uint16 time=welt->get_timeline_year_month();
-
 	vector_tpl<const way_obj_desc_t *>matching;
 
 	for(auto const& i : table) {
 		way_obj_desc_t const* const desc = i.value;
-		if(  desc->is_available(time)  ) {
+		if(  welt->is_available_for_players(desc)  ) {
 
 			DBG_DEBUG("wayobj_t::fill_menu()", "try to add %s(%p)", desc->get_name(), desc);
 			// only add items with a cursor

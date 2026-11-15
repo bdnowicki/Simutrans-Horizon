@@ -316,6 +316,8 @@ void depot_frame_t::init(depot_t *dep)
 		// put columns 1-4 in extra container to force correct button width in last column
 		gui_aligned_container_t *cont_4cols = new_component_span<gui_aligned_container_t>(4,0,3);
 
+		// both checkboxes share the first column
+		cont_4cols->add_table(2,1);
 		bt_obsolete.init(button_t::square_state, "Show obsolete");
 		bt_obsolete.pressed = show_retired_vehicles;
 		if(  welt->get_settings().get_allow_buying_obsolete_vehicles()  ) {
@@ -326,6 +328,13 @@ void depot_frame_t::init(depot_t *dep)
 		else {
 			cont_4cols->new_component<gui_fill_t>();
 		}
+		// same option as "Show future objects" in the display settings (also offers future ways etc. in the toolbars)
+		bt_future.init(button_t::square_state, "Show future");
+		bt_future.pressed = welt->allow_future_objects();
+		bt_future.add_listener(this);
+		bt_future.set_tooltip("Show and allow to buy also vehicles not yet in production.");
+		cont_4cols->add_component(&bt_future);
+		cont_4cols->end_table();
 
 		cont_4cols->new_component<gui_label_t>("Filter:", SYSCOL_TEXT, gui_label_t::right);
 
@@ -557,6 +566,7 @@ void depot_frame_t::build_vehicle_lists()
 	}
 
 	const int month_now = welt->get_timeline_year_month();
+	const bool show_future = welt->allow_future_objects();
 
 	// free vectors
 	clear_ptr_vector(pas_vec);
@@ -611,7 +621,7 @@ void depot_frame_t::build_vehicle_lists()
 			// current vehicle
 			if( is_in_vehicle_list(info)  ||
 				((weg_electrified  ||  info->get_engine_type()!=vehicle_desc_t::electric)  &&
-					 ((!info->is_future(month_now))  &&  (show_retired_vehicles  ||  (!info->is_retired(month_now)) )  ) )) {
+					 ((show_future  ||  !info->is_future(month_now))  &&  (show_retired_vehicles  ||  (!info->is_retired(month_now)) )  ) )) {
 				// check, if allowed
 				bool append = true;
 				if(!show_all) {
@@ -1097,7 +1107,9 @@ void depot_frame_t::image_from_storage_list(gui_image_list_t::image_data_t *imag
 				// rather than one new convoi with multiple vehicles
 				depot->set_command_pending();
 			}
-			depot->call_depot_tool( veh_action == va_insert ? 'i' : 'a', cnv, image_data->text );
+			// upper case 'I'/'A': buying vehicles not yet introduced is allowed too
+			const bool show_future = welt->allow_future_objects();
+			depot->call_depot_tool( veh_action == va_insert ? (show_future ? 'I' : 'i') : (show_future ? 'A' : 'a'), cnv, image_data->text );
 		}
 	}
 }
@@ -1196,6 +1208,12 @@ bool depot_frame_t::action_triggered( gui_action_creator_t *comp, value_t p)
 			show_retired_vehicles = (show_retired_vehicles == 0);
 			bt_obsolete.pressed = show_retired_vehicles;
 			depot_t::update_all_win();
+		}
+		else if(  comp == &bt_future  ) {
+			env_t::show_future_objects = !env_t::show_future_objects;
+			// update_all_win() rebuilds every depot window, so all checkboxes follow
+			depot_t::update_all_win();
+			tool_t::update_toolbars();
 		}
 		else if(  comp == &bt_show_all  ) {
 			show_all = (show_all == 0);
@@ -1351,6 +1369,8 @@ void depot_frame_t::draw(scr_coord pos, scr_size size)
 	bt_schedule.enable( action_allowed );
 	bt_sell.enable( action_allowed );
 	bt_obsolete.enable( action_allowed );
+	bt_future.enable( action_allowed  &&  !env_t::networkmode );
+	bt_future.pressed = welt->allow_future_objects();
 	bt_show_all.enable( action_allowed );
 	bt_veh_action.enable( action_allowed );
 	line_button.enable( action_allowed );

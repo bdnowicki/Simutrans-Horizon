@@ -107,6 +107,7 @@
 
 #include "../descriptor/ground_desc.h"
 #include "../descriptor/intro_dates.h"
+#include "../descriptor/obj_base_desc.h"
 
 #include "../player/simplay.h"
 #include "../player/finance.h"
@@ -5503,6 +5504,20 @@ void karte_t::set_map_counter(uint32 new_map_counter)
 uint32 karte_t::generate_new_map_counter() const
 {
 	return dr_time();
+}
+
+
+bool karte_t::allow_future_objects() const
+{
+	// tool checks run on every client in network games: a client side option must not change them
+	return env_t::show_future_objects  &&  !env_t::networkmode;
+}
+
+
+bool karte_t::is_available_for_players(const obj_desc_timelined_t *desc) const
+{
+	const uint16 month = get_timeline_year_month();
+	return desc->is_available(month)  ||  (allow_future_objects()  &&  desc->is_future(month));
 }
 
 

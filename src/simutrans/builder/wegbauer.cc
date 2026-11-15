@@ -234,6 +234,10 @@ bool way_builder_t::waytype_available( const waytype_t wtyp, uint16 time )
 		if(  test->get_wtyp()==wtyp  &&  test->get_intro_year_month()<=time  &&  test->get_retire_year_month()>time  ) {
 			return true;
 		}
+		// ways not yet introduced can be built with "Show future objects"
+		if(  test->get_wtyp()==wtyp  &&  welt->allow_future_objects()  &&  test->is_future(time)  ) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -303,14 +307,12 @@ void way_builder_t::fill_menu(tool_selector_t *tool_selector, const waytype_t wt
 	}
 	bool enable = welt->get_scenario()->is_tool_enabled(welt->get_active_player(), TOOL_BUILD_WAY | GENERAL_TOOL, rwtyp, 0);
 
-	const uint16 time = welt->get_timeline_year_month();
-
 	// list of matching types (sorted by speed)
 	vector_tpl<const way_desc_t*> matching;
 
 	for(auto const &iter : desc_table) {
 		way_desc_t const* const desc = iter.value;
-		if (  desc->get_styp()==styp &&  desc->get_wtyp()==wtyp  &&  desc->get_builder()  &&  desc->is_available(time)  ) {
+		if (  desc->get_styp()==styp &&  desc->get_wtyp()==wtyp  &&  desc->get_builder()  &&  welt->is_available_for_players(desc)  ) {
 			if (welt->get_scenario()->is_tool_allowed(welt->get_active_player(), TOOL_BUILD_WAY | GENERAL_TOOL, rwtyp, desc->get_name())) {
 				matching.append(desc);
 			}

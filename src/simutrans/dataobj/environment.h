@@ -262,6 +262,9 @@ public:
 	/// show the contextual construction band beside the status bar
 	static bool show_construction_info;
 
+	/// toolbars and depots offer also ways, buildings and vehicles not yet introduced (single player only, not saved)
+	static bool show_future_objects;
+
 	/// customize your tooltips
 	static bool show_tooltips;
 	static rgb888_t tooltip_color_rgb;

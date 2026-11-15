@@ -80,6 +80,7 @@ private:
 	button_t bt_sell;
 
 	button_t bt_obsolete;
+	button_t bt_future;
 	button_t bt_show_all;
 
 	gui_combobox_t sort_by;

@@ -2627,7 +2627,7 @@ image_id tool_build_way_t::get_icon(player_t *) const
 		if(  image ==  IMG_EMPTY  ) {
 			image = desc->get_cursor()->get_image_id(1);
 		}
-		if(  !desc->is_available( world()->get_timeline_year_month() )  ) {
+		if(  !world()->is_available_for_players(desc)  ) {
 			return IMG_EMPTY;
 		}
 	}
@@ -2742,7 +2742,7 @@ bool tool_build_way_t::init( player_t *player )
 	if (!desc) {
 		return false;
 	}
-	if (!desc->is_available(welt->get_timeline_year_month()) && player != NULL && player != welt->get_public_player()) {
+	if (!welt->is_available_for_players(desc) && player != NULL && player != welt->get_public_player()) {
 		// non available way => fail if not public player
 		return false;
 	}
@@ -3300,7 +3300,7 @@ bool tool_build_bridge_t::init( player_t *player )
 	two_click_tool_t::init( player );
 	// now get current desc
 	const bridge_desc_t *desc = bridge_builder_t::get_desc(default_param);
-	if(  desc  &&  !desc->is_available(welt->get_timeline_year_month())  &&  player!=NULL  &&  player!=welt->get_public_player()  ) {
+	if(  desc  &&  !welt->is_available_for_players(desc)  &&  player!=NULL  &&  player!=welt->get_public_player()  ) {
 		return false;
 	}
 	return desc!=NULL;
@@ -3545,7 +3545,7 @@ bool tool_build_tunnel_t::init( player_t *player )
 	two_click_tool_t::init( player );
 	// now get current desc
 	const tunnel_desc_t *desc = tunnel_builder_t::get_desc(default_param);
-	if(  desc  &&  !desc->is_available(welt->get_timeline_year_month())  &&  player!=NULL  &&  player!=welt->get_public_player()  ) {
+	if(  desc  &&  !welt->is_available_for_players(desc)  &&  player!=NULL  &&  player!=welt->get_public_player()  ) {
 		return false;
 	}
 	return desc!=NULL;
@@ -6247,8 +6247,7 @@ image_id tool_build_depot_t::get_icon(player_t *player) const
 {
 	if(  player  &&  !player->is_public_service()  ) {
 		const building_desc_t *desc = hausbauer_t::find_tile(default_param,0)->get_desc();
-		const uint16 time = welt->get_timeline_year_month();
-		if(  desc  &&  desc->is_available(time)  ) {
+		if(  desc  &&  welt->is_available_for_players(desc)  ) {
 			return desc->get_cursor()->get_image_id(1);
 		}
 	}
@@ -7690,7 +7689,7 @@ const char* tool_pipette_t::allow_tool_check(const obj_t* obj, const obj_desc_ti
 		if (obj->get_owner() == NULL   ||  obj->get_owner() != pl) {
 			return "Not allowed to copy object.";
 		}
-		if (!desc->is_available(welt->get_timeline_year_month())) {
+		if (!welt->is_available_for_players(desc)) {
 			return "Not allowed to copy object.";
 		}
 	}
@@ -8678,6 +8677,13 @@ bool tool_change_depot_t::init( player_t *player )
 	}
 	sscanf( p, "%c,%hi,%hi,%hhi,%hi", &tool, &pos2d.x, &pos2d.y, &z, &convoi_id );
 
+	// 'A'/'I' append/insert like 'a'/'i', but allow also vehicles not yet introduced (depot option "Show future")
+	bool allow_future = false;
+	if(  tool=='A'  ||  tool=='I'  ) {
+		allow_future = true;
+		tool = (tool=='A') ? 'a' : 'i';
+	}
+
 	koord3d pos(pos2d, z);
 
 	// skip to the commands ...
@@ -8837,8 +8843,10 @@ bool tool_change_depot_t::init( player_t *player )
 
 						if (!info->is_available(welt->get_timeline_year_month())) {
 							if (info->is_future(welt->get_timeline_year_month())) {
-								// not allowed
-								return false;
+								if(  !allow_future  ) {
+									// not allowed
+									return false;
+								}
 							}
 							else if (!welt->get_settings().get_allow_buying_obsolete_vehicles()) {
 								// only allow append/insert, if in depot do not create new obsolete vehicles

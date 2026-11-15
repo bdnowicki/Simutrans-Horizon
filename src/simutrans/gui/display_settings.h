@@ -38,6 +38,7 @@ private:
 public:
 	button_t toolbar_pos, reselect_closes_tool, single_toolbar, stack_toolbars, fullscreen, borderless;
 	button_t show_construction_info;
+	button_t show_future_objects;
 
 	gui_settings_t();
 

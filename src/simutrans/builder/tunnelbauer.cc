@@ -114,12 +114,11 @@ void tunnel_builder_t::fill_menu(tool_selector_t* tool_selector, const waytype_t
 	}
 	bool enable = welt->get_scenario()->is_tool_enabled(welt->get_active_player(), TOOL_BUILD_TUNNEL | GENERAL_TOOL, wtyp, 0);
 
-	const uint16 time=welt->get_timeline_year_month();
 	vector_tpl<const tunnel_desc_t*> matching(tunnel_by_name.get_count());
 
 	for(auto const& i : tunnel_by_name) {
 		tunnel_desc_t* const desc = i.value;
-		if(  desc->get_waytype()==wtyp  &&  desc->is_available(time)  ) {
+		if(  desc->get_waytype()==wtyp  &&  welt->is_available_for_players(desc)  ) {
 			if (welt->get_scenario()->is_tool_allowed(welt->get_active_player(), TOOL_BUILD_TUNNEL | GENERAL_TOOL, wtyp, desc->get_name())) {
 				matching.insert_ordered(desc, compare_tunnels);
 			}

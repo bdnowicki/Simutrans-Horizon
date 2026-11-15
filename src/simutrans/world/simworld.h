@@ -54,6 +54,7 @@ class records_t;
 class loadingscreen_t;
 class terraformer_t;
 class building_desc_t;
+class obj_desc_timelined_t;
 class schedule_t;
 
 /**
@@ -806,6 +807,17 @@ public:
 	 * @return Either 0 or the current year*12 + month
 	 */
 	uint16 get_timeline_year_month() const { return settings.get_use_timeline() ? current_month : 0; }
+
+	/**
+	 * @return true if players are offered objects not yet introduced (env_t::show_future_objects, single player only)
+	 */
+	bool allow_future_objects() const;
+
+	/**
+	 * Players may build/buy this now: like desc->is_available(get_timeline_year_month()),
+	 * but with allow_future_objects() also objects not yet introduced (retired ones stay unavailable).
+	 */
+	bool is_available_for_players(const obj_desc_timelined_t *desc) const;
 
 	/**
 	 * Number of ticks per day in bits.

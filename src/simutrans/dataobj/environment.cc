@@ -40,6 +40,7 @@ bool env_t::show_construction_info = false;
 sint16 env_t::fullscreen = WINDOWED;
 sint16 env_t::display_scale_percent = 100;
 bool env_t::reselect_closes_tool = true;
+bool env_t::show_future_objects = false;
 
 sint8 env_t::pak_tile_height_step = 16;
 sint8 env_t::pak_height_conversion_factor = 1;

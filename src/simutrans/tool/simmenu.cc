@@ -505,7 +505,7 @@ void set_defaults_general_tool(tool_t* tool, const char* param_str)
  * will still be applied - show buttons with icons regardless of
  * whether the objects they build are available or not.
  */
-bool check_tool_availability(const tool_t* tool, uint16 time)
+bool check_tool_availability(const tool_t* tool)
 {
 	if (tool == NULL) {
 		return true;
@@ -515,7 +515,7 @@ bool check_tool_availability(const tool_t* tool, uint16 time)
 
 	general_tool_get_desc_builder(tool->get_id(), tool->get_default_param(), desc, dummy);
 
-	return desc ? desc->is_available(time) : true;
+	return desc ? world()->is_available_for_players(desc) : true;
 }
 
 
@@ -1195,7 +1195,7 @@ void toolbar_t::update(player_t* player)
 			if (scen->is_scripted() && !scen->is_tool_allowed(player, w->get_id(), w->get_waytype(), w->get_default_param())) {
 				continue;
 			}
-			if (!check_tool_availability(w, welt->get_timeline_year_month())) {
+			if (!check_tool_availability(w)) {
 				continue;
 			}
 			w->enabled = welt->get_scenario()->is_tool_enabled(welt->get_active_player(), w->get_id(), w->get_waytype(), w->get_default_param());

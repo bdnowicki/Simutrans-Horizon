@@ -2147,6 +2147,12 @@ show all building
 Pokaż wszystkie budynki
 Show also vehicles no longer in production.
 Pokaż również pojazdy wycofane z produkcji.
+Show and allow to buy also vehicles not yet in production.
+Pokaż i pozwól kupić również pojazdy, których produkcja jeszcze się nie zaczęła.
+Show future objects
+Pokaż przyszłe obiekty (drogi, tory, stacje, pojazdy)
+Toolbars and depots offer also ways, stations and vehicles not yet in production (single player only).
+Paski narzędzi i zajezdnie oferują również drogi, stacje i pojazdy, których produkcja jeszcze się nie zaczęła (tylko gra jednoosobowa).
 Show also vehicles that do not match for current action.
 Pokaż również pojazdy nie pasujące.
 Show always

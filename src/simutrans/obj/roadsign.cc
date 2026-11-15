@@ -823,14 +823,12 @@ void roadsign_t::fill_menu(tool_selector_t *tool_selector, waytype_t wtyp, sint1
 	}
 	bool enable = welt->get_scenario()->is_tool_enabled(welt->get_active_player(), TOOL_BUILD_ROADSIGN | GENERAL_TOOL, wtyp, 0);
 
-	const uint16 time = welt->get_timeline_year_month();
-
 	vector_tpl<const roadsign_desc_t *>matching;
 
 	for(auto const& i : table) {
 		roadsign_desc_t const* const desc = i.value;
 		// only add items with a cursor
-		if(  desc->is_available(time)  &&  desc->get_wtyp()==wtyp  &&  desc->get_builder()  ) {
+		if(  welt->is_available_for_players(desc)  &&  desc->get_wtyp()==wtyp  &&  desc->get_builder()  ) {
 			if (welt->get_scenario()->is_tool_allowed(welt->get_active_player(), TOOL_BUILD_ROADSIGN | GENERAL_TOOL, wtyp, desc->get_name())) {
 				matching.insert_ordered(desc, compare_roadsign_desc);
 			}

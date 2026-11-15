@@ -13,6 +13,7 @@
 #include "../dataobj/environment.h"
 #include "../dataobj/translator.h"
 #include "../obj/baum.h"
+#include "../obj/depot.h"
 #include "../obj/zeiger.h"
 #include "../display/simgraph.h"
 #include "../tool/simmenu.h"
@@ -160,6 +161,12 @@ gui_settings_t::gui_settings_t()
 	show_construction_info.pressed = env_t::show_construction_info;
 	add_component( &show_construction_info, 3 );
 
+	show_future_objects.init( button_t::square_state, "Show future objects" );
+	show_future_objects.set_tooltip( "Toolbars and depots offer also ways, stations and vehicles not yet in production (single player only)." );
+	show_future_objects.pressed = env_t::show_future_objects;
+	show_future_objects.enable( !env_t::networkmode );
+	add_component( &show_future_objects, 3 );
+
 	fullscreen.init( button_t::square_state, "Fullscreen (changed after restart)" );
 	fullscreen.pressed = ( dr_get_fullscreen() == FULLSCREEN );
 	fullscreen.enable(dr_has_fullscreen());
@@ -194,6 +201,9 @@ gui_settings_t::gui_settings_t()
 
 void gui_settings_t::draw(scr_coord offset)
 {
+	// the depot windows toggle the same option
+	show_future_objects.pressed = env_t::show_future_objects;
+
 	// Update label buffers
 	frame_time_value_label.buf().printf(" %d ms", get_frame_time() );
 	frame_time_value_label.update();
@@ -627,6 +637,7 @@ color_gui_t::color_gui_t() :
 	gui_settings.stack_toolbars.add_listener(this);
 	gui_settings.reselect_closes_tool.add_listener(this);
 	gui_settings.show_construction_info.add_listener(this);
+	gui_settings.show_future_objects.add_listener(this);
 	gui_settings.fullscreen.add_listener( this );
 	gui_settings.borderless.add_listener( this );
 
@@ -693,6 +704,14 @@ bool color_gui_t::action_triggered( gui_action_creator_t *comp, value_t)
 	if(  comp == &gui_settings.show_construction_info  ) {
 		env_t::show_construction_info = !env_t::show_construction_info;
 		gui_settings.show_construction_info.pressed = env_t::show_construction_info;
+		return true;
+	}
+
+	if(  comp == &gui_settings.show_future_objects  ) {
+		env_t::show_future_objects = !env_t::show_future_objects;
+		gui_settings.show_future_objects.pressed = env_t::show_future_objects;
+		tool_t::update_toolbars();
+		depot_t::update_all_win();
 		return true;
 	}
 
