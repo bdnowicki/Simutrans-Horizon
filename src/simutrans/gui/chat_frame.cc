@@ -459,7 +459,7 @@ void chat_frame_t::fill_list()
 			if (i->channel_nr != -1) {
 				continue; // other company's message
 			}
-			if (!i->destination) {
+			if (i->destination) {
 				continue; // direct message
 			}
 			break;
