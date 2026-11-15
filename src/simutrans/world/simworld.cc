@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: -remote_control polling in interactive(), is_available_for_players() and allow_future_objects()
  */
 
 #include <algorithm>

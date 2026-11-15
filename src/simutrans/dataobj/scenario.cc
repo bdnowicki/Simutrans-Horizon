@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: fixed the inverted cache check in load_language_file()
  */
 
 #include "../sys/simsys.h"

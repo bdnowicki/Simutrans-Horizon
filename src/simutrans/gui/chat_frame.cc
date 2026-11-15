@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans-Extended project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: fixed the inverted direct message check in fill_list()
  */
 
 #include <time.h>

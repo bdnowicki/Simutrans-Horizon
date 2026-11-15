@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: get_components() for GUI inspection by -remote_control
  */
 
 #ifndef GUI_COMPONENTS_GUI_CONTAINER_H

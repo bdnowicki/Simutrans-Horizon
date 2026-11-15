@@ -1,3 +1,4 @@
+# Simutrans-Horizon, 2026-11: added src/simutrans/network/remote_control.cc
 target_sources(simutrans PRIVATE
 	src/simutrans/builder/brueckenbauer.cc
 	src/simutrans/builder/fabrikbauer.cc

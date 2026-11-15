@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: new file, the -remote_control automation interface
  */
 
 #ifndef NETWORK_REMOTE_CONTROL_H

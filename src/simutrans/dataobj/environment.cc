@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: added env_t::show_future_objects (option "Show future objects")
  */
 
 #include <string>

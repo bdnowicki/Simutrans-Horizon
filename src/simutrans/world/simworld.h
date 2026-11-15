@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: is_available_for_players() and allow_future_objects() for the option "Show future objects"
  */
 
 #ifndef WORLD_SIMWORLD_H

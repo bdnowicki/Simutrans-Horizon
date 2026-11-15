@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced
  */
 
 #include <string.h>

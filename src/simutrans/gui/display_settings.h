@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: added the option "Show future objects"
  */
 
 #ifndef GUI_DISPLAY_SETTINGS_H

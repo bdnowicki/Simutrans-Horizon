@@ -3,6 +3,8 @@
 # This file is part of the Simutrans project under the Artistic License.
 # (see LICENSE.txt)
 #
+# Simutrans-Horizon, 2026-11: added src/simutrans/network/remote_control.cc
+#
 
 # Define variables here to force them as simple flavor. -> Faster parallel builds.
 FLAGS :=

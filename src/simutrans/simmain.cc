@@ -1,6 +1,8 @@
 
 /* This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: added the command line option -remote_control
  */
 
 #if defined(_M_X64)  ||  defined(__x86_64__)
