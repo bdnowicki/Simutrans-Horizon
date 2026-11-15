@@ -1,79 +1,77 @@
-# Simutrans
+# Simutrans-Horizon
+
+> **Unofficial fork of [Simutrans](https://www.simutrans.com/).**
+> Simutrans-Horizon is not affiliated with, endorsed by or supported by the Simutrans Team.
+> If you are looking for the original game, visit [simutrans.com](https://www.simutrans.com/en/) or the
+> [official source mirror](https://github.com/simutrans/simutrans).
 
 - 1.0) [About](#1-about)
-	- 1.1) [Download Simutrans](#11-download-simutrans)
-	- 1.2) [Helpful links](#12-helpful-links)
-- 2.0) [Compiling Simutrans](#2-compiling-simutrans)
-	- 2.1) [Getting the Source Code](#21-getting-the-source-code)
-	- 2.2) [Getting the libraries](#22-getting-the-libraries)
-	- 2.3) [Compiling](#23-compiling)
-		- 2.3.1) [Compiling with make](#232-compiling-with-make)
-		- 2.3.2) [Compiling with MSVC](#233-compiling-with-microsoft-visual-studio)
-		- 2.3.3) [Compiling with CMake](#231-compiling-with-cmake)
-	- 2.4) [Cross-Compiling](#24-Cross-Compiling)
-- 3.0) [Contribute](#3-contribute)
-	- 3.1) [Coding](#31-coding)
-	- 3.2) [Getting the libraries](#32-translating)
-	- 3.3) [Painting](#33-painting)
-	- 3.4) [Reporting-bugs](#34-reporting-bugs)
-- 4.0) [License](#4-license)
-- 5.0) [Credits](#5-credits)
+- 2.0) [Differences from Simutrans](#2-differences-from-simutrans)
+- 3.0) [Playing](#3-playing)
+- 4.0) [Compiling](#4-compiling)
+	- 4.1) [Getting the source code](#41-getting-the-source-code)
+	- 4.2) [Getting the libraries](#42-getting-the-libraries)
+	- 4.3) [Compiling with make](#43-compiling-with-make)
+	- 4.4) [Compiling with Microsoft Visual Studio](#44-compiling-with-microsoft-visual-studio)
+	- 4.5) [Compiling with CMake](#45-compiling-with-cmake)
+	- 4.6) [Cross-compiling](#46-cross-compiling)
+- 5.0) [Contributing](#5-contributing)
+- 6.0) [License](#6-license)
+- 7.0) [Credits](#7-credits)
 
 ## 1) About
 
-Simutrans is a freeware and open-source transportation simulator. Your goal is to establish a successful transport company. Transport passengers, mail and goods by rail, road, ship, and even air. Interconnect districts, cities, public buildings, industries and tourist attractions by building a transport network you always dreamed of.
+Simutrans is a freeware and open-source transportation simulator. Your goal is to establish a successful transport company: transport passengers, mail and goods by rail, road, ship and air, and connect cities, industries and attractions with the network you always dreamed of.
 
-## 1.1) Download Simutrans
+**Simutrans-Horizon** takes the Simutrans source code (Simutrans Standard, SVN trunk) as its starting point and develops it in a more modern direction. Changes are made openly in this repository and listed below.
 
-You can download Simutrans from:
+The `master` branch started from Simutrans trunk **r12390**.
 
-- [Simutrans Official Website](https://www.simutrans.com/en/)
-- [Steam](https://store.steampowered.com/app/434520/Simutrans/)
-- [Linux package managers](https://pkgs.org/search/?q=simutrans)
+## 2) Differences from Simutrans
 
-There is a "nightly" version available, but most most people should use the last "stable" release.
+The Artistic License asks every modified version to document how it differs from the standard version. This section is that documentation and is kept up to date with every change.
 
-## 1.2) Helpful links
+**Changes in this repository:** none yet. The code is still identical to Simutrans trunk r12390; only this README differs.
 
-### Main sites
+**In preparation:**
 
-- [Main website](https://www.simutrans.com/)
-- [International Forum](https://forum.simutrans.com/)
-- [German Forumurl](https://www.simutrans-forum.de/)
-- [Japanese Forum](https://forum.japanese.simutrans.com/)
+- **Remote control interface:** a `-remote_control <port>` command line option and a bridge in `tools/mcp` that lets scripts and AI assistants read the game state and play the game.
+- **"Show future objects" option:** toolbars and depot windows can also offer ways, stations and vehicles that have not been introduced yet in the timeline (single player only).
 
-### Help
+## 3) Playing
 
-- [Simutrans Wiki](https://wiki.simutrans.com)
-- [Starter Guide (PDF)](http://simutrans.igoreliezer.com/docs/Simutrans%20Starter%20Guide.pdf)
-- [Help Center (International Forum)](https://forum.simutrans.com/index.php/board,7.0.html)
+There are no binary releases of Simutrans-Horizon yet; build it from source (see below).
 
-### Additional downloads
+Like Simutrans, the program needs a pakset (the graphics and game data) to run. Paksets are distributed separately, for example from the [Simutrans paksets page](https://www.simutrans.com/en/paksets/). Start the executable with `-use_workdir` to point it to an existing Simutrans installation.
 
-- [Paksets](https://www.simutrans.com/en/paksets/)
-- [Addons](https://simutrans-germany.com/wiki/wiki/en_Addons)
+Saved games and network games are compatible with Simutrans only as long as Simutrans-Horizon does not change the file format or the game logic; incompatibilities will be listed in section 2.
 
-## 2) Compiling Simutrans
+To play the original game, download Simutrans from the [official website](https://www.simutrans.com/en/) or [Steam](https://store.steampowered.com/app/434520/Simutrans/).
 
-This is a short guide on compiling simutrans. If you want more detailed information, read the [Compiling Simutrans](https://simutrans-germany.com/wiki/wiki/en_CompilingSimutrans) wiki page.
+## 4) Compiling
 
-If you are on Windows, download either [Microsoft Visual Studio](https://visualstudio.microsoft.com/) or [MSYS2](https://www.msys2.org/). MSVC is easy for debugging, MSYS2 is easy to set up (but it has to be done on the command line).
+This is a short guide. For more details, read the [Compiling Simutrans](https://simutrans-germany.com/wiki/wiki/en_CompilingSimutrans) wiki page, which applies to Simutrans-Horizon as well.
 
-### 2.1) Getting the Source Code
+If you are on Windows, install either [Microsoft Visual Studio](https://visualstudio.microsoft.com/) or [MSYS2](https://www.msys2.org/). MSVC is easier for debugging; MSYS2 is easy to set up (on the command line).
 
-You can download the latest version with a SVN client:
+### 4.1) Getting the source code
+
 ```
-svn checkout svn://servers.simutrans.org/simutrans/trunk
+git clone https://github.com/bdnowicki/Simutrans-Horizon.git
 ```
-If you prefer to use git, there is a mirror of the svn repository available at github:
-```
-git clone http://github.com/simutrans/simutrans.git
-```
-Note that the svn repository is the main repository, and the git repository is just a mirror. If you use git instead of svn, you will need to set the game version manually to join a network game.
 
-### 2.2) Getting the libraries
+To follow the development of Simutrans itself, add the official mirror as a second remote:
 
-This is a list of libraries used by Simutrans. Not all of them are necessary, some are optional, so pick them according to your needs. Read below about how to install them.
+```
+git remote add upstream https://github.com/simutrans/simutrans.git
+git fetch upstream
+```
+
+The git history does not carry the SVN revision number that Simutrans uses as its version. Set the game version manually if you need to join a network game.
+
+### 4.2) Getting the libraries
+
+Not all libraries are necessary; pick them according to your needs.
 
 | Library       | Website                             | Necessary? | Notes                                                                     |
 |---------------|-------------------------------------|------------|---------------------------------------------------------------------------|
@@ -88,23 +86,19 @@ This is a list of libraries used by Simutrans. Not all of them are necessary, so
 | libSDL2_mixer | http://www.libsdl.org/              | Optional   | Alternative MIDI playback and sound system                                |
 | libfontconfig | https://www.fontconfig.org/         | Optional   | Font autodetection (Linux/Mac)                                            |
 
-You will also need pkgconfig (Unix) or [vcpkg](https://github.com/Microsoft/vcpkg) (Microsoft Visual C++)
+You will also need pkgconfig (Unix) or [vcpkg](https://github.com/Microsoft/vcpkg) (Microsoft Visual C++).
 
-- MSVC: Should compile the needed libraries automatically, if VCPKG is installed. Alternative, copy install-building-libs-{architecture}.bat to the vcpkg folder and run it.
-- MSYS2: Run [setup-mingw.sh] (tools/setup-mingw.sh) to get the libraries and set up the environment.
-- Ubuntu/Debian: Run [setup-debian.sh] (tools/setup-debian.sh) to get the libraries and set up the environment.
-- Linux: Use [pkgs.org](https://pkgs.org/) to search for development libraries available in your package manager.
-- Mac: Install libraries via [Homebrew] (https://brew.sh/). Some guidance can be found in the github directory.
+- MSVC: the needed libraries are compiled automatically if vcpkg is installed. Alternatively, copy install-building-libs-{architecture}.bat to the vcpkg folder and run it.
+- MSYS2: run [tools/setup-mingw.sh](tools/setup-mingw.sh) to get the libraries and set up the environment.
+- Ubuntu/Debian: run [tools/setup-debian.sh](tools/setup-debian.sh) to get the libraries and set up the environment.
+- Linux: use [pkgs.org](https://pkgs.org/) to find the development libraries in your package manager.
+- Mac: install the libraries via [Homebrew](https://brew.sh/).
 
-### 2.3) Compiling
+Compiling gives you only the executable; you still need a pakset to run the program (see [Playing](#3-playing)).
 
-Go to the source code directory of simutrans (simutrans/trunk if you downloaded from svn). You have three build systems to choose from: make, MSVC, and CMake. We recommend make or MSVC for debug builds, cmake for MacOS and Android.
+### 4.3) Compiling with make
 
-Compiling will give you only the executable, you still need a Simutrans installation to run the program. You can start simutrans with `-use_workdir` to point it to an existing installation.
-
-#### 2.3.1) Compiling with make
-
-The executable will be built in build/default.
+The executable is built in build/default.
 
 ```
 (Linux) autoconf
@@ -114,75 +108,61 @@ make -j 4
 (MacOS) make OSX/getversion
 ```
 
-#### 2.3.2) Compiling with Microsoft Visual Studio
+### 4.4) Compiling with Microsoft Visual Studio
 
-Simutrans solution is a single solution file [simutrans.sln](./simutrans.sln) with 4 projects:
+The solution file [Simutrans.sln](./Simutrans.sln) contains these projects:
 
-- Simutrans-Main: The project that holds the shared, non back-end specific, files. All the followings use Main to build the specific back-end executables.
-- Simutrans SDL2: Preferred back-end for Simutrans.
+- Simutrans-Main: the shared files that are not specific to a back-end. All the following projects use it.
+- Simutrans SDL2: the preferred back-end.
+- Simutrans SDL3: the SDL3 back-end.
 - Simutrans GDI: Windows-only back-end.
-- Simutrans Server: Server back-end with no graphical interface.
+- Simutrans Server: server back-end without a graphical interface.
 
-Select on of them as startup project and in the configuration manager compile it.
+Select one of them as the startup project and build it.
 
-#### 2.3.3) Compiling with CMake
+### 4.5) Compiling with CMake
 
-The executable will be built in build/simutrans.
+The executable is built in build/simutrans.
 
-##### Commandline on Linux/MinGW/MacOS ...
+Command line on Linux/MinGW/MacOS:
 ```
 cmake -G "Insert Correct Makefiles Generator" -B build .
 cmake --build build -j 4
 ```
-See [here](https://cmake.org/cmake/help/latest/manual/cmake-generators.7.html) for a list of generators.
+See [the list of CMake generators](https://cmake.org/cmake/help/latest/manual/cmake-generators.7.html).
 
-##### MSVC
+MSVC:
 ```
 mkdir build && cd build
-cmake.exe .. -G "Visual Studio 16 2019" -A x64 -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake
+cmake.exe .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake
 cmake --build . --config Release
 ```
 
-### 2.4) Cross-Compiling
+### 4.6) Cross-compiling
 
-If you want to cross-compile Simutrans from Linux for Windows, see the [Cross-Compiling Simutrans](https://simutrans-germany.com/wiki/wiki/en_Cross-Compiling_Simutrans) wiki page.
+To cross-compile from Linux for Windows, see the [Cross-Compiling Simutrans](https://simutrans-germany.com/wiki/wiki/en_Cross-Compiling_Simutrans) wiki page.
 
-## 3) Contribute
+## 5) Contributing
 
-You cand find general information about contributing to Simutrans in the [Development Index](https://simutrans-germany.com/wiki/wiki/en_Devel_Index?structure=en_Devel_Index) of the wiki.
+Issues and pull requests are welcome in this repository.
 
-### 3.1) Coding
+- Follow the coding guidelines in [documentation/coding_styles.txt](documentation/coding_styles.txt).
+- Every file changed compared with Simutrans gets a short notice near its top stating what was changed for Simutrans-Horizon and when, as the Artistic License requires. Example: `// Simutrans-Horizon, 2026-11: added the "Show future objects" option`.
+- Describe each change visible to players in [section 2](#2-differences-from-simutrans).
+- Report a bug here if it happens only in Simutrans-Horizon. If it also happens in the original game, report it in the [Simutrans Bug Reports forum](https://forum.simutrans.com/index.php/board,8.0.html).
+- Improvements that would also benefit Simutrans itself can be offered to the Simutrans Team as a patch in the [Patches & Projects forum](https://forum.simutrans.com/index.php/board,33.0.html); the Simutrans Team does not accept GitHub pull requests.
+- Translations of texts that also exist in Simutrans belong in [SimuTranslator](https://translator.simutrans.com/); texts added by Simutrans-Horizon are translated in `simutrans/text/*.tab` here.
 
-- If you want to contribute, read the coding guidelines in simutrans/documentation/coding_styles.txt
-- You definitely should check out the [Technical Documentation Sub-Forum](https://forum.simutrans.com/index.php/board,112.0.html) as well.
-- **Do not open Pull Requests** in GitHub. Use the [Patches & Projects](https://forum.simutrans.com/index.php/board,33.0.html) Sub-Forum instead.
+## 6) License
 
-### 3.2) Translating
+Simutrans-Horizon is a modified version of Simutrans and is distributed under the same **Artistic License version 1.0**; see [LICENSE.txt](./LICENSE.txt) for the complete text. The copyright holders of Simutrans are Hansjörg Malthaner (1997-2004) and The Simutrans Team (since 2005). All modifications made in this repository are freely available under the same license.
 
-Simutrans is constantly updating and adding texts so we are always in need for translators:
+The name Simutrans is used only to describe where this project comes from; it does not imply any endorsement by the Simutrans Team.
 
-- To help with translation use the [SimuTranslator](https://translator.simutrans.com/) web tool.
-- To request a translator account use the [Translation Sub-Forum](https://forum.simutrans.com/index.php/board,47.0.html).
+Paksets, which are necessary to run the game, have their own licenses, and none is included here. Check the license of each pakset before redistributing it; some parts of paksets (for example the sounds of pak128) are not covered by the pakset's main license.
 
-### 3.3) Painting
+## 7) Credits
 
-Simutrans is always looking for artists! If you want to paint graphics for Simutrans, check:
+Simutrans was originally written by Hansjörg Malthaner "Hajo" from 1997 until he retired from development around 2004. Since then, a team of contributors (The Simutrans Team) led by Markus Pristovsek "Prissi" has been developing Simutrans. A list of early contributors can be found in [simutrans/thanks.txt](./simutrans/thanks.txt).
 
-- The "Creating images" section of the [Development Index](https://simutrans-germany.com/wiki/wiki/en_Devel_Index).
-- The [General Resources and Tools](https://forum.simutrans.com/index.php/board,108.0.html) Sub-Forum.
-
-### 3.4) Reporting bugs
-
-For bug reports use the [Bug Reports](https://forum.simutrans.com/index.php/board,8.0.html) Sub-Forum.
-
-## 4) License
-
-Simutrans is licensed under the Artistic License version 1.0. The Artistic License 1.0 is an OSI-approved license which allows for use, distribution, modification, and distribution of modified versions, under the terms of the Artistic License 1.0. For the complete license text see [LICENSE.txt](./LICENSE.txt).
-
-Simutrans paksets (which are necessary to run the game) have their own license, but no one is included alongside this code.
-
-## 5) Credits
-
-Simutrans was originally written by Hansjörg Malthaner "Hajo" from 1997 until he retired from development around 2004. Since then a team of contributors (The Simutrans Team) lead by Markus Pristovsek "Prissi" is developing Simutrans.
-
-A list of early contributors can be found in [simutrans/thanks.txt](./simutrans/thanks.txt)
+Simutrans-Horizon is maintained by [bdnowicki](https://github.com/bdnowicki).
