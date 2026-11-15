@@ -25,18 +25,25 @@ Simutrans is a freeware and open-source transportation simulator. Your goal is t
 
 **Simutrans-Horizon** takes the Simutrans source code (Simutrans Standard, SVN trunk) as its starting point and develops it in a more modern direction. Changes are made openly in this repository and listed below.
 
-The `master` branch started from Simutrans trunk **r12390**.
+The `master` branch started from Simutrans trunk **r12390** and takes in newer Simutrans revisions from time to time.
 
 ## 2) Differences from Simutrans
 
-The Artistic License asks every modified version to document how it differs from the standard version. This section is that documentation and is kept up to date with every change.
+The Artistic License asks every modified version to document how it differs from the standard version. This section is that documentation and is kept up to date with every change. In the source, every file that differs from Simutrans carries a `Simutrans-Horizon` notice near its top.
 
-**Changes in this repository:** none yet. The code is still identical to Simutrans trunk r12390; only this README differs.
+### New features
 
-**In preparation:**
+- **Remote control interface.** With the command line option `-remote_control [port]` (default port 13360) the game accepts JSON commands on 127.0.0.1 only. Commands read the game state, the map, game objects and the open windows with their buttons, send mouse and keyboard input and run Squirrel scripts. [tools/mcp](tools/mcp/README.md) contains an MCP server that lets AI assistants such as Claude Code read and play the game through this interface. Without the option the game behaves like Simutrans.
+- **Option "Show future objects".** In the display settings (GUI tab) and as the checkbox "Show future" in every depot window. Toolbars then offer also ways, bridges, tunnels, catenary, signs and stations that are not yet introduced in the timeline, and depots sell vehicles that are not yet in production. The option is for single player games only: it is not saved and has no effect in network games. Polish translations are included.
 
-- **Remote control interface:** a `-remote_control <port>` command line option and a bridge in `tools/mcp` that lets scripts and AI assistants read the game state and play the game.
-- **"Show future objects" option:** toolbars and depot windows can also offer ways, stations and vehicles that have not been introduced yet in the timeline (single player only).
+### Bug fixes
+
+- Scenario texts loaded from files (info, goal, rules, result, about) were shown as "(null)" after the plainstring change in Simutrans r12344.
+- The public chat tab listed the direct messages instead of the public ones (same cause).
+
+### Compatibility
+
+The save game format is unchanged: Simutrans-Horizon and Simutrans load each other's saved games.
 
 ## 3) Playing
 
