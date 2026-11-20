@@ -51,6 +51,7 @@ claude mcp add simutrans --scope local \
 | `messages` | message center (incl. scenario messages) |
 | `ui_elements`, `tile_to_screen`, `screen_to_tile` | GUI elements and coordinate conversion |
 | `run_squirrel` | any query or action through the scripting API |
+| `screenshot` | PNG image of the game window, of one open window (by title) or of a screen region; see below |
 | `use_tool` | apply a game tool exactly at map coordinates (build way, station, depot, remove, ...) |
 | `change_cash` | add money to (or take it from) a player's bank account, like `book_cash()` of scenario scripts |
 | `click_element`, `click`, `drag`, `move_mouse`, `scroll_wheel`, `press_key`, `type_text` | GUI input; the result lists the open windows afterwards |
@@ -69,6 +70,20 @@ tile x (first character = `region.x`):
 * `height`: z = `height_base` + digit (`0-9a-zA-Z`); `groundwater` is the sea level
 * `owner`: `.` nobody, `0-9a-f` player number (1 = public service)
 * `slope`: `.` flat, `n` `s` `e` `w` ramp in that direction, `*` other slope
+
+### Screenshots
+
+The JSON tools come first: `map_view` and `tile_info` give exact tiles and coordinates and cost
+far fewer tokens than an image, `ui_elements` lists the content of windows. The tool descriptions
+and the server instructions tell the agent so. `screenshot` is for what JSON does not show:
+graphics, charts, the layout of a window, a visual check of a result.
+
+The game writes the PNG to a temporary file, the MCP server returns it as an image and deletes
+the file, so the game and the MCP server must run on the same computer. `scale` divides width and
+height; by default it is the smallest scale that keeps the longer side within 1568 px, the size
+Claude looks at (so 1 for most windows, 2 for a Full HD screen). Images over 4 MB are refused with
+a hint to use a higher scale. The server version of Simutrans has no screen and cannot take
+screenshots.
 
 ## Security
 

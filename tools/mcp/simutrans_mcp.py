@@ -16,19 +16,23 @@ Environment variables:
                          -set_basedir C:/simutrans -objects pak128/
 """
 
+import base64
 import json
 import os
 import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import urllib.parse
 
 SERVER_NAME = "simutrans"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
+MAX_IMAGE_BYTES = 4 * 1024 * 1024  # stay below the 5 MB image limit of the Claude API
+MAX_IMAGE_SIDE = 1568  # Claude scales larger images down anyway
 HELLO = "HELLO simutrans-remote 1"
 DEFAULT_PORT = 13360
 KNOWN_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -56,6 +60,9 @@ Reading the game:
   factories, cities, convoys, depots and labels in it. tile_info: everything on one tile.
 - players, cities, stations, station_details, convoys, lines, factories: game objects.
 - run_squirrel: any other query through the scripting API.
+- screenshot: an image of the game window. Use it only after the JSON tools: map_view and
+  tile_info are exact, cheap and give coordinates; a screenshot is costly and approximate.
+  It is meant for what JSON does not show (graphics, charts, layout of a window, a visual check).
 
 Acting:
 - use_tool applies a build/remove tool exactly at map coordinates (preferred for building).
@@ -308,6 +315,66 @@ def tool_run_squirrel(args):
     return [text({"result": r.get("result")})]
 
 
+def find_window(title_filter):
+    """Open window whose title contains title_filter (the top window first) and the titles of the
+    windows that are drawn over it."""
+    wanted = title_filter.lower()
+    windows = game.request("windows", components=False)["windows"]
+    windows.sort(key=lambda w: (not w.get("top"), -w.get("index", 0)))
+    for win in windows:
+        if wanted in (win.get("title") or "").lower():
+            covered_by = [o.get("title") for o in windows
+                          if o.get("index", 0) > win.get("index", 0)
+                          and o["x"] < win["x"] + win["w"] and win["x"] < o["x"] + o["w"]
+                          and o["y"] < win["y"] + win["h"] and win["y"] < o["y"] + o["h"]]
+            return win, covered_by
+    titles = [w.get("title") for w in windows]
+    raise GameError(f"no open window with '{title_filter}' in its title; open windows: {titles}")
+
+
+def tool_screenshot(args):
+    area = {}
+    covered_by = []
+    if args.get("window"):
+        win, covered_by = find_window(args["window"])
+        area = {k: win[k] for k in ("x", "y", "w", "h")}
+    elif args.get("w") is not None and args.get("h") is not None:
+        area = {"x": args.get("x", 0), "y": args.get("y", 0), "w": args["w"], "h": args["h"]}
+    scale = args.get("scale")
+    if scale is None:
+        # smallest scale that fits the image into the size Claude actually looks at
+        if area:
+            w, h = area["w"], area["h"]
+        else:
+            screen = game.request("status", components=False)["screen"]
+            w, h = screen["w"], screen["h"]
+        scale = max(1, -(-max(int(w), int(h)) // MAX_IMAGE_SIDE))
+
+    fd, path = tempfile.mkstemp(prefix="simutrans_screenshot_", suffix=".png")
+    os.close(fd)
+    try:
+        info = game.request("screenshot", path=path, scale=scale, **area)
+        with open(path, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if len(data) > MAX_IMAGE_BYTES:
+        raise GameError(f"screenshot is {len(data) // 1024} KB, too large to return; "
+                        "use a higher scale or a smaller region")
+    info.pop("path", None)
+    if args.get("window"):
+        info["window"] = win.get("title")
+        if covered_by:
+            # the image shows the screen area of the window, so these windows hide parts of it
+            info["covered_by"] = covered_by
+            info["hint"] = "click the title bar of the window to bring it to the top, then take the screenshot again"
+    info["note"] = "image of the screen; for exact tiles and coordinates use map_view / tile_info"
+    return [text(info), {"type": "image", "data": base64.b64encode(data).decode("ascii"), "mimeType": "image/png"}]
+
+
 # ---------------------------------------------------------------------------
 # tools: acting
 # ---------------------------------------------------------------------------
@@ -552,6 +619,19 @@ TOOLS = [
              "unowned": {"type": "boolean", "description": "run like a scenario script: tools may act for any "
                          "player, also password-locked ones such as the public player (not in network games)"}},
             ["code"]), False),
+    ("screenshot", tool_screenshot,
+     "PNG image of the game window, of one open window (by title) or of a screen region x,y,w,h. "
+     "Second choice after the JSON tools: for the map use map_view / tile_info, for windows ui_elements, "
+     "which are exact and much cheaper. Use a screenshot only for what they do not show (graphics, charts, "
+     "window layout, a visual check of a result). A window is captured as its screen area, so windows "
+     "on top of it show in the image (listed as covered_by). scale 1-8 shrinks the image; by default "
+     "the smallest scale that keeps the longer side within 1568 px.",
+     schema({"window": {"type": "string", "description": "capture the open window whose title contains this text"},
+             "x": INT, "y": INT,
+             "w": {"type": "integer", "description": "region width in screen pixels (with h, x, y)"},
+             "h": {"type": "integer", "description": "region height in screen pixels"},
+             "scale": {"type": "integer", "description": "divide width and height by this factor (1-8)"}}),
+     True),
     # --- acting
     ("use_tool", tool_use_tool,
      "Apply a game tool exactly at map coordinates as the active player, e.g. tool=tool_build_way with "
