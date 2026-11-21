@@ -2473,6 +2473,35 @@ static const char *cmd_unlock_game(const args_t &, json_t &j)
 }
 
 
+/**
+ * Removes the password of a player (default: the public player) like the server command
+ * "unlock company" does. Single player only. Saved with the game.
+ */
+static const char *cmd_remove_password(const args_t &a, json_t &j)
+{
+	if (env_t::networkmode) {
+		return "not available in network games";
+	}
+	karte_t *welt = world();
+	const sint64 nr = arg_int(a, "player", PLAYER_PUBLIC_NR);
+	player_t *player = (nr >= 0  &&  nr < PLAYER_UNOWNED) ? welt->get_player((uint8)nr) : NULL;
+	if (player == NULL) {
+		return "no such player";
+	}
+	j.kv("player", (int)nr);
+	j.kv("name", player->get_name());
+	j.kv("had_password", !player->access_password_hash().empty());
+	pwd_hash_t empty;
+	empty.clear();
+	player->access_password_hash().clear();
+	welt->store_player_password_hash((uint8)nr, empty);
+	player->unlock(true, false);
+	tool_t::update_toolbars();
+	j.kv("locked", player->is_locked());
+	return NULL;
+}
+
+
 struct command_t
 {
 	const char *name;
@@ -2511,6 +2540,7 @@ static const command_t commands[] = {
 	{ "toolbars",     cmd_toolbars },
 	{ "tool_visibility", cmd_tool_visibility },
 	{ "unlock_game",  cmd_unlock_game },
+	{ "remove_password", cmd_remove_password },
 };
 
 

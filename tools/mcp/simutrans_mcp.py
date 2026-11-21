@@ -74,6 +74,7 @@ Acting:
 - change_cash adds money to (or takes it from) a player's bank account.
 - set_tool_visibility hides a toolbar tool or shows one the scenario forbids (single player).
 - unlock_game lifts the "Lock game" lock of a map, so the player can be changed (single player).
+- remove_password removes the password of a player, by default the public player (single player).
 Useful keys: escape closes the top window, "p" pauses, "," and "." change the speed.
 
 """ + MAP_LEGEND
@@ -365,6 +366,10 @@ def tool_set_tool_visibility(args):
 
 def tool_unlock_game(args):
     return [text(game.request("unlock_game"))]
+
+
+def tool_remove_password(args):
+    return [text(game.request("remove_password", player=args.get("player")))]
 
 
 def tool_messages(args):
@@ -782,6 +787,10 @@ TOOLS = [
      "player'), so the player can be changed again. Single player only. The change is saved with the game; "
      "the public player keeps its password. In a scenario the 'Change player' tool also needs "
      "set_tool_visibility tool=TOOL_SWITCH_PLAYER visibility=show.", schema(), False),
+    ("remove_password", tool_remove_password,
+     "Remove the password of a player (default: the public player, number 1), so it can act without "
+     "asking for it, like the server command 'unlock company'. Single player only; saved with the game.",
+     schema({"player": {"type": "integer", "description": "player number (default 1 = public player)"}}), False),
     ("wait", tool_wait, "Let the game run for some seconds (max 300), then report the date.",
      schema({"seconds": {"type": "number"}}), True),
     ("launch_game", tool_launch_game,
