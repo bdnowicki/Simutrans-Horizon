@@ -47,13 +47,15 @@ claude mcp add simutrans --scope local \
 | `stations`, `station_details` | owner, position, accepted and waiting cargo, happy/unhappy passengers |
 | `convoys` | position, state, speed, load, line, next stop, profit |
 | `lines` | stops, convoys, profit, transported vs capacity |
-| `factories` | production, input/output storage, suppliers/consumers |
+| `factories` | production, input/output storage in the units of the factory window, this and last month's production/consumption, suppliers/consumers |
 | `messages` | message center (incl. scenario messages) |
+| `toolbars` | the toolbars with the tools they show and the tools they hide, with the reason; see below |
 | `ui_elements`, `tile_to_screen`, `screen_to_tile` | GUI elements and coordinate conversion |
 | `run_squirrel` | any query or action through the scripting API |
 | `screenshot` | PNG image of the game window, of one open window (by title) or of a screen region; see below |
 | `use_tool` | apply a game tool exactly at map coordinates (build way, station, depot, remove, ...) |
 | `change_cash` | add money to (or take it from) a player's bank account, like `book_cash()` of scenario scripts |
+| `set_tool_visibility` | hide a toolbar tool, or show a tool that the scenario forbids; see below |
 | `click_element`, `click`, `drag`, `move_mouse`, `scroll_wheel`, `press_key`, `type_text` | GUI input; the result lists the open windows afterwards |
 | `center_view`, `zoom`, `set_pause`, `set_fast_forward`, `wait`, `launch_game` | view, time and process control |
 
@@ -84,6 +86,25 @@ height; by default it is the smallest scale that keeps the longer side within 15
 Claude looks at (so 1 for most windows, 2 for a Full HD screen). Images over 4 MB are refused with
 a hint to use a higher scale. The server version of Simutrans has no screen and cannot take
 screenshots.
+
+### Tool visibility
+
+`toolbars` lists every toolbar with the tools it shows and the configured tools it does not show,
+with the reason: `forbidden by scenario`, `not available (timeline)` or `hidden by rule`. Tools
+are named as in `menuconf.tab` (`simple_tool[5]`) and by their constant (`TOOL_SWITCH_PLAYER`).
+
+`set_tool_visibility` sets a rule for a tool, optionally only for one waytype or one parameter
+(a descriptor name):
+
+* `hide` leaves the tool out of all toolbars; its keyboard shortcut still works.
+* `show` lifts a scenario ban on the tool: the button is back and the tool works. Scenario rules
+  for map areas still apply. Single player only.
+* `default` removes the rule; `clear` removes all rules.
+
+Examples: `tool=TOOL_SWITCH_PLAYER visibility=show` brings back the "Change player" button, which
+every scenario forbids (`simutrans/script/scenario_base.nut`); on a map locked with "Lock game" changing the
+player stays impossible. `tool=TOOL_BUILD_WAY waytype=air visibility=show` allows taxiways and
+runways when a scenario forbids them. Rules are not saved and last until the game is closed.
 
 ## Security
 

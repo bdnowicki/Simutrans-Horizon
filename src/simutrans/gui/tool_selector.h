@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: get_tool_count() and get_tool() for -remote_control
  */
 
 #ifndef GUI_TOOL_SELECTOR_H
@@ -70,6 +72,10 @@ public:
 
 	// purges toolbar
 	void reset_tools();
+
+	/// the tools shown in this toolbar (separators are tool_t::dummy)
+	uint32 get_tool_count() const { return tools.get_count(); }
+	tool_t *get_tool(uint32 i) const { return tools[i].tool; }
 
 	// untranslated title
 	const char *get_internal_name() const {return title;}

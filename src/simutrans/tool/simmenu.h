@@ -1,6 +1,9 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: tool visibility rules for -remote_control, toolbar_t::get_tools(),
+ *                             check_tool_availability() declared here
  */
 
 #ifndef TOOL_SIMMENU_H
@@ -297,6 +300,26 @@ public:
 
 	static void update_toolbars();
 
+	/**
+	 * Simutrans-Horizon: tool visibility rules, set through -remote_control and not saved.
+	 * A rule matches a tool by its id, its waytype (ignore_wt = any waytype) and its
+	 * default parameter (empty = any parameter); the most specific matching rule wins.
+	 * VISIBILITY_HIDE leaves the tool out of all toolbars (a keyboard shortcut still works).
+	 * VISIBILITY_SHOW lifts a scenario ban on the tool, so it is in the toolbars and works
+	 * again; single player only, rules of the scenario for map areas still apply.
+	 */
+	enum { VISIBILITY_DEFAULT = 0, VISIBILITY_SHOW, VISIBILITY_HIDE };
+	struct visibility_rule_t {
+		uint16 id;
+		sint16 wt;
+		std::string param;
+		uint8 visibility;
+	};
+	static uint8 get_visibility(uint16 id, sint16 wt, const char *param);
+	/// VISIBILITY_DEFAULT removes the rule with exactly this id, waytype and parameter
+	static void set_visibility(uint16 id, sint16 wt, const char *param, uint8 visibility);
+	static const vector_tpl<visibility_rule_t> &get_visibility_rules();
+
 	// since only a single toolstr a time can be visible ...
 	static char toolstr[1024];
 
@@ -536,6 +559,8 @@ public:
 	bool exit(player_t*) OVERRIDE;
 	virtual void update(player_t *); // just refresh content
 	void append(tool_t *tool) { tools.append(tool); }
+	/// the configured entries (menuconf.tab), including meta tools and separators
+	const slist_tpl<tool_t *> &get_tools() const { return tools; }
 };
 
 #define MAX_LAST_TOOLS (10)
@@ -553,5 +578,8 @@ public:
 
 // create new instance of tool
 tool_t *create_tool(int toolnr);
+
+/// false if the object the tool builds is not available (timeline)
+bool check_tool_availability(const tool_t* tool);
 
 #endif

@@ -2,7 +2,8 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: tool availability honours the option "Show future objects"
+ * Simutrans-Horizon, 2026-11: tool availability honours the option "Show future objects",
+ *                             tool visibility rules for -remote_control
  */
 
 #include <string>
@@ -1018,6 +1019,61 @@ void tool_t::update_toolbars()
 			break;
 		}
 	}
+}
+
+
+// Simutrans-Horizon: tool visibility rules (see simmenu.h)
+static vector_tpl<tool_t::visibility_rule_t> visibility_rules;
+
+
+uint8 tool_t::get_visibility(uint16 id, sint16 wt, const char *param)
+{
+	uint8 visibility = VISIBILITY_DEFAULT;
+	int best = -1;
+	for (visibility_rule_t const& r : visibility_rules) {
+		if (r.id != id  ||  (r.wt != ignore_wt  &&  r.wt != wt)  ||  (!r.param.empty()  &&  (param == NULL  ||  r.param != param))) {
+			continue;
+		}
+		// a rule for one parameter beats a rule for one waytype beats a rule for the whole tool
+		const int specific = (r.param.empty() ? 0 : 2) + (r.wt == ignore_wt ? 0 : 1);
+		if (specific > best) {
+			best = specific;
+			visibility = r.visibility;
+		}
+	}
+	return visibility;
+}
+
+
+void tool_t::set_visibility(uint16 id, sint16 wt, const char *param, uint8 visibility)
+{
+	const std::string p = param ? param : "";
+	for (uint32 i = 0; i < visibility_rules.get_count(); i++) {
+		visibility_rule_t &r = visibility_rules[i];
+		if (r.id == id  &&  r.wt == wt  &&  r.param == p) {
+			if (visibility == VISIBILITY_DEFAULT) {
+				visibility_rules.remove_at(i);
+			}
+			else {
+				r.visibility = visibility;
+			}
+			return;
+		}
+	}
+	if (visibility != VISIBILITY_DEFAULT) {
+		visibility_rule_t r;
+		r.id = id;
+		r.wt = wt;
+		r.param = p;
+		r.visibility = visibility;
+		visibility_rules.append(r);
+	}
+}
+
+
+const vector_tpl<tool_t::visibility_rule_t> &tool_t::get_visibility_rules()
+{
+	return visibility_rules;
 }
 
 

@@ -37,6 +37,7 @@
 #include "../gui/components/gui_scrollpane.h"
 #include "../gui/components/gui_scrolled_list.h"
 #include "../gui/components/gui_tab_panel.h"
+#include "../gui/tool_selector.h"
 #include "../io/raw_image.h"
 #include "../tool/simmenu.h"
 #include "../simconvoi.h"
@@ -46,6 +47,7 @@
 #include "../dataobj/ribi.h"
 #include "../dataobj/schedule.h"
 #include "../descriptor/building_desc.h"
+#include "../descriptor/factory_desc.h"
 #include "../descriptor/goods_desc.h"
 #include "../descriptor/way_desc.h"
 #include "../obj/depot.h"
@@ -57,12 +59,17 @@
 #include "../script/script_loader.h"
 #include "../sys/simsys.h"
 #include "../utils/cbuffer.h"
+#include "../utils/simstring.h"
+#include "../tpl/slist_tpl.h"
+#include "../tpl/vector_tpl.h"
 
 #include "../../squirrel/squirrel.h"
 #include "../../squirrel/sq_extensions.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -1519,6 +1526,16 @@ static void write_halt_brief(json_t &j, halthandle_t halt)
 }
 
 
+/// monthly statistics of a goods slot as [this month, last month], in the units of the factory window
+static void write_goods_stat(json_t &j, const char *name, ware_production_t const &w, int stat)
+{
+	j.key(name).arr();
+	j.num(w.get_stat_converted(0, stat));
+	j.num(w.get_stat_converted(1, stat));
+	j.end_arr();
+}
+
+
 static void write_factory_brief(json_t &j, fabrik_t *fab, bool details)
 {
 	j.obj();
@@ -1527,15 +1544,38 @@ static void write_factory_brief(json_t &j, fabrik_t *fab, bool details)
 	write_koord3d(j, "pos", fab->get_pos());
 	if (details) {
 		j.kv("production", (sint64)fab->get_current_production());
-		const array_tpl<ware_production_t> *lists[2] = { &fab->get_input(), &fab->get_output() };
-		const char *names[2] = { "inputs", "outputs" };
-		for (int l = 0; l < 2; l++) {
-			j.key(names[l]).arr();
-			for (ware_production_t const &w : *lists[l]) {
+		const factory_desc_t *desc = fab->get_desc();
+		for (int io = 0; io < 2; io++) {
+			const array_tpl<ware_production_t> &slots = io == 0 ? fab->get_input() : fab->get_output();
+			j.key(io == 0 ? "inputs" : "outputs").arr();
+			for (uint32 i = 0; i < slots.get_count(); i++) {
+				ware_production_t const &w = slots[i];
+				// the factory window scales the storage with the consumption/production factor (fabrik_t::info_prod)
+				sint64 factor = DEFAULT_PRODUCTION_FACTOR;
+				if (io == 0  &&  desc->get_supplier(i)) {
+					factor = desc->get_supplier(i)->get_consumption();
+				}
+				else if (io == 1  &&  desc->get_product(i)) {
+					factor = desc->get_product(i)->get_factor();
+				}
+				const char *unit = w.get_typ() ? translator::translate(w.get_typ()->get_mass()) : "";
+				while (*unit == ' ') {
+					unit++;
+				}
 				j.obj();
 				j.kv("goods", w.get_typ() ? translator::translate(w.get_typ()->get_name()) : "?");
-				j.kv("storage", (sint64)(w.menge >> fabrik_t::precision_bits));
-				j.kv("max", (sint64)(w.max >> fabrik_t::precision_bits));
+				j.kv("unit", unit);
+				j.kv("storage", convert_goods((sint64)w.menge * factor));
+				j.kv("max", convert_goods((sint64)w.max * factor));
+				if (io == 0) {
+					j.kv("in_transit", (sint64)w.get_in_transit());
+					write_goods_stat(j, "received", w, FAB_GOODS_RECEIVED);
+					write_goods_stat(j, "consumed", w, FAB_GOODS_CONSUMED);
+				}
+				else {
+					write_goods_stat(j, "produced", w, FAB_GOODS_PRODUCED);
+					write_goods_stat(j, "delivered", w, FAB_GOODS_DELIVERED);
+				}
 				j.end_obj();
 			}
 			j.end_arr();
@@ -2122,6 +2162,298 @@ static const char *cmd_factories(const args_t &a, json_t &j)
 }
 
 
+// ---------------------------------------------------------------------------
+// toolbars and tool visibility
+// ---------------------------------------------------------------------------
+
+/// reference of a tool as written in menuconf.tab, e.g. "simple_tool[5]"
+static std::string tool_ref(uint16 id)
+{
+	char buf[32];
+	const unsigned nr = id & 0x0FFF;
+	if (id & TOOLBAR_TOOL) {
+		sprintf(buf, "toolbar[%u]", nr);
+	}
+	else if (id & DIALOGE_TOOL) {
+		sprintf(buf, "dialog_tool[%u]", nr);
+	}
+	else if (id & SIMPLE_TOOL) {
+		sprintf(buf, "simple_tool[%u]", nr);
+	}
+	else if (id & GENERAL_TOOL) {
+		sprintf(buf, "general_tool[%u]", nr);
+	}
+	else {
+		sprintf(buf, "%u", (unsigned)id);
+	}
+	return buf;
+}
+
+
+/// "simple_tool[5]" or a name like "TOOL_SWITCH_PLAYER"; false if there is no such tool
+static bool parse_tool_ref(std::string s, uint16 &id)
+{
+	static const struct { const char *prefix; uint16 flag; uint32 count; } kinds[] = {
+		{ "general_tool[", GENERAL_TOOL, GENERAL_TOOL_COUNT },
+		{ "simple_tool[",  SIMPLE_TOOL,  SIMPLE_TOOL_COUNT },
+		{ "dialog_tool[",  DIALOGE_TOOL, DIALOGE_TOOL_COUNT },
+		{ "toolbar[",      TOOLBAR_TOOL, 0 }
+	};
+	for (auto const &k : kinds) {
+		const size_t len = strlen(k.prefix);
+		if (s.compare(0, len, k.prefix) == 0) {
+			char *end = NULL;
+			const long nr = strtol(s.c_str() + len, &end, 10);
+			const uint32 count = k.flag == TOOLBAR_TOOL ? tool_t::toolbar_tool.get_count() : k.count;
+			if (end == s.c_str() + len  ||  strcmp(end, "]") != 0  ||  nr < 0  ||  (uint32)nr >= count) {
+				return false;
+			}
+			id = (uint16)(k.flag | nr);
+			return true;
+		}
+	}
+	std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)toupper(c); });
+	for (auto const &k : kinds) {
+		for (uint32 nr = 0; nr < k.count; nr++) {
+			if (s == tool_t::id_to_string((uint16)(k.flag | nr))) {
+				id = (uint16)(k.flag | nr);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+
+static const char *visibility_name(uint8 v)
+{
+	return v == tool_t::VISIBILITY_SHOW ? "show" : (v == tool_t::VISIBILITY_HIDE ? "hide" : "default");
+}
+
+
+static bool contains_nocase(const char *text, const std::string &part)
+{
+	if (text == NULL) {
+		return false;
+	}
+	std::string t = text, p = part;
+	std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return (char)tolower(c); });
+	std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return (char)tolower(c); });
+	return t.find(p) != std::string::npos;
+}
+
+
+static void write_tool_ids(json_t &j, uint16 id, sint16 wt, const char *param)
+{
+	j.kv("ref", tool_ref(id).c_str());
+	if ((id & TOOLBAR_TOOL) == 0) {
+		j.kv("name", tool_t::id_to_string(id));
+	}
+	if (wt != invalid_wt  &&  wt != ignore_wt) {
+		j.kv("waytype", (int)wt);
+	}
+	if (param  &&  *param) {
+		j.kv("param", param);
+	}
+}
+
+
+static void write_tool_entry(json_t &j, tool_t *w, player_t *player, const char *reason)
+{
+	const char *param = w->get_default_param();
+	j.obj();
+	write_tool_ids(j, w->get_id(), w->get_waytype(), param);
+	const char *tip = w->get_tooltip(player);
+	j.kv("tooltip", tip ? tip : "");
+	const uint8 rule = tool_t::get_visibility(w->get_id(), w->get_waytype(), param);
+	if (rule != tool_t::VISIBILITY_DEFAULT) {
+		j.kv("rule", visibility_name(rule));
+	}
+	if (reason) {
+		j.kv("reason", reason);
+	}
+	else if (!w->enabled) {
+		j.kv("enabled", false);
+	}
+	j.end_obj();
+}
+
+
+/// why a configured tool is not in its toolbar (same checks as toolbar_t::update)
+static const char *tool_hidden_reason(tool_t *w, player_t *player)
+{
+	const char *param = w->get_default_param();
+	if (tool_t::get_visibility(w->get_id(), w->get_waytype(), param) == tool_t::VISIBILITY_HIDE) {
+		return "hidden by rule";
+	}
+	scenario_t *scen = world()->get_scenario();
+	if (scen->is_scripted()  &&  !scen->is_tool_allowed(player, w->get_id(), w->get_waytype(), param)) {
+		return "forbidden by scenario";
+	}
+	if (!check_tool_availability(w)) {
+		return "not available (timeline)";
+	}
+	return (w->get_id() & TOOLBAR_TOOL) ? "no tools in it" : "not shown";
+}
+
+
+/// meta tools like ways(16,0) fill a toolbar with one general tool for one waytype
+static bool meta_tool_target(const char *param, uint16 &id, sint16 &wt)
+{
+	static const struct { const char *prefix; uint16 tool; } metas[] = {
+		{ "ways(",    TOOL_BUILD_WAY },
+		{ "bridges(", TOOL_BUILD_BRIDGE },
+		{ "tunnels(", TOOL_BUILD_TUNNEL },
+		{ "signs(",   TOOL_BUILD_ROADSIGN },
+		{ "wayobjs(", TOOL_BUILD_WAYOBJ }
+	};
+	for (auto const &m : metas) {
+		if (const char *c = strstart(param, m.prefix)) {
+			id = (uint16)(m.tool | GENERAL_TOOL);
+			wt = (sint16)atoi(c);
+			return true;
+		}
+	}
+	return false;
+}
+
+
+static void write_visibility_rules(json_t &j)
+{
+	j.key("rules").arr();
+	for (tool_t::visibility_rule_t const &r : tool_t::get_visibility_rules()) {
+		j.obj();
+		write_tool_ids(j, r.id, r.wt, r.param.c_str());
+		j.kv("visibility", visibility_name(r.visibility));
+		j.end_obj();
+	}
+	j.end_arr();
+}
+
+
+/**
+ * The toolbars with the tools they show and the configured tools they do not show, with the reason.
+ * toolbar=<index or part of the name/title> limits the list to matching toolbars.
+ */
+static const char *cmd_toolbars(const args_t &a, json_t &j)
+{
+	player_t *player = world()->get_active_player();
+	scenario_t *scen = world()->get_scenario();
+	const std::string filter = arg_str(a, "toolbar");
+	char *end = NULL;
+	const long filter_nr = filter.empty() ? -1 : strtol(filter.c_str(), &end, 10);
+	const bool filter_by_index = !filter.empty()  &&  *end == 0;
+
+	j.key("toolbars").arr();
+	for (uint32 t = 0; t < tool_t::toolbar_tool.get_count(); t++) {
+		toolbar_t *tb = tool_t::toolbar_tool[t];
+		const char *name = tb->get_default_param();
+		const char *title = t == 0 ? "main menu" : tb->get_tooltip(player);
+		if (filter_by_index ? filter_nr != (long)t : (!filter.empty()  &&  !contains_nocase(name, filter)  &&  !contains_nocase(title, filter))) {
+			continue;
+		}
+		tool_selector_t *sel = tb->get_tool_selector();
+		j.obj();
+		j.kv("ref", tool_ref(tb->get_id()).c_str());
+		j.kv("name", name ? name : "");
+		j.kv("title", title ? title : "");
+		j.kv("open", t == 0  ||  tb->is_selected());
+		j.key("tools").arr();
+		for (uint32 i = 0; sel  &&  i < sel->get_tool_count(); i++) {
+			if (sel->get_tool(i) != tool_t::dummy) {
+				write_tool_entry(j, sel->get_tool(i), player, NULL);
+			}
+		}
+		j.end_arr();
+		j.key("hidden").arr();
+		for (tool_t *w : tb->get_tools()) {
+			const char *param = w->get_default_param();
+			if (w->command_key == 1  &&  w->get_icon(player) == IMG_EMPTY) {
+				// meta tool: the whole group is missing if the scenario forbids the tool for this waytype
+				uint16 id;
+				sint16 wt;
+				if (param  &&  meta_tool_target(param, id, wt)  &&  scen->is_scripted()  &&  !scen->is_tool_allowed(player, id, wt)) {
+					j.obj();
+					write_tool_ids(j, id, wt, NULL);
+					j.kv("meta", param);
+					const uint8 rule = tool_t::get_visibility(id, wt, NULL);
+					if (rule != tool_t::VISIBILITY_DEFAULT) {
+						j.kv("rule", visibility_name(rule));
+					}
+					j.kv("reason", "forbidden by scenario");
+					j.end_obj();
+				}
+				continue;
+			}
+			if (w->get_icon(player) == IMG_EMPTY  &&  (w->get_id() & TOOLBAR_TOOL) == 0) {
+				continue; // keyboard shortcut only
+			}
+			bool shown = false;
+			for (uint32 i = 0; sel  &&  i < sel->get_tool_count()  &&  !shown; i++) {
+				shown = sel->get_tool(i) == w;
+			}
+			if (!shown) {
+				write_tool_entry(j, w, player, tool_hidden_reason(w, player));
+			}
+		}
+		j.end_arr();
+		j.end_obj();
+	}
+	j.end_arr();
+	write_visibility_rules(j);
+	return NULL;
+}
+
+
+/**
+ * Sets a visibility rule: tool=<ref or name> visibility=show|hide|default [waytype=<nr>] [param=<text>],
+ * or clear=1 removes all rules. Always returns the rules.
+ */
+static const char *cmd_tool_visibility(const args_t &a, json_t &j)
+{
+	if (arg_bool(a, "clear", false)) {
+		while (tool_t::get_visibility_rules().get_count() > 0) {
+			const tool_t::visibility_rule_t r = tool_t::get_visibility_rules()[0];
+			tool_t::set_visibility(r.id, r.wt, r.param.c_str(), tool_t::VISIBILITY_DEFAULT);
+		}
+		tool_t::update_toolbars();
+	}
+	else if (has_arg(a, "tool")) {
+		uint16 id = 0;
+		if (!parse_tool_ref(arg_str(a, "tool"), id)) {
+			return "unknown tool: use a reference like simple_tool[5] (see toolbars) or a name like TOOL_SWITCH_PLAYER";
+		}
+		const std::string vis = arg_str(a, "visibility");
+		uint8 v;
+		if (vis == "show") {
+			v = tool_t::VISIBILITY_SHOW;
+		}
+		else if (vis == "hide") {
+			v = tool_t::VISIBILITY_HIDE;
+		}
+		else if (vis == "default") {
+			v = tool_t::VISIBILITY_DEFAULT;
+		}
+		else {
+			return "visibility must be show, hide or default";
+		}
+		if (v == tool_t::VISIBILITY_SHOW  &&  env_t::networkmode) {
+			return "show is not possible in network games";
+		}
+		const sint16 wt = (sint16)arg_int(a, "waytype", ignore_wt);
+		const std::string param = arg_str(a, "param");
+		tool_t::set_visibility(id, wt, param.c_str(), v);
+		tool_t::update_toolbars();
+		j.key("tool").obj();
+		write_tool_ids(j, id, wt, param.c_str());
+		j.kv("visibility", visibility_name(v));
+		j.end_obj();
+	}
+	write_visibility_rules(j);
+	return NULL;
+}
+
+
 struct command_t
 {
 	const char *name;
@@ -2157,6 +2489,8 @@ static const command_t commands[] = {
 	{ "convoys",      cmd_convoys },
 	{ "lines",        cmd_lines },
 	{ "factories",    cmd_factories },
+	{ "toolbars",     cmd_toolbars },
+	{ "tool_visibility", cmd_tool_visibility },
 };
 
 

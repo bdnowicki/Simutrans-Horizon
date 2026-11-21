@@ -2,7 +2,8 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: fixed the inverted cache check in load_language_file()
+ * Simutrans-Horizon, 2026-11: fixed the inverted cache check in load_language_file(),
+ *                             a tool shown by a visibility rule of -remote_control is allowed
  */
 
 #include "../sys/simsys.h"
@@ -600,6 +601,11 @@ bool scenario_t::is_tool_allowed(const player_t* player, uint16 tool_id, sint16 
 		return true;
 	}
 
+	// Simutrans-Horizon: shown through -remote_control (single player only)
+	if (!env_t::networkmode  &&  tool_t::get_visibility(tool_id, wt, param) == tool_t::VISIBILITY_SHOW) {
+		return true;
+	}
+
 	// first test the list
 	uint8 player_nr = player ? player->get_player_nr() : PLAYER_UNOWNED;
 	forbidden_t test(forbidden_t::forbid_tool, tool_id, wt, param);
@@ -652,8 +658,10 @@ const char* scenario_t::is_work_allowed_here(const player_t* player, uint16 tool
 		// not allowed => test for forbidden area
 		player_nr = player ? player->get_player_nr() : PLAYER_UNOWNED;
 		test.type = forbidden_t::forbid_tool;
-		idx = matching_rule(player_nr, test, koord3d::invalid);
-		if (idx == -1 && player_nr != PLAYER_UNOWNED) {
+		// Simutrans-Horizon: a tool shown through -remote_control is not banned as a whole (single player only)
+		const bool shown = !env_t::networkmode  &&  tool_t::get_visibility(tool_id, wt, param) == tool_t::VISIBILITY_SHOW;
+		idx = shown ? -1 : matching_rule(player_nr, test, koord3d::invalid);
+		if (idx == -1 && player_nr != PLAYER_UNOWNED && !shown) {
 			// retry as public player
 			player_nr = PLAYER_UNOWNED;
 			idx = matching_rule(player_nr, test, koord3d::invalid);
@@ -773,6 +781,10 @@ const char* scenario_t::is_convoy_allowed(const player_t* player, convoihandle_t
 bool scenario_t::is_tool_enabled(const player_t * player, uint16 tool_id, sint16 wt, const char *param)
 {
 	if (what_scenario != SCRIPTED  &&  what_scenario != SCRIPTED_NETWORK) {
+		return true;
+	}
+	// Simutrans-Horizon: shown through -remote_control (single player only)
+	if (!env_t::networkmode  &&  tool_t::get_visibility(tool_id, wt, param) == tool_t::VISIBILITY_SHOW) {
 		return true;
 	}
 	// then call script if available

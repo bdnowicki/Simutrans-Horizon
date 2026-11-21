@@ -30,7 +30,7 @@ import traceback
 import urllib.parse
 
 SERVER_NAME = "simutrans"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # stay below the 5 MB image limit of the Claude API
 MAX_IMAGE_SIDE = 1568  # Claude scales larger images down anyway
 HELLO = "HELLO simutrans-remote 1"
@@ -59,6 +59,7 @@ Reading the game:
 - map_view: the map around the view (or any region) as character grids with stations,
   factories, cities, convoys, depots and labels in it. tile_info: everything on one tile.
 - players, cities, stations, station_details, convoys, lines, factories: game objects.
+- toolbars: the toolbars with their tools, and which tools are hidden and why.
 - run_squirrel: any other query through the scripting API.
 - screenshot: an image of the game window. Use it only after the JSON tools: map_view and
   tile_info are exact, cheap and give coordinates; a screenshot is costly and approximate.
@@ -71,6 +72,7 @@ Acting:
 - Input is handled in the next frames; actions report the open windows afterwards
   (ui=true includes their elements).
 - change_cash adds money to (or takes it from) a player's bank account.
+- set_tool_visibility hides a toolbar tool or shows one the scenario forbids (single player).
 Useful keys: escape closes the top window, "p" pauses, "," and "." change the speed.
 
 """ + MAP_LEGEND
@@ -295,6 +297,69 @@ def tool_lines(args):
 
 def tool_factories(args):
     return [text(game.request("factories", **pick(args, "x1", "y1", "x2", "y2", "limit")))]
+
+
+WAYTYPES = {"road": 1, "rail": 2, "water": 3, "overheadlines": 4, "monorail": 5, "maglev": 6,
+            "tram": 7, "narrowgauge": 8, "air": 16, "power": 128}
+WAYTYPE_NAMES = {v: k for k, v in WAYTYPES.items()}
+
+
+def waytype_number(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, int) or str(value).lstrip("-").isdigit():
+        return int(value)
+    key = str(value).lower()
+    key = key[3:] if key.startswith("wt_") else key
+    key = {"track": "rail", "narrow_gauge": "narrowgauge", "powerline": "power"}.get(key, key)
+    if key not in WAYTYPES:
+        raise GameError(f"unknown waytype '{value}'; use one of {sorted(WAYTYPES)} or a number")
+    return WAYTYPES[key]
+
+
+def name_waytypes(entries):
+    for e in entries:
+        if "waytype" in e:
+            e["waytype"] = WAYTYPE_NAMES.get(e["waytype"], e["waytype"])
+    return entries
+
+
+def tool_toolbars(args):
+    r = game.request("toolbars", toolbar=args.get("toolbar"))
+    search = (args.get("search") or "").lower()
+    detail = bool(search or args.get("toolbar"))
+    toolbars = []
+    for tb in r["toolbars"]:
+        name_waytypes(tb["tools"])
+        name_waytypes(tb["hidden"])
+        if search:
+            def match(t):
+                return search in " ".join(str(t.get(k, "")) for k in ("ref", "name", "tooltip", "param", "meta")).lower()
+            tb["tools"] = [t for t in tb["tools"] if match(t)]
+            tb["hidden"] = [t for t in tb["hidden"] if match(t)]
+            if not tb["tools"] and not tb["hidden"]:
+                continue
+        elif not detail:
+            tb["tools"] = len(tb["tools"])  # overview: only the number of shown tools
+        toolbars.append(tb)
+    return [text({"toolbars": toolbars, "rules": name_waytypes(r.get("rules", []))})]
+
+
+def tool_set_tool_visibility(args):
+    if args.get("clear"):
+        r = game.request("tool_visibility", clear=True)
+    else:
+        tool = (args.get("tool") or "").strip()
+        if not tool or not args.get("visibility"):
+            raise GameError("give tool and visibility (show, hide or default), or clear=true")
+        if "[" in tool:
+            tool = tool.lower()
+        r = game.request("tool_visibility", tool=tool, visibility=args["visibility"],
+                         waytype=waytype_number(args.get("waytype")), param=args.get("param"))
+    if "tool" in r:
+        name_waytypes([r["tool"]])
+    name_waytypes(r.get("rules", []))
+    return [text(r)]
 
 
 def tool_messages(args):
@@ -599,10 +664,21 @@ TOOLS = [
      "Lines: id, name, owner, type, number of convoys, stops (positions and station names), profit, "
      "transported and capacity this and last month.", schema({"owner": OWNER, "limit": LIMIT}), True),
     ("factories", tool_factories,
-     "Factories with production, input/output storage and number of suppliers/consumers; optional region "
-     "x1,y1,x2,y2.", schema({"x1": INT, "y1": INT, "x2": INT, "y2": INT, "limit": LIMIT}), True),
+     "Factories with production and per input/output good: storage and max in the units of the factory window "
+     "(unit), [this month, last month] produced and delivered (outputs) or received and consumed (inputs), "
+     "amount in transit (inputs); number of suppliers/consumers; optional region x1,y1,x2,y2.",
+     schema({"x1": INT, "y1": INT, "x2": INT, "y2": INT, "limit": LIMIT}), True),
     ("messages", tool_messages, "Latest messages of the message center (newest first), incl. scenario messages.",
      schema({"count": INT}), True),
+    ("toolbars", tool_toolbars,
+     "Toolbars and their tools for the active player. Per toolbar: ref (toolbar[N]), name, title, open, the "
+     "tools it shows (ref like simple_tool[5], name like TOOL_SWITCH_PLAYER, tooltip, param, waytype) and the "
+     "configured tools it does not show, with the reason (forbidden by scenario, not available (timeline), "
+     "hidden by rule). Without toolbar and search only the number of shown tools is given. Also lists the "
+     "rules set with set_tool_visibility.",
+     schema({"toolbar": {"type": "string", "description": "toolbar index or part of its name/title, e.g. AIRTOOLS"},
+             "search": {"type": "string", "description": "only tools whose ref, name, tooltip or param "
+                        "contains this text, e.g. 'Change player' or 'switch_player'"}}), True),
     ("ui_elements", tool_ui_elements,
      "Open windows with their visible GUI elements (buttons, labels, tabs, text fields, list items), "
      "each with screen rectangle and center (cx, cy).",
@@ -683,6 +759,19 @@ TOOLS = [
      schema({"amount": {"type": "number", "description": "credits, e.g. 1000000 or -50000"},
              "player": {"type": "integer", "description": "player number (default: active player)"}}, ["amount"]),
      False),
+    ("set_tool_visibility", tool_set_tool_visibility,
+     "Show or hide a tool in the toolbars. hide leaves it out of all toolbars (its keyboard shortcut still "
+     "works). show lifts a scenario ban on the tool, so its button is back and it works (single player only; "
+     "scenario rules for map areas still apply). default removes the rule. tool is a ref from toolbars like "
+     "simple_tool[5] or a name like TOOL_SWITCH_PLAYER (the 'Change player' button, which every scenario "
+     "forbids). waytype and param (a descriptor name) narrow the rule, e.g. tool=TOOL_BUILD_WAY waytype=air "
+     "visibility=show allows taxiways and runways. Rules last until the game is closed; clear=true removes all.",
+     schema({"tool": {"type": "string", "description": "e.g. simple_tool[5], TOOL_SWITCH_PLAYER, TOOL_BUILD_WAY"},
+             "visibility": {"type": "string", "enum": ["show", "hide", "default"]},
+             "waytype": {"type": "string", "description": "only for this waytype: road, rail, water, monorail, "
+                         "maglev, tram, narrowgauge, air, power (default: all)"},
+             "param": {"type": "string", "description": "only for the tool with this parameter, e.g. a way name"},
+             "clear": {"type": "boolean", "description": "remove all rules"}}), False),
     ("wait", tool_wait, "Let the game run for some seconds (max 300), then report the date.",
      schema({"seconds": {"type": "number"}}), True),
     ("launch_game", tool_launch_game,

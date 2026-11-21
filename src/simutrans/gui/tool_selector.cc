@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: tools hidden by a visibility rule of -remote_control are left out
  */
 
 
@@ -45,6 +47,9 @@ void tool_selector_t::add_tool_selector(tool_t *tool_in)
 {
 	image_id tool_img = tool_in->get_icon(welt->get_active_player());
 	if(  tool_img == IMG_EMPTY  &&  tool_in!=tool_t::dummy  ) {
+		return;
+	}
+	if(  tool_in != tool_t::dummy  &&  tool_t::get_visibility(tool_in->get_id(), tool_in->get_waytype(), tool_in->get_default_param()) == tool_t::VISIBILITY_HIDE  ) {
 		return;
 	}
 
