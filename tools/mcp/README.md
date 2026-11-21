@@ -56,6 +56,7 @@ claude mcp add simutrans --scope local \
 | `use_tool` | apply a game tool exactly at map coordinates (build way, station, depot, remove, ...) |
 | `change_cash` | add money to (or take it from) a player's bank account, like `book_cash()` of scenario scripts |
 | `set_tool_visibility` | hide a toolbar tool, or show a tool that the scenario forbids; see below |
+| `unlock_game` | lift the "Lock game" lock of a map so the player can be changed; see below |
 | `click_element`, `click`, `drag`, `move_mouse`, `scroll_wheel`, `press_key`, `type_text` | GUI input; the result lists the open windows afterwards |
 | `center_view`, `zoom`, `set_pause`, `set_fast_forward`, `wait`, `launch_game` | view, time and process control |
 
@@ -102,9 +103,15 @@ are named as in `menuconf.tab` (`simple_tool[5]`) and by their constant (`TOOL_S
 * `default` removes the rule; `clear` removes all rules.
 
 Examples: `tool=TOOL_SWITCH_PLAYER visibility=show` brings back the "Change player" button, which
-every scenario forbids (`simutrans/script/scenario_base.nut`); on a map locked with "Lock game" changing the
-player stays impossible. `tool=TOOL_BUILD_WAY waytype=air visibility=show` allows taxiways and
-runways when a scenario forbids them. Rules are not saved and last until the game is closed.
+every scenario forbids (`simutrans/script/scenario_base.nut`). `tool=TOOL_BUILD_WAY waytype=air
+visibility=show` allows taxiways and runways when a scenario forbids them. Rules are not saved and
+last until the game is closed.
+
+A map author can also lock the map with "Lock game" (the public player gets a password and changing
+the player is switched off; the game then says "This game is locked"). `unlock_game` switches
+changing the player on again, in single player games only. Unlike the visibility rules this is a
+setting of the map and is saved with the game; the public player keeps its password, so acting as
+the public player still asks for it.
 
 ## Security
 

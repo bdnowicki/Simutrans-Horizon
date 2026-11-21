@@ -73,6 +73,7 @@ Acting:
   (ui=true includes their elements).
 - change_cash adds money to (or takes it from) a player's bank account.
 - set_tool_visibility hides a toolbar tool or shows one the scenario forbids (single player).
+- unlock_game lifts the "Lock game" lock of a map, so the player can be changed (single player).
 Useful keys: escape closes the top window, "p" pauses, "," and "." change the speed.
 
 """ + MAP_LEGEND
@@ -360,6 +361,10 @@ def tool_set_tool_visibility(args):
         name_waytypes([r["tool"]])
     name_waytypes(r.get("rules", []))
     return [text(r)]
+
+
+def tool_unlock_game(args):
+    return [text(game.request("unlock_game"))]
 
 
 def tool_messages(args):
@@ -772,6 +777,11 @@ TOOLS = [
                          "maglev, tram, narrowgauge, air, power (default: all)"},
              "param": {"type": "string", "description": "only for the tool with this parameter, e.g. a way name"},
              "clear": {"type": "boolean", "description": "remove all rules"}}), False),
+    ("unlock_game", tool_unlock_game,
+     "Lift the lock of a map locked with 'Lock game' (message 'This game is locked, you cannot change the "
+     "player'), so the player can be changed again. Single player only. The change is saved with the game; "
+     "the public player keeps its password. In a scenario the 'Change player' tool also needs "
+     "set_tool_visibility tool=TOOL_SWITCH_PLAYER visibility=show.", schema(), False),
     ("wait", tool_wait, "Let the game run for some seconds (max 300), then report the date.",
      schema({"seconds": {"type": "number"}}), True),
     ("launch_game", tool_launch_game,

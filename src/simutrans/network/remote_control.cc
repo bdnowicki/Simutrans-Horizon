@@ -774,6 +774,7 @@ static const char *cmd_status(const args_t &a, json_t &j)
 	j.kv("pakset", env_t::pak_name.c_str());
 	j.kv("networkmode", env_t::networkmode);
 	j.kv("server", env_t::server != 0);
+	j.kv("player_change_allowed", welt->get_settings().get_allow_player_change() != 0);
 	j.end_obj();
 
 	j.key("screen").obj();
@@ -2454,6 +2455,24 @@ static const char *cmd_tool_visibility(const args_t &a, json_t &j)
 }
 
 
+/**
+ * Lifts the lock of a map locked with "Lock game", so the player can be changed again.
+ * Single player only. The setting is saved with the game; the public player keeps its password.
+ */
+static const char *cmd_unlock_game(const args_t &, json_t &j)
+{
+	if (env_t::networkmode) {
+		return "not available in network games";
+	}
+	karte_t *welt = world();
+	j.kv("was_locked", welt->get_settings().get_allow_player_change() == 0);
+	welt->get_settings().set_allow_player_change(true);
+	tool_t::update_toolbars();
+	j.kv("public_player_password", welt->get_public_player()->is_locked());
+	return NULL;
+}
+
+
 struct command_t
 {
 	const char *name;
@@ -2491,6 +2510,7 @@ static const command_t commands[] = {
 	{ "factories",    cmd_factories },
 	{ "toolbars",     cmd_toolbars },
 	{ "tool_visibility", cmd_tool_visibility },
+	{ "unlock_game",  cmd_unlock_game },
 };
 
 
