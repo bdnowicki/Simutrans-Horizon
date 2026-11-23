@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: query for queued string events (text of the remote control)
  */
 
 #include "simevent.h"
@@ -309,4 +311,15 @@ void queue_event(event_t *events)
 		}
 	}
 	queued_events.append(events);
+}
+
+
+bool is_string_event_queued(const void *text)
+{
+	for(  event_t const *ev : queued_events  ) {
+		if(  ev->ev_class == EVENT_STRING  &&  ev->ev_ptr == text  ) {
+			return true;
+		}
+	}
+	return false;
 }

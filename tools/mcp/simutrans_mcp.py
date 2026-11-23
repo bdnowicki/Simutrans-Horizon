@@ -30,7 +30,7 @@ import traceback
 import urllib.parse
 
 SERVER_NAME = "simutrans"
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # stay below the 5 MB image limit of the Claude API
 MAX_IMAGE_SIDE = 1568  # Claude scales larger images down anyway
 HELLO = "HELLO simutrans-remote 1"
@@ -228,16 +228,6 @@ def after_input(args, done):
         windows = [{"title": w["title"], "top": w["top"], "x": w["x"], "y": w["y"], "w": w["w"], "h": w["h"]}
                    for w in windows]
     return [text({"done": done, "open_windows": windows})]
-
-
-def squirrel_literal(value):
-    return json.dumps(value)  # JSON strings are valid Squirrel string literals
-
-
-def squirrel_pos(x, y, z):
-    if z is None:
-        return f"square_x({int(x)},{int(y)}).get_ground_tile()"
-    return f"coord3d({int(x)},{int(y)},{int(z)})"
 
 
 def pick(args, *names):
@@ -545,24 +535,25 @@ def tool_change_cash(args):
 
 
 def tool_use_tool(args):
-    tool = args["tool"]
-    tool_expr = str(int(tool)) if str(tool).lstrip("-").isdigit() else str(tool)
-    if not tool_expr.replace("_", "").isalnum():
-        raise GameError("tool must be a constant name like tool_build_way or a numeric id")
-    player = f"player_x({int(args['player'])})" if args.get("player") is not None else "player_x.self()"
-    start = squirrel_pos(args["x"], args["y"], args.get("z"))
-    params = [player, start]
+    # native command "tool" of the game (works like command_x(...).work(...) of scripts, also in network games)
+    params = {"tool": args["tool"], "player": args.get("player"),
+              "x": int(args["x"]), "y": int(args["y"]), "z": args.get("z")}
+    where = f"({params['x']},{params['y']})"
     if args.get("x2") is not None and args.get("y2") is not None:
-        params.append(squirrel_pos(args["x2"], args["y2"], args.get("z2")))
-        params.append(squirrel_literal(args.get("param", "")))
+        params.update(x2=int(args["x2"]), y2=int(args["y2"]), z2=args.get("z2"), param=args.get("param", ""))
+        where += f" -> ({params['x2']},{params['y2']})"
     elif args.get("param") is not None:
-        params.append(squirrel_literal(args["param"]))
-    code = f"return command_x({tool_expr}).work({', '.join(params)})"
-    r = game.request("eval", code=code)
-    result = r.get("result")
-    if result:
-        raise GameError(f"tool failed: {result}")
-    return after_input(args, f"tool executed: {code}")
+        params["param"] = args["param"]
+    try:
+        r = game.request("tool", **params)
+    except GameError as e:
+        raise GameError(f"tool failed: {e}") from e
+    done = f"tool {args['tool']} executed at {where}"
+    if params.get("param"):
+        done += f" with param {params['param']!r}"
+    if r.get("pending"):
+        done += " (network game: sent to the server, a refusal is shown in the game)"
+    return after_input(args, done)
 
 
 def tool_wait(args):
@@ -722,8 +713,10 @@ TOOLS = [
     ("use_tool", tool_use_tool,
      "Apply a game tool exactly at map coordinates as the active player, e.g. tool=tool_build_way with "
      "x,y -> x2,y2 and param=<way name>, or tool=tool_remover at x,y. z defaults to the ground height. "
-     "Returns an error text if the game refuses (cost, scenario rules, terrain).",
-     schema(with_after({"tool": {"type": "string", "description": "tool constant like tool_build_way, or numeric id"},
+     "Returns an error text if the game refuses (cost, scenario rules, terrain, password protected player). "
+     "Works in network games too (the server executes the tool).",
+     schema(with_after({"tool": {"type": "string",
+                                 "description": "tool constant like tool_build_way (or TOOL_BUILD_WAY), or numeric id"},
                         "x": INT, "y": INT, "z": INT, "x2": INT, "y2": INT, "z2": INT,
                         "param": {"type": "string", "description": "tool parameter, usually a descriptor name"},
                         "player": INT}), ["tool", "x", "y"]), False),

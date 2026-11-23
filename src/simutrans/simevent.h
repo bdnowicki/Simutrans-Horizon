@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: query for queued string events (text of the remote control)
  */
 
 #ifndef SIMEVENT_H
@@ -232,5 +234,8 @@ scr_coord get_mouse_pos();
 
 /// Adds new events to be processed.
 void queue_event(event_t *event);
+
+/// True if a queued (not yet polled) string event still points to this text.
+bool is_string_event_queued(const void *text);
 
 #endif

@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: minimap colours as palette indices without the window, tile change hook for the remote control
  */
 
 #ifndef GUI_MINIMAP_H
@@ -194,6 +195,59 @@ public:
 
 	/// needed for town passenger map
 	static PIXVAL calc_ground_color (const grund_t *gr);
+
+	/*
+	 * The minimap colours as indices of the 256 colour palette (gfx->get_color_rgb()), computed
+	 * without the minimap window; the in-game minimap uses them too, so both always agree.
+	 */
+
+	/// maxima of the modes that colour relative to the largest value on the map
+	struct color_scale_t {
+		sint32 max_cargo;  ///< MAP_FREIGHT
+		sint32 max_passed; ///< MAP_TRAFFIC
+		sint32 max_level;  ///< MAP_LEVEL
+	};
+
+	/// palette index of calc_severity_color() and calc_severity_color_log()
+	static palette_index_t calc_severity_color_index(sint32 amount, sint32 scale);
+	static palette_index_t calc_severity_color_log_index(sint32 amount, sint32 scale);
+
+	/// palette index of calc_height_color()
+	static palette_index_t calc_height_color_index(const sint16 height, const sint16 groundwater);
+
+	/// palette index of the height colour table: 0..4 water (deepest first), 5..35 land
+	static palette_index_t get_height_color_table(int i);
+	static int get_height_color_count();
+
+	/// palette index of the severity colours (low to high)
+	static palette_index_t get_severity_color_table(int i) { return severity_color[i]; }
+
+	/// palette index of calc_ground_color() for a display mode (only MAP_HIDE_CONTOUR and MAP_CLIMATES matter)
+	static palette_index_t calc_ground_color_index(const grund_t *gr, MAP_DISPLAY_MODE display_mode);
+
+	/**
+	 * the value of a ground that MAP_FREIGHT (goods), MAP_TRAFFIC (convoys) or MAP_LEVEL (city
+	 * building level) colours relative to the maximum; false if the ground has none
+	 */
+	static bool get_scaled_value(const grund_t *gr, MAP_DISPLAY_MODE display_mode, sint32 &value);
+
+	/**
+	 * palette index of a ground in a display mode, without vehicles; false if the mode shows nothing
+	 * special on this ground (then the ground colour applies)
+	 */
+	static bool calc_mode_color_index(const grund_t *gr, MAP_DISPLAY_MODE display_mode, const color_scale_t &scale, palette_index_t &color);
+
+	/**
+	 * palette index of a map square as calc_map_pixel(koord) colours it in the normal (not underground)
+	 * view; with_vehicles shows convoys like the minimap does
+	 */
+	static palette_index_t calc_tile_color_index(koord k, MAP_DISPLAY_MODE display_mode, const color_scale_t &scale, bool with_vehicles);
+
+	/**
+	 * if set, calc_map_pixel(koord) calls it for every square it is called for, also while no minimap
+	 * is visible, but not during full redraws (calc_map()); used by the remote control to track changes
+	 */
+	static void (*tile_changed_hook)(koord k);
 
 	/// we are single instance ...
 	static minimap_t *get_instance();

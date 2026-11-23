@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: new messages are reported to the remote control
  */
 
 #include "macros.h"
@@ -18,6 +20,7 @@
 #include "dataobj/environment.h"
 #include "dataobj/pakset_manager.h"
 #include "network/network_socket_list.h"
+#include "network/remote_control.h"
 #include "player/simplay.h"
 #include "utils/simstring.h"
 #include "tpl/slist_tpl.h"
@@ -239,6 +242,9 @@ DBG_MESSAGE("message_t::add_msg()","%40s (at %i,%i,%i)", text, pos.x, pos.y, pos
 
 	// insert at the top
 	list.insert(n);
+
+	// for clients of the remote control that subscribed messages (seq as in its command messages)
+	remote_control_on_message(n, list.get_count());
 
 	// if we are not current player, do not open windows
 	if(  (what_bit&(1<<ai))==0  &&   (color & PLAYER_FLAG) != 0  &&  welt->get_active_player_nr() != (color&(~PLAYER_FLAG))  ) {

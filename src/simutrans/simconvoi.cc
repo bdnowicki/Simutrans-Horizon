@@ -1,6 +1,8 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ *
+ * Simutrans-Horizon, 2026-11: arrivals at stops are reported to the remote control
  */
 
 #include <stdlib.h>
@@ -10,6 +12,7 @@
 #include "world/simworld.h"
 #include "simware.h"
 #include "player/finance.h" // convert_money
+#include "network/remote_control.h"
 #include "player/simplay.h"
 #include "simconvoi.h"
 #include "simhalt.h"
@@ -1638,6 +1641,7 @@ void convoi_t::ziel_erreicht()
 
 			akt_speed = 0;
 			halt->book(1, HALT_CONVOIS_ARRIVED);
+			remote_control_on_arrival(self.get_id(), halt.get_id());
 			state = LOADING;
 			arrived_time = welt->get_ticks();
 			last_load_tick = arrived_time;

@@ -2,7 +2,7 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: -remote_control polling in interactive(), is_available_for_players() and allow_future_objects()
+ * Simutrans-Horizon, 2026-11: -remote_control polling in interactive(), is_available_for_players() and allow_future_objects(), world and month event hooks for the remote control
  */
 
 #include <algorithm>
@@ -413,6 +413,10 @@ void karte_t::destroy()
 	is_sound = false; // karte_t::play_sound_area_clipped needs valid zeiger (pointer/drawer)
 	destroying = true;
 	DBG_MESSAGE("karte_t::destroy()", "destroying world");
+
+	if(  plan  ) {
+		remote_control_on_world(REMOTE_WORLD_CLOSED);
+	}
 
 	// no schedule editor survives this, and the tiles are about to go away
 	clear_schedule_route( 0 );
@@ -1359,6 +1363,7 @@ DBG_DEBUG("karte_t::init()","built timeline");
 		gfx->set_cursor_visible(true);
 	}
 	mute_sound(false);
+	remote_control_on_world(REMOTE_WORLD_CREATED);
 }
 
 
@@ -3007,6 +3012,8 @@ void karte_t::new_month()
 	// update toolbars (i.e. new waytypes
 	tool_t::update_toolbars();
 
+	remote_control_on_month( last_month == 0 );
+
 	// no autosave in networkmode or when the new world dialogue is shown
 	if( !env_t::networkmode  &&  env_t::autosave>0  &&  last_month%env_t::autosave==0  &&  !win_get_magic(magic_welt_gui_t)  ) {
 		cbuffer_t buf;
@@ -4343,6 +4350,7 @@ DBG_MESSAGE("karte_t::load()", "%d factories loaded", all_factories.get_count())
 
 	// loading finished, reset savegame version to current
 	load_version = loadsave_t::int_version( env_t::savegame_version_str, NULL );
+	remote_control_on_world(REMOTE_WORLD_LOADED);
 
 	dbg->warning("karte_t::load()","loaded savegame from %i/%i, next month=%i, ticks=%i (per month=1<<%i)",last_month,last_year,next_month_ticks,ticks,karte_t::ticks_per_world_month_shift);
 }

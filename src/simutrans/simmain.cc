@@ -2,7 +2,7 @@
 /* This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: added the command line option -remote_control
+ * Simutrans-Horizon, 2026-11: added the command line options -remote_control and -remote_control_readonly
  */
 
 #if defined(_M_X64)  ||  defined(__x86_64__)
@@ -420,6 +420,8 @@ void print_help()
 		" -scenario NAME      Load scenario NAME\n"
 		" -remote_control [PORT] accept automation commands on 127.0.0.1\n"
 		"                     (see tools/mcp/README.md), default port 13360\n"
+		" -remote_control_readonly [PORT] like -remote_control, but only commands\n"
+		"                     that do not change the game or the GUI are allowed\n"
 		" -screensize WxH     set screensize to width W and height H\n"
 		" -server [PORT]      starts program as server (for network game)\n"
 		"                     without port specified uses 13353\n"
@@ -1692,14 +1694,15 @@ int simu_main(int argc, char** argv)
 
 	simachievements_t::check_pakset_ach();
 
-	if(  args.has_arg("-remote_control")  ) {
+	const bool remote_control_readonly = args.has_arg("-remote_control_readonly");
+	if(  args.has_arg("-remote_control")  ||  remote_control_readonly  ) {
 		// local automation interface, see network/remote_control.h
-		const char *p = args.gimme_arg("-remote_control", 1);
+		const char *p = args.has_arg("-remote_control") ? args.gimme_arg("-remote_control", 1) : args.gimme_arg("-remote_control_readonly", 1);
 		int port = (p  &&  *p != '-') ? atoi(p) : 0;
 		if(  port <= 0  ||  port > 65535  ) {
 			port = 13360;
 		}
-		if(  !remote_control_init(port)  ) {
+		if(  !remote_control_init(port, remote_control_readonly)  ) {
 			dbg->error("simu_main()", "Could not start remote control on port %d", port);
 		}
 	}
