@@ -1,0 +1,19 @@
+#
+# This file is part of the Simutrans-Horizon project under the Artistic License.
+# (see LICENSE.txt)
+#
+# Settings of the dedicated server (tools/server). The entrypoint copies this file into the
+# user directory once; it is read after config/simuconf.tab of the base directory, so only
+# the lines here differ from the defaults. Edit the copy in the user directory.
+
+# Never announce the server on the public server list (LAN only)
+server_announce = 0
+
+# Game time runs only while at least one client plays; the server saves the game
+# (server<port>-network.sve) whenever the last client leaves
+pause_server_no_clients = 1
+
+# Save the game (server<port>-restore.sve) when the server is stopped
+server_save_game_on_quit = 1
+
+# Note: "autosave" has no effect in network games.

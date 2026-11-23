@@ -1,0 +1,30 @@
+# This file is part of the Simutrans-Horizon project under the Artistic License.
+# (see LICENSE.txt)
+#
+# Dedicated Simutrans-Horizon server with the browser dashboard (see README.md).
+# Variables come from .env next to this file: SIMUTRANS_LAN_IP, SIMUTRANS_INITIAL_SAVE,
+# SIMUTRANS_DASHBOARD_HOSTS, SIMUTRANS_DASHBOARD_TOKEN_VIEWER, SIMUTRANS_DASHBOARD_TOKEN_PLAYER.
+
+name: simutrans
+
+services:
+  server:
+    image: simutrans-horizon-server
+    init: true
+    restart: unless-stopped
+    # the server saves the whole game when it is stopped
+    stop_grace_period: 3m
+    env_file: .env
+    ports:
+      - "${SIMUTRANS_LAN_IP:?set SIMUTRANS_LAN_IP in .env}:13353:13353"
+      - "${SIMUTRANS_LAN_IP}:13380:13380"
+    volumes:
+      # base files (config, text, script, ai, themes, font) and the pakset, byte-identical to the clients
+      - ./base:/simutrans/base:ro
+      # user directory: simuconf.tab, settings, save/ and the server's own saves
+      - ./user:/simutrans/user
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
