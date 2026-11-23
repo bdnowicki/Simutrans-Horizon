@@ -62,8 +62,9 @@ If the game has such a company that must stay (e.g. a scenario's helper company)
 
 On the first start the server loads `SIMUTRANS_INITIAL_SAVE`. Later it continues its own game: the save written
 when it quit (`server13353-restore.sve`) or when the last client left (`server13353-network.sve`),
-whichever is newer. To start over from `SIMUTRANS_INITIAL_SAVE`, stop the server and delete
-`user/server13353-*.sve`.
+whichever is newer. To start over from `SIMUTRANS_INITIAL_SAVE`, stop the server and move
+`user/server13353-*` away. After editing `.env` use `docker compose up -d` (it recreates the
+container); `docker compose start` keeps the old environment.
 
 - Update: build the image again, then `docker compose up -d` (the game is saved and continued).
 - New pakset files: stop the server, copy them into `base/`, start it; clients need the same files.
