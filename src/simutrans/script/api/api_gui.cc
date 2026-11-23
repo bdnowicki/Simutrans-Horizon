@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: the server never sends an empty scenario window tab (clients crashed)
  */
 
 #include "api.h"
@@ -57,7 +58,8 @@ void open_info_win_client(const char* tab, uint8 player_nr)
 		// void network_send_all(network_command_t* nwc, bool exclude_us )
 		nwc_scenario_t *nwc = new nwc_scenario_t();
 		nwc->what = nwc_scenario_t::OPEN_SCEN_WIN;
-		nwc->function = tab;
+		// an empty string arrives as NULL; "info" is the tab that "" selects
+		nwc->function = (tab  &&  *tab) ? tab : "info";
 		network_send_all(nwc, false, player_nr);
 	}
 	else {

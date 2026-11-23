@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: scenario window command without tab no longer crashes
  */
 
 #include "network_cmd_scenario.h"
@@ -53,8 +54,8 @@ bool nwc_scenario_t::execute(karte_t *welt)
 	script_vm_t *script = scen->script;
 
 	if (what == OPEN_SCEN_WIN) {
-		// open window on server and clients
-		scen->open_info_win(function);
+		// open window on server and clients (an empty tab arrives as NULL)
+		scen->open_info_win(function.c_str() ? function.c_str() : "");
 		return true;
 	}
 

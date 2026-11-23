@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: tool calls of resume_game no longer fail on a server
  */
 
 #include "api.h"
@@ -18,6 +19,7 @@
 #include "../../tool/simtool.h"
 #include "../../world/simworld.h"
 #include "../../dataobj/environment.h"
+#include "../../utils/simrandom.h"
 #include "../../script/script.h"
 #include "../../descriptor/bridge_desc.h"
 #include "../../descriptor/building_desc.h"
@@ -91,8 +93,9 @@ SQInteger param<call_tool_init>::push(HSQUIRRELVM vm, call_tool_init v)
 		return sq_raise_error(vm, "Called tool with player == null");
 	}
 #endif
-	// check if calling suspendable tools is blocked
-	if (!v.no_block) {
+	// check if calling suspendable tools is blocked (not while a game loads, e.g. in resume_game
+	// of a scenario on a server: karte_t::set_tool_api ignores tools then, as in single player)
+	if (!v.no_block  &&  (get_random_mode() & LOAD_RANDOM) == 0) {
 		if (const char* blocker = env_t::networkmode ? sq_get_suspend_blocker(vm) : NULL) {
 			return sq_raise_error(vm, "Cannot call this tool from within `%s'.", blocker);
 		}

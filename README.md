@@ -51,6 +51,8 @@ The Artistic License asks every modified version to document how it differs from
 
 - Scenario texts loaded from files (info, goal, rules, result, about) were shown as "(null)" after the plainstring change in Simutrans r12344.
 - The public chat tab listed the direct messages instead of the public ones (same cause).
+- In network games, scenarios whose `resume_game` calls tools (e.g. `settings.set_traffic_level`) were dropped by the server when it loaded the game; the server now ignores these calls during loading, as single player games do.
+- A scenario that opens its window without a tab (`gui.open_info_win()`) made every client crash when it joined the server.
 
 ### Compatibility
 
