@@ -74,9 +74,12 @@ refused) and refuses `tool_lock_game`, `tool_generate_script` and the scripted t
 
 ## Sign in and sessions
 
-* `GET /?token=T` checks the token and answers `302 Location: /` with the session cookie
+* `GET /?token=T` checks the token and answers `200` with the session cookie
   `sdash_<port>=<id>; HttpOnly; SameSite=Strict; Path=/` (plus `Secure` when the request has
-  `X-Forwarded-Proto: https`). The token leaves the address bar with the redirect.
+  `X-Forwarded-Proto: https`) and a short page that goes on to `/` by itself (`<meta http-equiv="refresh">`,
+  which replaces the history entry, so the token leaves the address bar). Not a `302`: a link opened from
+  another site or app (chat, mail) is a cross-site navigation, and browsers do not send a `SameSite=Strict`
+  cookie on its redirect, so the redirected request would show the login page again.
 * `GET /` without a valid session shows a login page (built into the bridge, styled by
   `/login.css`) whose form posts `token` to `POST /login` (`application/x-www-form-urlencoded`,
   answer `303 Location: /` + cookie). A wrong token gives the login page with status 401.

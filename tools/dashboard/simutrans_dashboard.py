@@ -1865,6 +1865,25 @@ LOGIN_PAGE = """<!doctype html>
 </html>
 """
 
+# answer to a token link: sets the cookie, then moves on by itself (see Handler.login)
+LOGIN_BOUNCE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="0;url=/">
+<title>Simutrans dashboard</title>
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+<main>
+<h1>Simutrans dashboard</h1>
+<p class="hint">Signed in. <a href="/">Open the dashboard</a></p>
+</main>
+</body>
+</html>
+"""
+
 LOGIN_CSS = """:root{color-scheme:light dark;--bg:#f4f5f7;--fg:#1d2330;--card:#fff;--line:#c9ced8;--accent:#2f6fde;--err:#b3261e}
 @media (prefers-color-scheme:dark){:root{--bg:#14171d;--fg:#e4e7ee;--card:#1e232c;--line:#3a4250;--accent:#6d9cff;--err:#ff8a80}}
 body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
@@ -2260,7 +2279,11 @@ class Handler(BaseHTTPRequestHandler):
             cookie += "; Secure"
         return cookie
 
-    def login(self, token, redirect_code):
+    def login(self, token, redirect_code=None):
+        """Sign in with a token. redirect_code None (token link): a page that sets the cookie and goes on to /
+        by itself. A link opened from another site or app (chat, mail) is a cross-site navigation, and browsers
+        do not send the SameSite=Strict cookie on a redirect of it, so a 302 would show the sign-in page again;
+        the page's own navigation is same-site."""
         ip = self.client_address[0]
         if self.app.logins.blocked(ip):
             return self.send_login(429, "limit")
@@ -2275,7 +2298,11 @@ class Handler(BaseHTTPRequestHandler):
             self.app.hub.close_session(old)
         sid = self.app.sessions.create(role)
         log.info("%s signed in as %s", ip, role)
-        self.redirect(redirect_code, self.make_cookie(sid))
+        cookie = self.make_cookie(sid)
+        if redirect_code is None:
+            return self.send_bytes(200, utf8(LOGIN_BOUNCE), "text/html; charset=utf-8",
+                                   headers=[("Set-Cookie", cookie)])
+        self.redirect(redirect_code, cookie)
 
     def read_body(self, allowed=True):
         """Request body (bytes), or None after an error response. A body the bridge would not read
@@ -2341,7 +2368,7 @@ class Handler(BaseHTTPRequestHandler):
                 if (self.headers.get("Sec-Fetch-Dest") or "document").lower() != "document":
                     # an <img> or <iframe> of another site: no sign-in, no failed attempt counted
                     return self.send_text(403, "sign in with the link in the address bar")
-                return self.login(params["token"][0], 302)
+                return self.login(params["token"][0])
             if self.session() is None:
                 return self.send_login(200)
             return self.static("/index.html")
