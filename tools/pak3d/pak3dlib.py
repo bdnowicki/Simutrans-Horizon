@@ -25,7 +25,7 @@ PLAYER1, PLAYER2, NIGHT = "player1", "player2", "night_emissive"
 TOP_KEYS = {"format", "name", "version", "license", "author", "homepage", "description", "units", "entries",
             "generators", "rules"}
 ENTRY_KEYS = {"match", "model", "lod", "player_color", "scale_by_age", "variants", "featured", "generator", "type",
-              "climate", "waytype", "size", "system", "freight", "footprint", "length", "comment"}
+              "climate", "waytype", "size", "system", "freight", "footprint", "length", "at", "comment"}
 FILTERS = ("type", "climate", "waytype", "system", "freight")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -163,7 +163,7 @@ def validate_manifest(j):
             out = {"index": idx, "kind": m.group(1), "pattern": m.group(2), "exact": not re.search(r"[*?]", m.group(2)),
                    "model": None, "lod": [], "player": [], "scale_by_age": False,
                    "variants": {"season": None, "climate": None}, "featured": False, "generator": None,
-                   "filters": {}, "footprint": None, "length": None}
+                   "filters": {}, "footprint": None, "length": None, "at": None}
             if e.get("model") is not None:
                 pe = path_error(e["model"], where + ": model", (".glb", ".gltf"), True)
                 if pe:
@@ -235,6 +235,19 @@ def validate_manifest(j):
                     errors.append(where + ": length must be the car length in squares (e.g. 0.5)")
                 else:
                     out["length"] = float(e["length"])
+            if "at" in e:
+                v = e["at"]
+                if not (isinstance(v, list) and len(v) == 2 and all(isinstance(n, int) and not isinstance(n, bool)
+                                                                    and 0 <= n <= 32767 for n in v)):
+                    errors.append(where + ": at must be [x, y], the north-west square of the footprint on the map")
+                elif out["kind"] != "building":
+                    errors.append(where + ": at is only for buildings")
+                elif not out["model"]:
+                    errors.append(where + ": at needs a model")
+                else:
+                    out["at"] = v
+                    if not out["footprint"]:
+                        warnings.append(where + ": at without footprint: the model covers one square")
             if out["kind"] not in DRAWN_KINDS and out["model"]:
                 warnings.append("%s: %s models are not drawn by the dashboard yet (generated instead)" % (where, out["kind"]))
             if not out["model"] and out["lod"]:
@@ -276,13 +289,33 @@ def entry_matches(e, d):
     return True
 
 
+def placed_rect(e, rotation, size):
+    """squares of an entry bound to a place ("at", rotation 0) in a world turned `rotation` times, of size (x, y) now:
+    (x, y, w, h, turn), or None without a size for a turned world (same as placedRect in pak.js)"""
+    x, y = e["at"]
+    w, h = e["footprint"] or (1, 1)
+    r = rotation & 3
+    if not r:
+        return x, y, w, h, 0
+    if not size or not size[0] or not size[1]:
+        return None
+    sx, sy = (size[1], size[0]) if r & 1 else (size[0], size[1])  # the size at rotation 0
+    for _ in range(r):
+        x, y = sy - 1 - (y + h - 1), x
+        w, h = h, w
+        sx, sy = sy, sx
+    return x, y, w, h, (4 - r) & 3
+
+
 class Matcher:
-    """entries of a pak for the descs of a catalogue: exact names first (file order), then patterns (file order)"""
+    """entries of a pak for the descs of a catalogue: exact names first (file order), then patterns (file order);
+    entries bound to a place ("at") apply only there and are left out"""
 
     def __init__(self, pak, cat):
         self.by_kind = {}
         for e in (pak or {}).get("entries", []):
-            self.by_kind.setdefault(e["kind"], []).append(e)
+            if not e.get("at"):
+                self.by_kind.setdefault(e["kind"], []).append(e)
         for lst in self.by_kind.values():
             lst.sort(key=lambda e: (0 if e["exact"] else 1, e["index"]))
         self.cat = cat or {}

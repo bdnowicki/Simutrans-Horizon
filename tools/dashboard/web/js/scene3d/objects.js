@@ -29,13 +29,14 @@ const WHITE = [1, 1, 1];
 /**
  * cat: desc_list; opts: {hs, rules (gen/rules.json), players ([r, g, b] sRGB per player number), treeDensity,
  * buildingInstanceMin (a model with at least this many copies in a chunk is drawn as instances; 0 = always merged),
- * pak (normalized pak 3D manifest) and store (pakplace.js ModelStore): objects with a model are not generated}.
+ * pak (normalized pak 3D manifest) and store (pakplace.js ModelStore): objects with a model are not generated,
+ * size ({x, y} of the map, for the pak's places in a turned world)}.
  */
 export function createObjectBuilder(cat, opts = {}) {
 	const hs = opts.hs;
 	const ways = createWayBuilder(cat, hs);
 	const stations = createStationBuilder(cat, hs, { players: opts.players });
-	const placer = opts.pak && opts.store ? createPakPlacer(cat, opts.pak, opts.store, hs) : null;
+	const placer = opts.pak && opts.store ? createPakPlacer(cat, opts.pak, opts.store, hs, opts.size) : null;
 	const categoryOf = placer ? (d) => {
 		const e = placer.matcher.of("building", d.i);
 		return e && e.generator;

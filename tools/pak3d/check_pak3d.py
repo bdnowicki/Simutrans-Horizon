@@ -106,7 +106,7 @@ def check_model(rep, root, path, uses, descs, stats_out):
                 rep.warn(where, "player_color names material %s, which the model does not have" % json.dumps(name))
         if abs(y0) > GROUND_TOL and e["kind"] != "vehicle":
             rep.warn(where, "lowest point at %.3f squares: the origin belongs on the ground" % y0)
-        foot = e["footprint"]
+        foot = e["footprint"] or ([1, 1] if e.get("at") else None)
         if foot is None and e["kind"] == "building" and e["exact"] and descs:
             d = next((d for d in descs.get("buildings", []) if d.get("name") == e["pattern"]), None)
             foot = d.get("size") if d else None

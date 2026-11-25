@@ -109,21 +109,38 @@ class Engine:
         return None
 
 
-def count(src, cat, extras, progress):
-    """instances per (kind, desc index) on the whole map"""
+def count(src, cat, extras, progress, pak=None):
+    """instances per (kind, desc index) on the whole map, the buildings among them that the places of the pak
+    (entries with "at") cover per (kind, desc index), and per entry index"""
     sx, sy = src.world()
     if not sx:
         raise SystemExit("no world loaded")
     n = collections.Counter()
+    covered, per_place = collections.Counter(), collections.Counter()
+    places = [e for e in (pak or {}).get("entries", []) if e.get("at") and e["model"]]
+    blds = {d["i"]: d for d in cat.get("buildings", [])}
+    rects = {}
     nx, ny = -(-sx // CHUNK), -(-sy // CHUNK)
     for cy in range(ny):
         for cx in range(nx):
-            o = P.decode_objs(src.scene(cx, cy))
+            sc = src.scene(cx, cy)
+            o = P.decode_objs(sc)
+            rot = sc.get("rotation", 0) & 3
+            if places and rot not in rects:
+                rects[rot] = [(P.placed_rect(e, rot, (sx, sy)), e) for e in places]
+            x0, y0 = sc.get("x0", cx * CHUNK), sc.get("y0", cy * CHUNK)
             for i in range(len(o["kind"])):
                 k = o["kind"][i]
                 if k == P.KIND["BUILDING"]:
                     if o["b"][i] == 0:
                         n[("building", o["desc"][i])] += 1
+                        d = blds.get(o["desc"][i]) if places else None
+                        gx, gy = x0 + o["x"][i], y0 + o["y"][i]
+                        for q, e in rects.get(rot, ()) if d else ():
+                            if q and q[0] <= gx < q[0] + q[2] and q[1] <= gy < q[1] + q[3] and P.entry_matches(e, d):
+                                covered[("building", o["desc"][i])] += 1
+                                per_place[e["index"]] += 1
+                                break
                 elif k == P.KIND["TREE"]:
                     n[("tree", o["desc"][i])] += 1
                 elif k == P.KIND["SIGN"]:
@@ -143,10 +160,11 @@ def count(src, cat, extras, progress):
             desc, kind = P.decode_vehicles(src.vehicles(x, y, min(sx, x + REGION) - 1, min(sy, y + REGION) - 1, extras))
             for d, k in zip(desc, kind):
                 n[(("vehicle", "citycar", "pedestrian")[k] if k < 3 else "vehicle", d)] += 1
-    return n
+    return n, covered, per_place
 
 
-def report(cat, pak, n, top):
+def report(cat, pak, n, top, covered=None, per_place=None):
+    covered, per_place = covered or {}, per_place or {}
     m = P.Matcher(pak, cat)
     lists = {k: {d["i"]: d for d in cat.get(v, [])} for k, v in P.KIND_LIST.items()}
     rows = collections.defaultdict(lambda: [0, 0, 0, 0])  # group -> [types, types with model, copies, with model]
@@ -165,9 +183,18 @@ def report(cat, pak, n, top):
             r[1] += 1
             r[3] += c
         else:
-            missing.append((c, group, d.get("name", "?"), "declared, drawn generated" if has else ""))
+            cov = 0 if has else min(c, covered.get((kind, i), 0))  # copies drawn by a model bound to their place
+            r[3] += cov
+            if cov and cov >= c:
+                r[1] += 1
+            if c > cov:
+                missing.append((c - cov, group, d.get("name", "?"), "declared, drawn generated" if has else
+                                "%d more at the places of the pak" % cov if cov else ""))
+    places = [e for e in (pak or {}).get("entries", []) if e.get("at")]
     out = {"groups": {g: {"types": r[0], "types_model": r[1], "copies": r[2], "copies_model": r[3]} for g, r in rows.items()},
-           "missing": [{"copies": c, "kind": g, "name": nm, "note": note} for c, g, nm, note in sorted(missing, reverse=True)]}
+           "missing": [{"copies": c, "kind": g, "name": nm, "note": note} for c, g, nm, note in sorted(missing, reverse=True)],
+           "places": [{"entry": e["index"], "match": e["pattern"], "at": e["at"], "covered": per_place.get(e["index"], 0)}
+                      for e in places]}
     order = sorted(rows, key=lambda g: (list(P.KIND_LIST).index(g.split(":")[0]), g))
     print("\n%-22s %8s %8s %6s %10s %10s %6s" % ("kind", "types", "model", "%", "copies", "model", "%"))
     tot = [0, 0, 0, 0]
@@ -179,6 +206,12 @@ def report(cat, pak, n, top):
                                                              100.0 * r[3] / max(1, r[2]), note))
     print("%-22s %8d %8d %5.1f%% %10d %10d %5.1f%%" % ("all", tot[0], tot[1], 100.0 * tot[1] / max(1, tot[0]), tot[2],
                                                         tot[3], 100.0 * tot[3] / max(1, tot[2])))
+    if places:
+        print("\nModels bound to a place (entries with \"at\"):")
+        for p in out["places"]:
+            print("  entries[%d] %s at %d,%d: %s" % (p["entry"], p["match"], p["at"][0], p["at"][1],
+                                                   "%d building(s) covered" % p["covered"] if p["covered"]
+                                                   else "nothing that matches stands there (another map?)"))
     print("\nWithout a model, most copies first (the to-do list):")
     print("%5s %10s  %-22s %s" % ("rank", "copies", "kind", "name"))
     for k, x in enumerate(out["missing"][:top], 1):
@@ -219,11 +252,11 @@ def main():
             return 1
     cat = s.desc_list()
     t0 = time.time()
-    n = count(s, cat, a.extras, not a.quiet)
+    n, covered, per_place = count(s, cat, a.extras, not a.quiet, pak)
     print("%s: %s %s, %d entries; map read in %.1f s" % ("pak 3D" if pak else "no pak 3D", (pak or {}).get("name", ""),
                                                         (pak or {}).get("version", ""), len((pak or {}).get("entries", [])),
                                                         time.time() - t0))
-    out = report(cat, pak, n, a.top)
+    out = report(cat, pak, n, a.top, covered, per_place)
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=1)

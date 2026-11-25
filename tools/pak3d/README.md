@@ -39,8 +39,8 @@ The tools here need only Python 3 (standard library):
   "author": "...",
   "units": {"tile": 1.0, "height_step": 0.2041},
   "entries": [
-    {"match": "building:NYC_EmpireState", "model": "models/empire_state.glb", "lod": ["models/empire_state_lod1.glb"],
-     "featured": true, "footprint": [2, 2]},
+    {"match": "building:ABBYS_0", "at": [409, 452], "model": "models/empire_state.glb",
+     "lod": ["models/empire_state_lod1.glb"], "featured": true, "footprint": [1, 2]},
     {"match": "building:RES_65_12", "model": "models/res_65_12.glb"},
     {"match": "building:*", "type": "res", "climate": "desert", "generator": "adobe"},
     {"match": "building:FakeStop"},
@@ -73,6 +73,16 @@ order; the first entry whose name and **filters** fit wins:
 keeps it generated but in the named generator category; an entry with neither keeps the generated look and stops
 the search (to exclude one name from a pattern).
 
+**Places.** An entry with `at` (buildings, needs `model`) is bound to one place of one map: a landmark the pakset
+has no object for, standing where the map holds a stand-in. `at` is the north-west square `[x, y]` of `footprint`
+on the map as saved (rotation 0). The model is drawn **once over the whole footprint**, as modelled (layout 0)
+and turned with the map; it covers the buildings that match the entry (name and filters) and stand in the
+footprint by their square with offset 0,0. Buildings there that do not match stay as they are, and so do
+matching buildings anywhere else: these entries are left out of the matching above. The copy belongs to the
+chunk of the north-west square. Example: the New York City map marks the Empire State Building (label
+"Empire State Bldg", 5th Avenue between 33rd and 34th Street) with two attractions `ABBYS_0` at 409,452 and
+409,453; the entry above draws the model over both.
+
 | Field | Meaning |
 |---|---|
 | `model` | path inside the pak (`.glb`/`.gltf`); `{season}` (`summer autumn winter spring`) and `{climate}` (names above) are filled in per object |
@@ -81,7 +91,8 @@ the search (to exclude one name from a pattern).
 | `player_color` | further material names painted in the company colour (besides `player1`/`player2`) |
 | `scale_by_age` | trees: grown trees (age class 4) at model size, young ones down to 0.43 |
 | `featured` | higher limits (landmarks, favourite vehicles) |
-| `footprint` / `length` | declared size for `check_pak3d.py` (squares; buildings `[x, y]` of layout 0, vehicles the car length) |
+| `footprint` / `length` | declared size for `check_pak3d.py` (squares; buildings `[x, y]` of layout 0, vehicles the car length); with `at` the squares the model covers (default `[1, 1]`) |
+| `at` | buildings: `[x, y]`, binds the entry to that place of a map (see Places) |
 | `generator` | buildings: generator category (a key of `rules.categories`) |
 | `comment` | ignored |
 
@@ -189,6 +200,8 @@ Reads every chunk of the map (`scene3d`) and the vehicles (`vehicles3d`, in squa
 bridge (any token, also over the internet) or straight from a game with `-remote_control`, and matches the
 objects against the manifest (the one the bridge serves, or `--pak3d`). Prints per kind (buildings by type) how
 many object types and copies (buildings counted once per building, trees and cars one by one, ways per square)
-have a model, and the objects without one with the most copies first — the to-do list for modellers. `--extras`
+have a model, and the objects without one with the most copies first — the to-do list for modellers. Buildings
+covered by an entry with `at` count as having a model, and every such entry is listed with the number of
+buildings it covers (none: the map is another one, or the stand-in is gone). `--extras`
 also counts city cars and pedestrians; `--json` writes everything. The bridge's rate limits are respected
 (about 5 s for a 1024 × 1024 map).

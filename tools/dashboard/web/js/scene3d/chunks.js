@@ -108,7 +108,7 @@ export class ChunkLayer {
 		this.startWorker();
 		const r = await this.rpc({ op: "init", treeDensity: this.quality.treeDensity, players: companyColors(),
 			buildingInstanceMin: this.quality.buildingInstanceMin || 0, pak: pak && pak.state === "loaded" ? pak.pak : null,
-			rules: pak ? pak.rules : null });
+			rules: pak ? pak.rules : null, size: { x: sizeX, y: sizeY } });
 		if (gen !== this.gen) {
 			return;
 		}

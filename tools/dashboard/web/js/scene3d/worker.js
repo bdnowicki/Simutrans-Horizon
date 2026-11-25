@@ -33,6 +33,7 @@ let rules = null;
 let buildingInstanceMin = 0;
 let pak = null;
 let store = null;
+let mapSize = null;
 
 class HttpError extends Error {
 	constructor(status, message, retry) {
@@ -62,7 +63,8 @@ async function getJson(url, headers) {
 async function loadCatalogue() {
 	const { body } = await getJson("/api/desc_list?kinds=" + DESC_KINDS);
 	catalogue = body;
-	objects = createObjectBuilder(catalogue, { hs: HEIGHT_STEP, treeDensity, rules, players, buildingInstanceMin, pak, store });
+	objects = createObjectBuilder(catalogue, { hs: HEIGHT_STEP, treeDensity, rules, players, buildingInstanceMin, pak, store,
+		size: mapSize });
 	pickData = createPickBuilder(catalogue, HEIGHT_STEP, objects);
 }
 
@@ -82,6 +84,7 @@ async function init(m) {
 	buildingInstanceMin = m.buildingInstanceMin | 0;
 	pak = m.pak || null;
 	store = pak ? new ModelStore(pak.units) : null;
+	mapSize = m.size && m.size.x > 0 && m.size.y > 0 ? { x: m.size.x | 0, y: m.size.y | 0 } : null;
 	if (m.rules) {
 		rules = m.rules;
 	} else {

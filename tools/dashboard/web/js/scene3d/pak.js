@@ -2,6 +2,8 @@
 // No three.js: used by the worker (matching, model checks, placement) and the main thread (manifest, rules,
 // authors page). The manifest (format 1) lists entries "kind:pattern" -> model file (+ LODs, variants) or a
 // generator category; an exact name wins over patterns, otherwise the first entry in file order that matches.
+// An entry with "at" (buildings) is bound to a place of one map instead: it draws its model once over the footprint
+// whose north-west square that is, covering the buildings standing there that match it (placedRect, pakplace.js).
 // tools/pak3d/pak3dlib.py implements the same rules for the checker and the coverage report.
 // Artistic License, see LICENSE.txt.
 
@@ -29,7 +31,7 @@ export const DEFAULT_HEIGHT_STEP = 0.2041;
 const TOP_KEYS = new Set(["format", "name", "version", "license", "author", "homepage", "description", "units", "entries",
 	"generators", "rules"]);
 const ENTRY_KEYS = new Set(["match", "model", "lod", "player_color", "scale_by_age", "variants", "featured", "generator",
-	"type", "climate", "waytype", "size", "system", "freight", "footprint", "length", "comment"]);
+	"type", "climate", "waytype", "size", "system", "freight", "footprint", "length", "at", "comment"]);
 const FILTERS = ["type", "climate", "waytype", "system", "freight"];
 const MODEL_EXT = /\.(glb|gltf)$/i;
 
@@ -210,7 +212,7 @@ export function validateManifest(j) {
 			}
 			const out = { index: idx, kind: m[1], pattern: m[2], exact: !/[*?]/.test(m[2]), model: null, lod: [], player: [],
 				scaleByAge: false, variants: { season: null, climate: null }, featured: false, generator: null, filters: {},
-				footprint: null, length: null };
+				footprint: null, length: null, at: null };
 			if (e.model !== undefined && e.model !== null) {
 				const pe = pathError(e.model, where + ": model", MODEL_EXT, true);
 				if (pe) {
@@ -304,6 +306,21 @@ export function validateManifest(j) {
 					out.length = e.length;
 				}
 			}
+			if (e.at !== undefined) {
+				const v = e.at;
+				if (!Array.isArray(v) || v.length !== 2 || !v.every((n) => Number.isInteger(n) && n >= 0 && n <= 32767)) {
+					errors.push(where + ": at must be [x, y], the north-west square of the footprint on the map");
+				} else if (out.kind !== "building") {
+					errors.push(where + ": at is only for buildings");
+				} else if (!out.model) {
+					errors.push(where + ": at needs a model");
+				} else {
+					out.at = v;
+					if (!out.footprint) {
+						warnings.push(where + ": at without footprint: the model covers one square");
+					}
+				}
+			}
 			if (!DRAWN_KINDS.has(out.kind) && out.model) {
 				warnings.push(where + ": " + out.kind + " models are not drawn by this dashboard yet (generated instead)");
 			}
@@ -358,11 +375,14 @@ export function entryMatches(e, d) {
 /**
  * The entries of a pak for the descs of a catalogue (desc_list). of(kind, i) -> entry or null: exact names first (in
  * file order), then patterns in file order; an entry without model and generator stops the search (generated).
+ * Entries bound to a place ("at") are not in it: they apply only there (placedRect).
  */
 export function createMatcher(pak, cat) {
 	const byKind = {};
 	for (const e of (pak && pak.entries) || []) {
-		(byKind[e.kind] = byKind[e.kind] || []).push(e);
+		if (!e.at) {
+			(byKind[e.kind] = byKind[e.kind] || []).push(e);
+		}
 	}
 	for (const k of Object.keys(byKind)) {
 		byKind[k].sort((a, b) => (a.exact === b.exact ? a.index - b.index : a.exact ? -1 : 1));
@@ -386,6 +406,35 @@ export function createMatcher(pak, cat) {
 		},
 		has: (kind) => !!byKind[kind],
 	};
+}
+
+/**
+ * The squares of an entry bound to a place ("at", given for the map as saved, rotation 0) in a world turned
+ * `rotation` times (scene3d) of size {x, y} (now): {x, y, w, h, turn} with x, y the north-west square, w x h the
+ * footprint and turn the quarter turns of the model (layout steps like the buildings: a turn of the map takes one
+ * away, gebaeude_t::rotate90). Squares turn like koord::rotate90: (x, y) -> (size y - 1 - y, x). Null without a size
+ * for a turned world.
+ */
+export function placedRect(e, rotation, size) {
+	let [x, y] = e.at;
+	let [w, h] = e.footprint || [1, 1];
+	const r = rotation & 3;
+	if (!r) {
+		return { x, y, w, h, turn: 0 };
+	}
+	if (!size || !(size.x > 0) || !(size.y > 0)) {
+		return null;
+	}
+	let sy = r & 1 ? size.x : size.y; // the size along y before each turn (at rotation 0 first)
+	let sx = r & 1 ? size.y : size.x;
+	for (let k = 0; k < r; k++) {
+		const nx = sy - 1 - (y + h - 1);
+		y = x;
+		x = nx;
+		[w, h] = [h, w];
+		[sx, sy] = [sy, sx];
+	}
+	return { x, y, w, h, turn: (4 - r) & 3 };
 }
 
 /** A model path of an entry with its variants filled in (season 0..3, climate 0..7). */

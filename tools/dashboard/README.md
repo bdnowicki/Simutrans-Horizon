@@ -887,6 +887,7 @@ reads it when `/api/session` says `view3d.pak3d: true`:
   (vehicle layer) looks up the entries of its kind by the untranslated desc name: exact names first, then
   patterns (`*`, `?`) in file order, with the filters `type climate waytype size system freight`; `{season}` and
   `{climate}` in a model path take the chunk's season and the square's climate (vehicles: summer, temperate).
+  Entries bound to a place (`at`) are looked up first, by the building's square with offset 0,0, and only there.
 * **Checks.** The worker fetches each model file once and reads its glTF JSON (`pakplace.js`): triangles,
   bounds after the node transforms, embedded texture sizes (PNG/JPEG/WebP headers), cameras, lights,
   extensions that need decoders; a model over the limits (buildings 5 000 triangles, featured 30 000; vehicles
@@ -895,7 +896,12 @@ reads it when `/api/session` says `view3d.pak3d: true`:
   reported to the worker, which builds the chunks with it again, generated.
 * **Placing.** Buildings: one copy at the square with offset 0,0, origin at the middle of the footprint of the
   layout, turned by the layout (layout 0 as modelled, front +Z; 1, 2, 3 by 90° steps), at the ground height of
-  that square; all squares of the building skip the generator (also stations and depots). Trees: the tree's
+  that square; all squares of the building skip the generator (also stations and depots). A place (`at`): one
+  copy over its whole footprint at the height of the building on its north-west square, turned with the map
+  (the place is given for rotation 0; the worker turns it with the chunk's `rotation` and the map size from the
+  status, like `koord::rotate90`, and the model by one layout step back per turn); every matching building in the
+  footprint skips the generator; the copy belongs to the chunk of the north-west square (a chunk east or south of
+  it holding part of the footprint draws an overhang copy while that one is not shown). Trees: the tree's
   place, turn and size jitter of the generated trees, the density setting of phones, `scale_by_age`. Signs:
   where the generated post stands, turned towards the vehicles. Picking uses the top of the model's bounds.
   Vehicles: the car's middle, along the interpolated heading (pitch and roll like the generated bodies), at
