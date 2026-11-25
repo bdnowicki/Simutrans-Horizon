@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: replaced building tiles are reported to the remote control
  */
 
 #include <string.h>
@@ -36,6 +37,7 @@ static pthread_mutex_t add_to_city_mutex = PTHREAD_MUTEX_INITIALIZER;
 #include "../simachievements.h"
 
 #include "../ground/grund.h"
+#include "../network/remote_control.h"
 
 
 #include "../descriptor/building_desc.h"
@@ -279,6 +281,9 @@ void gebaeude_t::set_tile( const building_tile_desc_t *new_tile, bool start_with
 #ifdef MULTI_THREAD
 		pthread_mutex_unlock( &sync_mutex );
 #endif
+	}
+	if(  tile != new_tile  ) {
+		remote_control_map_changed(get_pos().x, get_pos().y);
 	}
 	tile = new_tile;
 	remove_ground = tile->has_image()  &&  !tile->get_desc()->needs_ground();

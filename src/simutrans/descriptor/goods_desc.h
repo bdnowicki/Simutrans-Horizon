@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_color_index() for the remote control
  */
 
 #ifndef DESCRIPTOR_GOODS_DESC_H
@@ -113,6 +114,9 @@ public:
 	* @return color for good table and waiting bars
 	*/
 	PIXVAL get_color() const { return gfx->palette_lookup(color); }
+
+	/// @return palette index of get_color() (also without graphics)
+	uint8 get_color_index() const { return color; }
 
 	void calc_checksum(checksum_t *chk) const
 	{

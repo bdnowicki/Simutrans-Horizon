@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_all_desc() of the city cars for the remote control
  */
 
 #include "../simdebug.h"
@@ -251,6 +252,14 @@ bool private_car_t::successfully_loaded()
 		DBG_MESSAGE("private_car_t", "No citycars found - feature disabled");
 	}
 	return true;
+}
+
+
+void private_car_t::get_all_desc(vector_tpl<const citycar_desc_t *> &list)
+{
+	for(auto const& i : table) {
+		list.append(i.value);
+	}
 }
 
 

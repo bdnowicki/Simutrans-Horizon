@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: height, slope and position changes are reported to the remote control
  */
 
 #ifndef GROUND_GRUND_H
@@ -16,6 +17,7 @@
 #include "../display/clip_num.h"
 #include "../obj/way/weg.h"
 #include "../obj/crossing.h"
+#include "../network/remote_control.h"
 
 
 class player_t;
@@ -406,11 +408,11 @@ public:
 	/// @returns the world position of this ground.
 	inline const koord3d& get_pos() const { return pos; }
 
-	inline void set_pos(koord3d newpos) { pos = newpos; }
+	inline void set_pos(koord3d newpos) { if(  newpos != pos  ) { remote_control_map_changed(newpos.x, newpos.y); } pos = newpos; }
 
 	// slope are now maintained locally
 	slope_t::type get_grund_hang() const { return slope; }
-	void set_grund_hang(slope_t::type sl) { slope = sl; }
+	void set_grund_hang(slope_t::type sl) { if(  sl != slope  ) { remote_control_map_changed(pos.x, pos.y); } slope = sl; }
 
 	/// some ground tiles may be part of halts.
 	void set_halt(halthandle_t halt);
@@ -448,7 +450,7 @@ public:
 		}
 	}
 
-	void set_hoehe(sint8 h) { pos.z = h;}
+	void set_hoehe(sint8 h) { if(  h != pos.z  ) { remote_control_map_changed(pos.x, pos.y); } pos.z = h; }
 
 	// Helper functions for underground modes
 	//

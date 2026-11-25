@@ -2,7 +2,7 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced
+ * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced; get_all_desc() and direction changes for the remote control
  */
 
 #include <stdio.h>
@@ -141,6 +141,9 @@ roadsign_t::~roadsign_t()
 void roadsign_t::set_dir(ribi_t::ribi dir)
 {
 	ribi_t::ribi olddir = this->dir;
+	if(  olddir != dir  &&  !preview  ) {
+		remote_control_map_changed(get_pos().x, get_pos().y);
+	}
 
 	this->dir = dir;
 	if (!preview) {
@@ -773,6 +776,14 @@ static bool compare_roadsign_desc(const roadsign_desc_t* a, const roadsign_desc_
 
 
 /* static stuff from here on ... */
+void roadsign_t::get_all_desc(vector_tpl<const roadsign_desc_t *> &list)
+{
+	for(auto const& i : table) {
+		list.append(i.value);
+	}
+}
+
+
 bool roadsign_t::successfully_loaded()
 {
 	if(table.empty()) {

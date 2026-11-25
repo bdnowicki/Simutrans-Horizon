@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: type changes are reported to the remote control
  */
 
 #ifndef OBJ_TUNNEL_H
@@ -9,6 +10,7 @@
 
 #include "simobj.h"
 #include "../display/simimg.h"
+#include "../network/remote_control.h"
 
 class tunnel_desc_t;
 
@@ -47,7 +49,7 @@ public:
 
 	const tunnel_desc_t *get_desc() const { return desc; }
 
-	void set_desc( const tunnel_desc_t *_desc ) { desc = _desc; }
+	void set_desc( const tunnel_desc_t *_desc ) { if(  _desc != desc  ) { remote_control_map_changed(get_pos().x, get_pos().y); } desc = _desc; }
 
 	void rdwr(loadsave_t *file) OVERRIDE;
 

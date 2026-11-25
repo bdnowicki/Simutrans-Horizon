@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_steps_next() for the remote control
  */
 
 #ifndef VEHICLE_VEHICLE_BASE_H
@@ -114,6 +115,7 @@ public:
 
 	sint16 get_hoff(const sint16 raster_width=1) const;
 	uint8 get_steps() const {return steps;}
+	uint8 get_steps_next() const {return steps_next;}
 
 	uint8 get_disp_lane() const { return disp_lane; }
 

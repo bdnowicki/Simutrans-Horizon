@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: direction changes are reported to the remote control
  */
 
 #ifndef OBJ_WAYOBJ_H
@@ -13,6 +14,7 @@
 #include "../dataobj/ribi.h"
 #include "../descriptor/way_obj_desc.h"
 #include "../tpl/stringhashtable_tpl.h"
+#include "../network/remote_control.h"
 
 class player_t;
 class karte_t;
@@ -81,7 +83,7 @@ public:
 	bool finish_rd() OVERRIDE;
 
 	// specific for wayobj
-	void set_dir(ribi_t::ribi d) { dir = d; }
+	void set_dir(ribi_t::ribi d) { if(  d != dir  ) { remote_control_map_changed(get_pos().x, get_pos().y); } dir = d; }
 	ribi_t::ribi get_dir() const { return close_diagonal ? (ribi_t::ribi)ribi_t::all : dir; }
 	uint8 get_close_diagonal() const { return close_diagonal; }
 

@@ -2,7 +2,7 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced, waytype_available() counts them
+ * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced, waytype_available() counts them; get_all_desc() for the remote control
  */
 
 #include <algorithm>
@@ -156,6 +156,14 @@ const vector_tpl<const way_desc_t *>&  way_builder_t::get_way_list(waytype_t wty
 		}
 	}
 	return dummy;
+}
+
+
+void way_builder_t::get_all_desc(vector_tpl<const way_desc_t *> &list)
+{
+	for(auto const& i : desc_table) {
+		list.append(i.value);
+	}
 }
 
 

@@ -2,6 +2,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: way type changes are reported to the remote control
  */
 
 #include <stdio.h>
@@ -143,6 +144,9 @@ const char *weg_t::waytype_to_string(waytype_t wt)
 
 void weg_t::set_desc(const way_desc_t *b)
 {
+	if(  desc != b  ) {
+		remote_control_map_changed(get_pos().x, get_pos().y);
+	}
 	desc = b;
 
 	if(  hat_gehweg() &&  desc->get_wtyp() == road_wt  &&  desc->get_topspeed() > cityroad_speed  ) {

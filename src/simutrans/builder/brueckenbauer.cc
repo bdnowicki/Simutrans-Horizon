@@ -2,7 +2,7 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced
+ * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced; get_all_desc() for the remote control
  */
 
 
@@ -77,6 +77,14 @@ void bridge_builder_t::register_desc(bridge_desc_t *desc)
 const bridge_desc_t *bridge_builder_t::get_desc(const char *name)
 {
 	return  (name ? desc_table.get(name) : NULL);
+}
+
+
+void bridge_builder_t::get_all_desc(vector_tpl<const bridge_desc_t *> &list)
+{
+	for(auto const& i : desc_table) {
+		list.append(i.value);
+	}
 }
 
 

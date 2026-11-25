@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_all_desc() for the remote control
  */
 
 #ifndef OBJ_ROADSIGN_H
@@ -216,6 +217,9 @@ public:
 	static const roadsign_desc_t *find_desc(const char *name) { return table.get(name); }
 
 	static const vector_tpl<const roadsign_desc_t*>& get_available_signs(const waytype_t wt);
+
+	/// appends all registered sign and signal descriptions to @p list, unordered
+	static void get_all_desc(vector_tpl<const roadsign_desc_t *> &list);
 };
 
 #endif

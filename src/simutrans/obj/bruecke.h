@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: type changes are reported to the remote control
  */
 
 #ifndef OBJ_BRUECKE_H
@@ -11,6 +12,7 @@ class karte_t;
 
 #include "../descriptor/bridge_desc.h"
 #include "simobj.h"
+#include "../network/remote_control.h"
 
 /**
  * Bridges (visible)
@@ -36,7 +38,7 @@ public:
 	 */
 	waytype_t get_waytype() const OVERRIDE { return desc ? desc->get_waytype() : invalid_wt; }
 
-	void set_desc(const bridge_desc_t *b) { desc = b; }
+	void set_desc(const bridge_desc_t *b) { if(  b != desc  ) { remote_control_map_changed(get_pos().x, get_pos().y); } desc = b; }
 	const bridge_desc_t *get_desc() const { return desc; }
 
 	virtual bool is_clipping_below_needed() const OVERRIDE;

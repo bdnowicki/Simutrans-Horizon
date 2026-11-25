@@ -2,7 +2,7 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced
+ * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced; get_all_desc() for the remote control
  */
 
 #include <stdio.h>
@@ -65,6 +65,14 @@ void tunnel_builder_t::register_desc(tunnel_desc_t *desc)
 const tunnel_desc_t *tunnel_builder_t::get_desc(const char *name)
 {
 	return (name ? tunnel_by_name.get(name) : NULL);
+}
+
+
+void tunnel_builder_t::get_all_desc(vector_tpl<const tunnel_desc_t *> &list)
+{
+	for(auto const& i : tunnel_by_name) {
+		list.append(i.value);
+	}
 }
 
 

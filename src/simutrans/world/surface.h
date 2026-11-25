@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: climate changes are reported to the remote control
  */
 
 #ifndef WORLD_SURFACE_H
@@ -12,6 +13,7 @@
 #include "../dataobj/koord.h"
 #include "../dataobj/koord3d.h"
 #include "../tpl/array2d_tpl.h"
+#include "../network/remote_control.h"
 
 
 class grund_t;
@@ -494,6 +496,9 @@ public:
 	inline void set_climate(koord k, climate cl, bool recalc) {
 		planquadrat_t *plan = access(k);
 		if(  plan  ) {
+			if(  plan->get_climate() != cl  ) {
+				remote_control_map_changed(k.x, k.y);
+			}
 			plan->set_climate(cl);
 			if(  recalc  ) {
 				recalc_transitions(k);

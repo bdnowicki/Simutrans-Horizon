@@ -1,12 +1,14 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: clouds leave the ground in their own destructor (map change tracking of the remote control)
  */
 
 #include <stdio.h>
 #include <string.h>
 
 #include "../world/simworld.h"
+#include "../ground/grund.h"
 #include "simobj.h"
 #include "../utils/simrandom.h"
 #include "wolke.h"
@@ -50,6 +52,13 @@ wolke_t::wolke_t(koord3d pos, sint8 b_x_off, sint8 b_y_off, sint16 b_h_off, uint
 wolke_t::~wolke_t()
 {
 	mark_image_dirty( get_image(), calc_yoff() );
+	// leave the ground here, where the type is still known; otherwise obj_t::~obj_t does it
+	if(  !get_flag(obj_t::not_on_map)  ) {
+		grund_t *gr = welt->lookup(get_pos());
+		if(  gr  &&  gr->obj_remove(this)  ) {
+			set_flag(obj_t::not_on_map);
+		}
+	}
 }
 
 

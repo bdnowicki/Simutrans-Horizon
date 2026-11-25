@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: direction changes are reported to the remote control
  */
 
 #ifndef OBJ_WAY_WEG_H
@@ -12,6 +13,7 @@
 #include "../../obj/simobj.h"
 #include "../../descriptor/way_desc.h"
 #include "../../dataobj/koord3d.h"
+#include "../../network/remote_control.h"
 
 
 class karte_t;
@@ -196,7 +198,7 @@ public:
 	* @note After changing of ribi the image of the way is wrong. To correct this,
 	* grund_t::calc_image needs to be called. This is not done here (Too expensive).
 	*/
-	void ribi_add(ribi_t::ribi ribi) { this->ribi |= (uint8)ribi;}
+	void ribi_add(ribi_t::ribi ribi) { const uint8 old = this->ribi; this->ribi |= (uint8)ribi; ribi_changed(old); }
 
 	/**
 	* Remove direction bits (ribi) for a way.
@@ -204,7 +206,7 @@ public:
 	* @note After changing of ribi the image of the way is wrong. To correct this,
 	* grund_t::calc_image needs to be called. This is not done here (Too expensive).
 	*/
-	void ribi_rem(ribi_t::ribi ribi) { this->ribi &= (uint8)~ribi;}
+	void ribi_rem(ribi_t::ribi ribi) { const uint8 old = this->ribi; this->ribi &= (uint8)~ribi; ribi_changed(old); }
 
 	/**
 	* Set direction bits (ribi) for the way.
@@ -212,7 +214,10 @@ public:
 	* @note After changing of ribi the image of the way is wrong. To correct this,
 	* grund_t::calc_image needs to be called. This is not done here (Too expensive).
 	*/
-	void set_ribi(ribi_t::ribi ribi) { this->ribi = (uint8)ribi;}
+	void set_ribi(ribi_t::ribi ribi) { const uint8 old = this->ribi; this->ribi = (uint8)ribi; ribi_changed(old); }
+
+	/// reports a changed direction to the map change tracking of the remote control (3D export)
+	void ribi_changed(uint8 old) const { if(  old != this->ribi  ) { remote_control_map_changed(get_pos().x, get_pos().y); } }
 
 	/**
 	* Get the unmasked direction bits (ribi) for the way (without signals or other ribi changer).

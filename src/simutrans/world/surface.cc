@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: climate changes are reported to the remote control
  */
 
 #include "surface.h"
@@ -718,6 +719,7 @@ void surface_t::calc_climate(koord k, bool recalc)
 	}
 
 	grund_t *gr = pl->get_kartenboden();
+	const climate old_climate = pl->get_climate();
 	if(  gr  ) {
 		if(  !gr->is_water()  ) {
 			bool beach = false;
@@ -747,6 +749,9 @@ void surface_t::calc_climate(koord k, bool recalc)
 		}
 		pl->set_climate_transition_flag(false);
 		pl->set_climate_corners(0);
+	}
+	if(  pl->get_climate() != old_climate  ) {
+		remote_control_map_changed(k.x, k.y);
 	}
 
 	if(  recalc  ) {

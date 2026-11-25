@@ -71,4 +71,25 @@ void remote_control_on_world(remote_control_world_event_t what);
 /// a convoy arrived at a stop
 void remote_control_on_arrival(unsigned short convoy_id, unsigned short halt_id);
 
+/*
+ * Change tracking of the map for the 3D export (command map_changes). The engine reports every
+ * visible change of a square that is not a moving thing: objects added to or removed from a
+ * ground (except vehicles, pedestrians, city cars, animals, smoke and cursors), a building tile
+ * replaced, way and way object directions, way, bridge and tunnel types, terrain heights and
+ * slopes, grounds added, removed or replaced, climates. Only flags of the 64x64 cells around the
+ * square are set (atomic stores; the world's worker threads may call it while the main thread
+ * waits for them), nothing of the game is touched, and while no client tracks the map the
+ * inline check returns at once.
+ */
+extern bool remote_control_map_tracked;
+
+void remote_control_mark_changed(int x, int y);
+
+inline void remote_control_map_changed(int x, int y)
+{
+	if(  remote_control_map_tracked  ) {
+		remote_control_mark_changed(x, y);
+	}
+}
+
 #endif

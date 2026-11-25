@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_all_desc() of the city cars for the remote control
  */
 
 #ifndef VEHICLE_SIMROADTRAFFIC_H
@@ -12,6 +13,8 @@
 
 #include "../tpl/stringhashtable_tpl.h"
 #include "../tpl/freelist_iter_tpl.h"
+
+template<class T> class vector_tpl;
 
 class citycar_desc_t;
 class karte_t;
@@ -154,6 +157,9 @@ public:
 
 	static bool register_desc(const citycar_desc_t *desc);
 	static bool successfully_loaded();
+
+	/// appends all registered city car descriptions to @p list, unordered
+	static void get_all_desc(vector_tpl<const citycar_desc_t *> &list);
 
 	// since we must consider overtaking, we use this for offset calculation
 	void get_screen_offset( int &xoff, int &yoff, const sint16 raster_width ) const OVERRIDE;

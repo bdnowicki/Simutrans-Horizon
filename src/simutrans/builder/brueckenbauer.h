@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_all_desc() for the remote control
  */
 
 #ifndef BUILDER_BRUECKENBAUER_H
@@ -167,6 +168,9 @@ public:
 	 * Returns a list with available bridge types.
 	 */
 	static const vector_tpl<const bridge_desc_t *>& get_available_bridges(const waytype_t wtyp);
+
+	/// appends all registered bridge descriptions to @p list, unordered
+	static void get_all_desc(vector_tpl<const bridge_desc_t *> &list);
 };
 
 #endif

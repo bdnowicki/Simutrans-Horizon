@@ -46,19 +46,42 @@
 #include "../simconvoi.h"
 #include "../simfab.h"
 #include "../simline.h"
+#include "../builder/brueckenbauer.h"
 #include "../builder/goods_manager.h"
+#include "../builder/hausbauer.h"
+#include "../builder/tree_builder.h"
+#include "../builder/tunnelbauer.h"
+#include "../builder/vehikelbauer.h"
+#include "../builder/wegbauer.h"
 #include "../dataobj/ribi.h"
 #include "../dataobj/schedule.h"
+#include "../descriptor/bridge_desc.h"
 #include "../descriptor/building_desc.h"
+#include "../descriptor/citycar_desc.h"
 #include "../descriptor/factory_desc.h"
 #include "../descriptor/goods_desc.h"
+#include "../descriptor/pedestrian_desc.h"
+#include "../descriptor/roadsign_desc.h"
+#include "../descriptor/tree_desc.h"
+#include "../descriptor/tunnel_desc.h"
+#include "../descriptor/vehicle_desc.h"
 #include "../descriptor/way_desc.h"
+#include "../descriptor/way_obj_desc.h"
+#include "../obj/baum.h"
+#include "../obj/bruecke.h"
 #include "../obj/depot.h"
 #include "../obj/field.h"
 #include "../obj/gebaeude.h"
 #include "../obj/label.h"
 #include "../obj/leitung2.h"
+#include "../obj/pillar.h"
+#include "../obj/roadsign.h"
+#include "../obj/tunnel.h"
+#include "../obj/wayobj.h"
 #include "../obj/way/weg.h"
+#include "../vehicle/air_vehicle.h"
+#include "../vehicle/pedestrian.h"
+#include "../vehicle/simroadtraffic.h"
 #include "../vehicle/vehicle.h"
 #include "../script/script.h"
 #include "../script/script_loader.h"
@@ -72,7 +95,9 @@
 #include "../../squirrel/sq_extensions.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -95,7 +120,8 @@
 #define MAX_PENDING_INPUT (8*1024*1024)   ///< a client with more received but not executed requests is disconnected
 #define OUTPUT_STALL_TIMEOUT 60000        ///< ms without any progress in sending the replies until disconnect
 #define HANDSHAKE_TIMEOUT 5000            ///< ms until a new connection must have sent the greeting
-#define POLL_TIME_BUDGET 8                ///< ms per poll for executing requests (at least one per client)
+#define POLL_TIME_BUDGET_US 4000          ///< us per poll for executing requests (at least one per client)
+#define HEAVY_START_US 1000               ///< a heavy request starts only this early in a poll, at most one per poll
 #define MAX_QUEUED_TEXTS 1024             ///< text requests whose string events the game has not polled yet
 #define MAX_QUEUED_TEXT_BYTES (16*1024*1024)
 
@@ -206,6 +232,22 @@ class json_t
 		buf += '"';
 	}
 
+	void append_int(sint64 v)
+	{
+		char digits[24];
+		char *const end = digits + sizeof(digits);
+		char *p = end;
+		uint64 u = v < 0 ? (uint64)0 - (uint64)v : (uint64)v;
+		do {
+			*--p = (char)('0' + u % 10);
+			u /= 10;
+		} while (u);
+		if (v < 0) {
+			*--p = '-';
+		}
+		buf.append(p, end - p);
+	}
+
 public:
 	json_t &obj()     { sep(); buf += '{'; first.push_back(true); return *this; }
 	json_t &end_obj() { buf += '}'; first.pop_back(); return *this; }
@@ -228,18 +270,21 @@ public:
 	json_t &num(sint64 v)
 	{
 		sep();
-		char digits[24];
-		char *const end = digits + sizeof(digits);
-		char *p = end;
-		uint64 u = v < 0 ? (uint64)0 - (uint64)v : (uint64)v;
-		do {
-			*--p = (char)('0' + u % 10);
-			u /= 10;
-		} while (u);
-		if (v < 0) {
-			*--p = '-';
+		append_int(v);
+		return *this;
+	}
+	/// [v0,v1,...] as one array element or value: faster than arr() + num() for many small rows
+	json_t &int_row(const int *v, int n)
+	{
+		sep();
+		buf += '[';
+		for (int i = 0; i < n; i++) {
+			if (i) {
+				buf += ',';
+			}
+			append_int(v[i]);
 		}
-		buf.append(p, end - p);
+		buf += ']';
 		return *this;
 	}
 	json_t &dbl(double v)
@@ -253,6 +298,13 @@ public:
 		else {
 			buf += "null";
 		}
+		return *this;
+	}
+	/// a value that is already JSON (e.g. a cached array)
+	json_t &raw(const std::string &json)
+	{
+		sep();
+		buf += json;
 		return *this;
 	}
 	/// string of len characters that need no escaping (e.g. map rows)
@@ -406,6 +458,13 @@ static const char *make_error(const char *fmt, const char *detail)
 static int owner_of(sint8 nr)
 {
 	return (nr < 0 || nr >= PLAYER_UNOWNED) ? -1 : nr;
+}
+
+
+/// monotonic clock in microseconds, for time budgets and measurements
+static uint64 time_us()
+{
+	return (uint64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 
@@ -4433,14 +4492,21 @@ static const uint8 builtin_palette[SPECIAL_COLOR_COUNT + LIGHT_COUNT][3] = {
 #define MAP_CELL (1 << MAP_CELL_SHIFT)
 #define MAP_TRACK_IDLE_TIMEOUT 120000     ///< ms without map requests or polls until the tracking stops
 #define MAP_SWEEP_TILES_PER_SECOND 65536  ///< background re-check of all squares
+#define MAP_SWEEP_MAX_PER_POLL 8192       ///< at most this many squares per poll (about 0.5 ms; slow frames re-check slower)
+#define MAP_SCAN_UNTIL_US 4000            ///< the first pass scans cells until this long after the start of the poll
 #define MAX_MINIMAP_SAMPLES (1024*1024)
 
 /**
- * Change tracking of the map for map_changes, started by the first minimap or map_changes request.
- * Every square keeps its terrain and owner colour; minimap_t::calc_map_pixel(koord), which the game
- * calls for every changed square (and when a vehicle moves while the minimap is open), compares them
- * and records a change only if one of them changed. A slow background re-check finds the changes
- * that do not go through calc_map_pixel (e.g. owner changes).
+ * Change tracking of the map for map_changes, started by the first minimap, map_changes, scene3d or
+ * heights request. Every square keeps its terrain and owner colour; minimap_t::calc_map_pixel(koord),
+ * which the game calls for every changed square (and when a vehicle moves while the minimap is open),
+ * compares them and records a change only if one of them changed. A slow background re-check finds
+ * the changes that do not go through calc_map_pixel (e.g. owner changes). Changes that keep the
+ * colours (a city building replaced, a way extended, a sign added, ...) come from the engine hooks
+ * (remote_control_mark_changed), which flag cells; map_tracking_fold() records them.
+ * The first pass that takes the colours is spread over the polls, one cell after the other (a
+ * whole 1024x1024 map would stop the game for some 40 ms); a request scans the cells it needs at
+ * once. A cell counts as changed when it is scanned, since nothing was compared before.
  */
 struct map_tracking_t
 {
@@ -4450,8 +4516,11 @@ struct map_tracking_t
 	koord size = koord(0, 0);
 	uint32 start_gen = 0;           ///< map gen when the tracking started: older since give full
 	koord cells = koord(0, 0);
-	std::vector<uint16> sig;        ///< per square: terrain colour << 8 | owner colour
+	std::vector<uint16> sig;        ///< per square: terrain colour << 8 | owner colour (once its cell is scanned)
 	std::vector<uint32> cell_gen;   ///< per cell: map gen of its last change
+	std::vector<uint8> cell_scanned; ///< per cell: sig holds its colours
+	uint32 cells_left = 0;          ///< cells not scanned yet
+	uint32 scan_next = 0;           ///< the cells before this one are scanned
 	uint32 sweep_next = 0;          ///< next square of the background re-check
 	uint32 sweep_time = 0;
 	uint32 last_use = 0;            ///< dr_time() of the last minimap, map_changes or poll
@@ -4459,6 +4528,52 @@ struct map_tracking_t
 
 static map_tracking_t map_track;
 static uint32 map_gen = 1; ///< revision of the map: changes, other worlds, rotations (never reset)
+
+bool remote_control_map_tracked = false;
+
+/// per cell: changed according to an engine hook, not yet recorded in cell_gen (written from any thread)
+static std::unique_ptr<std::atomic<uint8>[]> map_dirty;
+static std::atomic<bool> map_dirty_any(false);
+static int map_dirty_w = 0, map_dirty_h = 0, map_dirty_cells_x = 0;
+
+
+/**
+ * Engine hook (see remote_control.h): flags the cells of the square and of its eight neighbours,
+ * since an object also changes how the next squares look (ways, overhead lines, power lines).
+ * The world's worker threads (loading, rotation) may call it at the same time while the main
+ * thread waits for them; the arrays only change on the main thread outside of such calls.
+ */
+void remote_control_mark_changed(int x, int y)
+{
+	const int w = map_dirty_w, h = map_dirty_h;
+	if (x < 0  ||  y < 0  ||  x >= w  ||  y >= h) {
+		return;
+	}
+	const int cx0 = max(x - 1, 0) >> MAP_CELL_SHIFT, cx1 = min(x + 1, w - 1) >> MAP_CELL_SHIFT;
+	const int cy0 = max(y - 1, 0) >> MAP_CELL_SHIFT, cy1 = min(y + 1, h - 1) >> MAP_CELL_SHIFT;
+	for (int cy = cy0; cy <= cy1; cy++) {
+		for (int cx = cx0; cx <= cx1; cx++) {
+			map_dirty[cy * map_dirty_cells_x + cx].store(1, std::memory_order_relaxed);
+		}
+	}
+	map_dirty_any.store(true, std::memory_order_relaxed);
+}
+
+
+/// records the cells flagged by the engine hooks as changed (main thread)
+static void map_tracking_fold()
+{
+	if (!map_track.active  ||  !map_dirty_any.exchange(false, std::memory_order_relaxed)) {
+		return;
+	}
+	const size_t cells = map_track.cell_gen.size();
+	for (size_t i = 0; i < cells; i++) {
+		if (map_dirty[i].load(std::memory_order_relaxed)) {
+			map_dirty[i].store(0, std::memory_order_relaxed);
+			map_track.cell_gen[i] = ++map_gen;
+		}
+	}
+}
 
 static const minimap_t::color_scale_t unit_scale = { 1, 1, 1 };
 
@@ -4484,6 +4599,56 @@ static void map_check_tile(koord k)
 }
 
 
+static uint32 map_cell_of(koord k)
+{
+	return (uint32)(k.y >> MAP_CELL_SHIFT) * (uint32)map_track.cells.x + (uint32)(k.x >> MAP_CELL_SHIFT);
+}
+
+
+/// takes the colours of the squares of a cell that is not scanned yet; the cell counts as changed
+static void map_scan_cell(uint32 cell)
+{
+	const koord size = map_track.size;
+	const sint16 x0 = (sint16)((cell % (uint32)map_track.cells.x) << MAP_CELL_SHIFT);
+	const sint16 y0 = (sint16)((cell / (uint32)map_track.cells.x) << MAP_CELL_SHIFT);
+	const sint16 x1 = (sint16)min(x0 + MAP_CELL, (int)size.x), y1 = (sint16)min(y0 + MAP_CELL, (int)size.y);
+	koord k;
+	for (k.y = y0; k.y < y1; k.y++) {
+		uint16 *row = map_track.sig.data() + (size_t)k.y * size.x;
+		for (k.x = x0; k.x < x1; k.x++) {
+			row[k.x] = tile_signature(k);
+		}
+	}
+	map_track.cell_scanned[cell] = 1;
+	map_track.cells_left--;
+	map_track.cell_gen[cell] = ++map_gen;
+}
+
+
+/// scans the cells of a region (inside the map) now; the tracking must be active
+static void map_tracking_scan(koord pos, koord size)
+{
+	if (map_track.cells_left == 0) {
+		return;
+	}
+	const sint16 cx1 = (sint16)((pos.x + size.x - 1) >> MAP_CELL_SHIFT), cy1 = (sint16)((pos.y + size.y - 1) >> MAP_CELL_SHIFT);
+	for (sint16 cy = (sint16)(pos.y >> MAP_CELL_SHIFT); cy <= cy1; cy++) {
+		for (sint16 cx = (sint16)(pos.x >> MAP_CELL_SHIFT); cx <= cx1; cx++) {
+			const uint32 cell = (uint32)cy * (uint32)map_track.cells.x + (uint32)cx;
+			if (!map_track.cell_scanned[cell]) {
+				map_scan_cell(cell);
+			}
+		}
+	}
+}
+
+
+static void map_tracking_scan_at(koord pos)
+{
+	map_tracking_scan(pos, koord(1, 1));
+}
+
+
 /// minimap_t::tile_changed_hook while the tracking is active
 static void on_tile_changed(koord k)
 {
@@ -4494,7 +4659,9 @@ static void on_tile_changed(koord k)
 	if (map_track.world_gen != remote_control_world_generation  ||  map_track.rotation != welt->get_settings().get_rotation()  ||  map_track.size != welt->get_size()) {
 		return; // another world or rotated: the next request starts again
 	}
-	map_check_tile(k);
+	if (map_track.cell_scanned[map_cell_of(k)]) {
+		map_check_tile(k); // a cell not scanned yet counts as changed when it is scanned
+	}
 }
 
 
@@ -4502,8 +4669,14 @@ static void map_tracking_stop()
 {
 	map_track.active = false;
 	minimap_t::tile_changed_hook = NULL;
+	remote_control_map_tracked = false;
+	map_dirty_w = map_dirty_h = map_dirty_cells_x = 0;
+	map_dirty.reset();
+	map_dirty_any.store(false, std::memory_order_relaxed);
 	std::vector<uint16>().swap(map_track.sig);
 	std::vector<uint32>().swap(map_track.cell_gen);
+	std::vector<uint8>().swap(map_track.cell_scanned);
+	map_track.cells_left = 0;
 }
 
 
@@ -4519,10 +4692,11 @@ static void map_tracking_validate()
 		map_track.size = welt->get_size();
 		map_gen++;
 	}
+	map_tracking_fold();
 }
 
 
-/// starts the tracking if needed (one pass over the map)
+/// starts the tracking if needed; the cells are scanned later (map_tracking_poll, map_tracking_scan)
 static void map_tracking_start()
 {
 	map_tracking_validate();
@@ -4532,25 +4706,31 @@ static void map_tracking_start()
 	}
 	const koord size = map_track.size;
 	map_track.cells = koord((size.x + MAP_CELL - 1) >> MAP_CELL_SHIFT, (size.y + MAP_CELL - 1) >> MAP_CELL_SHIFT);
+	const size_t cells = (size_t)map_track.cells.x * map_track.cells.y;
 	map_track.start_gen = ++map_gen;
-	map_track.cell_gen.assign((size_t)map_track.cells.x * map_track.cells.y, map_track.start_gen);
-	map_track.sig.resize((size_t)size.x * size.y);
-	size_t i = 0;
-	koord k;
-	for (k.y = 0; k.y < size.y; k.y++) {
-		for (k.x = 0; k.x < size.x; k.x++) {
-			map_track.sig[i++] = tile_signature(k);
-		}
-	}
+	map_track.cell_gen.assign(cells, map_track.start_gen);
+	map_track.cell_scanned.assign(cells, 0);
+	map_track.cells_left = (uint32)cells;
+	map_track.scan_next = 0;
+	map_track.sig.assign((size_t)size.x * size.y, 0);
 	map_track.sweep_next = 0;
 	map_track.sweep_time = dr_time();
+	map_dirty.reset(new std::atomic<uint8>[cells]());
+	map_dirty_any.store(false, std::memory_order_relaxed);
+	map_dirty_w = size.x;
+	map_dirty_h = size.y;
+	map_dirty_cells_x = map_track.cells.x;
 	map_track.active = true;
 	minimap_t::tile_changed_hook = on_tile_changed;
+	remote_control_map_tracked = true;
 }
 
 
-/// called every poll: stops unused tracking, notices other worlds, re-checks some squares
-static void map_tracking_poll(uint32 now, bool any_client)
+/**
+ * Called every poll: stops unused tracking, notices other worlds, continues the first pass (at
+ * least one cell, more until MAP_SCAN_UNTIL_US after poll_start), afterwards re-checks some squares.
+ */
+static void map_tracking_poll(uint32 now, bool any_client, uint64 poll_start)
 {
 	if (!map_track.active) {
 		return;
@@ -4560,12 +4740,25 @@ static void map_tracking_poll(uint32 now, bool any_client)
 		return;
 	}
 	map_tracking_validate();
+	if (!map_track.active) {
+		return;
+	}
+	if (map_track.cells_left > 0) {
+		do {
+			while (map_track.cell_scanned[map_track.scan_next]) {
+				map_track.scan_next++;
+			}
+			map_scan_cell(map_track.scan_next);
+		} while (map_track.cells_left > 0  &&  time_us() - poll_start < MAP_SCAN_UNTIL_US);
+		map_track.sweep_time = now;
+		return;
+	}
 	const uint32 elapsed = now - map_track.sweep_time;
-	if (!map_track.active  ||  elapsed < 20) {
+	if (elapsed < 20) {
 		return;
 	}
 	map_track.sweep_time = now;
-	uint32 n = std::min<uint32>(elapsed, 1000) * MAP_SWEEP_TILES_PER_SECOND / 1000;
+	uint32 n = std::min<uint32>(std::min<uint32>(elapsed, 1000) * MAP_SWEEP_TILES_PER_SECOND / 1000, MAP_SWEEP_MAX_PER_POLL);
 	const uint32 w = (uint32)map_track.size.x;
 	const uint32 total = w * (uint32)map_track.size.y;
 	while (n-- > 0) {
@@ -4776,9 +4969,13 @@ static const char *cmd_minimap(const args_t &a, json_t &j)
 	const int level = (int)clamp<sint64>(arg_int(a, "level", 6), 1, 9);
 
 	map_tracking_start();
+	const bool tracked_colours = !vehicles  &&  (mode == minimap_t::PLAIN  ||  mode == minimap_t::MAP_OWNER);
+	if (tracked_colours  &&  step == 1) {
+		map_tracking_scan(koord((sint16)x, (sint16)y), koord((sint16)w, (sint16)h));
+	}
 	std::vector<uint8> samples((size_t)(sw * sh));
 	uint8 *out = samples.data();
-	if (!vehicles  &&  (mode == minimap_t::PLAIN  ||  mode == minimap_t::MAP_OWNER)) {
+	if (tracked_colours  &&  (step == 1  ||  map_track.cells_left == 0)) {
 		// the colours kept for the change tracking
 		const int shift = mode == minimap_t::PLAIN ? 8 : 0;
 		for (sint64 sy = 0; sy < sh; sy++) {
@@ -4895,6 +5092,973 @@ static const char *cmd_labels(const args_t &, json_t &j)
 		j.end_obj();
 	}
 	j.end_arr();
+	return NULL;
+}
+
+
+// ---------------------------------------------------------------------------
+// 3D view export: desc_list, scene3d, heights, vehicles3d
+// ---------------------------------------------------------------------------
+
+/// the lists of desc_list, in this order
+enum desc_kind_t
+{
+	DESC_BUILDINGS, DESC_VEHICLES, DESC_WAYS, DESC_BRIDGES, DESC_TUNNELS, DESC_TREES, DESC_SIGNS, DESC_WAYOBJS, DESC_GOODS,
+	DESC_CITYCARS, DESC_PEDESTRIANS,
+	DESC_KINDS
+};
+
+static const char *const desc_kind_names[DESC_KINDS] = {
+	"buildings", "vehicles", "ways", "bridges", "tunnels", "trees", "signs", "wayobjs", "goods", "citycars", "pedestrians"
+};
+
+
+/**
+ * Catalog of the pak objects with the indices that scene3d uses instead of names: every list is
+ * sorted by the untranslated names (trees by tree id, which follows the names too). The pakset
+ * does not change while the program runs, so it is built once, together with the JSON of the lists.
+ */
+struct desc_catalog_t
+{
+	bool built = false;
+	uint32 gen = 0;                                          ///< FNV-1a hash of all lists
+	std::string json[DESC_KINDS];                            ///< every list as a JSON array
+	std::unordered_map<const void *, int> index[DESC_KINDS]; ///< desc -> i (trees: i is the tree id)
+};
+
+
+template<class T> static bool desc_name_less(const T *a, const T *b)
+{
+	return strcmp(a->get_name(), b->get_name()) < 0;
+}
+
+
+/// NULL for no waytype (ignore_wt)
+static const char *waytype_name(waytype_t wt)
+{
+	switch (wt) {
+		case road_wt:          return "road";
+		case track_wt:         return "track";
+		case water_wt:         return "water";
+		case overheadlines_wt: return "overheadline";
+		case monorail_wt:      return "monorail";
+		case maglev_wt:        return "maglev";
+		case tram_wt:          return "tram";
+		case narrowgauge_wt:   return "narrowgauge";
+		case air_wt:           return "air";
+		case powerline_wt:     return "powerline";
+		case invalid_wt:
+		case ignore_wt:        return NULL;
+		default:               return "other";
+	}
+}
+
+
+static const char *way_waytype_name(const way_desc_t *desc)
+{
+	if (desc->get_wtyp() == track_wt  &&  desc->get_styp() == type_tram) {
+		return "tram"; // tram tracks are track ways of the system type tram
+	}
+	const char *name = waytype_name(desc->get_wtyp());
+	return name ? name : "other";
+}
+
+
+static const char *way_system_name(const way_desc_t *desc)
+{
+	switch (desc->get_styp()) {
+		case type_flat:     return "flat";
+		case type_elevated: return desc->get_wtyp() == air_wt ? "runway" : "elevated";
+		case type_tram:     return "tram";
+		case type_river:    return "river";
+		default:            return "other";
+	}
+}
+
+
+static const char *building_type_name(const building_desc_t *desc)
+{
+	switch (desc->get_type()) {
+		case building_desc_t::city_res:          return "res";
+		case building_desc_t::city_com:          return "com";
+		case building_desc_t::city_ind:          return "ind";
+		case building_desc_t::attraction_city:
+		case building_desc_t::attraction_land:   return "cur";
+		case building_desc_t::monument:          return "mon";
+		case building_desc_t::townhall:          return "tow";
+		case building_desc_t::headquarters:      return "hq";
+		case building_desc_t::dock:
+		case building_desc_t::flat_dock:
+		case building_desc_t::generic_stop:      return "stop";
+		case building_desc_t::generic_extension: return "ext";
+		case building_desc_t::depot:             return "depot";
+		case building_desc_t::factory:           return "factory";
+		default:                                 return "other";
+	}
+}
+
+
+static void write_timeline(json_t &j, const obj_desc_timelined_t *desc)
+{
+	j.kv("intro", (int)(desc->get_intro_year_month() / 12));
+	j.kv("retire", (int)(desc->get_retire_year_month() / 12));
+}
+
+
+/// sorts a list by name, numbers it and writes it as JSON array (i, name, then what write() adds)
+template<class T, class F> static void catalog_add(desc_catalog_t &cat, desc_kind_t kind, vector_tpl<const T *> &list, F write)
+{
+	std::sort(list.begin(), list.end(), desc_name_less<T>);
+	json_t j;
+	j.arr();
+	for (uint32 i = 0; i < list.get_count(); i++) {
+		cat.index[kind][list[i]] = (int)i;
+		j.obj().kv("i", (int)i).kv("name", list[i]->get_name());
+		write(j, list[i]);
+		j.end_obj();
+	}
+	j.end_arr();
+	cat.json[kind].swap(j.text());
+}
+
+
+static uint32 fnv1a(uint32 h, const char *s, size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		h = (h ^ (uint8)s[i]) * 16777619u;
+	}
+	return h;
+}
+
+
+static const desc_catalog_t &get_desc_catalog()
+{
+	static desc_catalog_t cat;
+	if (cat.built) {
+		return cat;
+	}
+
+	vector_tpl<const building_desc_t *> buildings;
+	hausbauer_t::get_all_desc(buildings);
+	catalog_add(cat, DESC_BUILDINGS, buildings, [](json_t &j, const building_desc_t *d) {
+		const char *type = building_type_name(d);
+		j.kv("type", type);
+		j.key("size").arr().num(d->get_x()).num(d->get_y()).end_arr();
+		j.kv("layouts", (int)d->get_all_layouts());
+		j.kv("level", (int)d->get_level());
+		j.kv("height", (int)d->get_height_clearance());
+		j.kv("climates", (int)d->get_allowed_climate_bits());
+		j.kv("waytype", waytype_name(d->get_finance_waytype()));
+		if (strcmp(type, "stop") == 0  ||  strcmp(type, "ext") == 0) {
+			j.kv("enables", (int)d->get_enabled());
+		}
+		write_timeline(j, d);
+	});
+
+	vector_tpl<const vehicle_desc_t *> vehicles;
+	for (int wt = 0; wt <= narrowgauge_wt; wt++) {
+		// the vehicle lists by waytype index: 1-8 are the waytypes, 0 holds aircraft and all others
+		for (const vehicle_desc_t *d : vehicle_builder_t::get_info((waytype_t)wt)) {
+			vehicles.append(d);
+		}
+	}
+	catalog_add(cat, DESC_VEHICLES, vehicles, [](json_t &j, const vehicle_desc_t *d) {
+		j.kv("waytype", waytype_name(d->get_waytype()));
+		j.kv("length", (int)d->get_length());
+		const goods_desc_t *freight = d->get_freight_type();
+		j.kv("freight", freight ? freight->get_name() : NULL);
+		j.kv("capacity", (int)d->get_capacity());
+		j.kv("power", (uint32)d->get_power());
+		j.kv("speed", (int)d->get_topspeed());
+		write_timeline(j, d);
+	});
+
+	vector_tpl<const way_desc_t *> ways;
+	way_builder_t::get_all_desc(ways);
+	catalog_add(cat, DESC_WAYS, ways, [](json_t &j, const way_desc_t *d) {
+		j.kv("waytype", way_waytype_name(d));
+		j.kv("system", way_system_name(d));
+		j.kv("speed", (int)d->get_topspeed());
+	});
+
+	vector_tpl<const bridge_desc_t *> bridges;
+	bridge_builder_t::get_all_desc(bridges);
+	catalog_add(cat, DESC_BRIDGES, bridges, [](json_t &j, const bridge_desc_t *d) {
+		j.kv("waytype", waytype_name(d->get_waytype()));
+		j.kv("speed", (int)d->get_topspeed());
+		j.kv("pillars", (int)d->get_pillar());
+	});
+
+	vector_tpl<const tunnel_desc_t *> tunnels;
+	tunnel_builder_t::get_all_desc(tunnels);
+	catalog_add(cat, DESC_TUNNELS, tunnels, [](json_t &j, const tunnel_desc_t *d) {
+		j.kv("waytype", waytype_name(d->get_waytype()));
+		j.kv("speed", (int)d->get_topspeed());
+	});
+
+	json_t trees;
+	trees.arr();
+	const vector_tpl<const tree_desc_t *> &tree_list = tree_builder_t::get_all_desc();
+	for (uint32 i = 0; i < tree_list.get_count(); i++) {
+		if (const tree_desc_t *d = tree_list[i]) { // the list ends with NULL
+			trees.obj().kv("i", (int)i).kv("name", d->get_name()).kv("climates", (int)d->get_allowed_climate_bits()).end_obj();
+		}
+	}
+	trees.end_arr();
+	cat.json[DESC_TREES].swap(trees.text());
+
+	vector_tpl<const roadsign_desc_t *> signs;
+	roadsign_t::get_all_desc(signs);
+	catalog_add(cat, DESC_SIGNS, signs, [](json_t &j, const roadsign_desc_t *d) {
+		j.kv("waytype", waytype_name(d->get_wtyp()));
+		j.kv("flags", (int)d->get_flags());
+		j.kv("traffic_light", d->is_traffic_light());
+	});
+
+	vector_tpl<const way_obj_desc_t *> wayobjs;
+	for (auto const &i : wayobj_t::get_list()) {
+		wayobjs.append(i.value);
+	}
+	catalog_add(cat, DESC_WAYOBJS, wayobjs, [](json_t &j, const way_obj_desc_t *d) {
+		j.kv("waytype", waytype_name(d->get_wtyp()));
+		j.kv("speed", (int)d->get_topspeed());
+		j.kv("overhead", d->is_overhead_line());
+	});
+
+	vector_tpl<const goods_desc_t *> goods;
+	for (uint16 i = 0; i < goods_manager_t::get_count(); i++) {
+		goods.append(goods_manager_t::get_info(i));
+	}
+	catalog_add(cat, DESC_GOODS, goods, [](json_t &j, const goods_desc_t *d) {
+		j.kv("color", (int)d->get_color_index());
+		j.kv("catg", (int)d->get_catg());
+	});
+
+	vector_tpl<const citycar_desc_t *> citycars;
+	private_car_t::get_all_desc(citycars);
+	catalog_add(cat, DESC_CITYCARS, citycars, [](json_t &j, const citycar_desc_t *d) {
+		j.kv("speed", (int)speed_to_kmh(d->get_topspeed()));
+		write_timeline(j, d);
+	});
+
+	vector_tpl<const pedestrian_desc_t *> pedestrians;
+	pedestrian_t::get_all_desc(pedestrians);
+	catalog_add(cat, DESC_PEDESTRIANS, pedestrians, [](json_t &j, const pedestrian_desc_t *d) {
+		write_timeline(j, d);
+	});
+
+	uint32 h = 2166136261u;
+	for (int k = 0; k < DESC_KINDS; k++) {
+		h = fnv1a(h, desc_kind_names[k], strlen(desc_kind_names[k]));
+		h = fnv1a(h, cat.json[k].data(), cat.json[k].size());
+	}
+	cat.gen = h;
+	cat.built = true;
+	return cat;
+}
+
+
+static int catalog_index(const desc_catalog_t &cat, desc_kind_t kind, const void *desc)
+{
+	std::unordered_map<const void *, int>::const_iterator it = cat.index[kind].find(desc);
+	return it == cat.index[kind].end() ? -1 : it->second;
+}
+
+
+/// the pak objects that scene3d and vehicles3d refer to by index
+static const char *cmd_desc_list(const args_t &a, json_t &j)
+{
+	const uint64 start = time_us();
+	uint32 kinds = (1u << DESC_KINDS) - 1;
+	const std::string list = arg_str(a, "kinds");
+	if (!list.empty()) {
+		kinds = 0;
+		size_t pos = 0;
+		while (pos <= list.size()) {
+			size_t end = list.find(',', pos);
+			if (end == std::string::npos) {
+				end = list.size();
+			}
+			const std::string name = list.substr(pos, end - pos);
+			int k = 0;
+			while (k < DESC_KINDS  &&  name != desc_kind_names[k]) {
+				k++;
+			}
+			if (k == DESC_KINDS) {
+				return make_error("unknown kind '%s' (buildings vehicles ways bridges tunnels trees signs wayobjs goods citycars pedestrians)", name.c_str());
+			}
+			kinds |= 1u << k;
+			pos = end + 1;
+		}
+	}
+	const desc_catalog_t &cat = get_desc_catalog();
+	j.kv("pakset", env_t::pak_name.c_str());
+	j.kv("gen", cat.gen);
+	for (int k = 0; k < DESC_KINDS; k++) {
+		if (kinds & (1u << k)) {
+			j.key(desc_kind_names[k]).raw(cat.json[k]);
+		}
+	}
+	j.kv("t_us", (sint64)(time_us() - start));
+	return NULL;
+}
+
+
+/// object kinds of scene3d
+enum scene_kind_t
+{
+	SCENE_WAY = 0, SCENE_BUILDING, SCENE_TREE, SCENE_BRIDGE, SCENE_TUNNEL, SCENE_SIGN, SCENE_WAYOBJ,
+	SCENE_PILLAR, SCENE_POWERLINE, SCENE_FIELD, SCENE_GROUNDOBJ, SCENE_OTHER
+};
+
+/// one object of scene3d; the binary block stores the fields as columns in this order
+struct scene_obj_t
+{
+	uint8 x, y;   ///< square inside the chunk
+	sint8 z;      ///< height of the ground that carries the object
+	uint8 kind;   ///< scene_kind_t
+	sint16 desc;  ///< index in the desc_list list of the kind, -1 none
+	uint16 a, b;  ///< meaning depends on the kind
+	sint8 owner;  ///< player number, -1 nobody
+};
+
+#define SCENE_OBJ_BYTES 11
+static const char scene_obj_layout[] = "x:u8,y:u8,z:i8,kind:u8,desc:i16,a:u16,b:u16,owner:i8";
+
+
+/// the age classes of the tree images (tree_builder_t::get_tree_image)
+static int tree_age_class(uint32 age)
+{
+	static const uint8 age_class[12] = { 0, 1, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4 };
+	return age_class[min(age >> 6, 11u)];
+}
+
+
+/// appends the objects of a ground (moving objects are left out)
+static void collect_scene_objects(std::vector<scene_obj_t> &out, const desc_catalog_t &cat, const grund_t *gr, int lx, int ly)
+{
+	// way flags: bit 0 on a bridge (also the ramp) or an elevated way, bit 1 tunnel portal, bits 8-15 way slope
+	const int way_flags = (!gr->ist_karten_boden()  ||  gr->ist_bruecke() ? 1 : 0) | (gr->ist_tunnel() ? 2 : 0) | ((int)(uint8)gr->get_weg_hang() << 8);
+	for (uint8 n = 0; n < gr->obj_count(); n++) {
+		obj_t *obj = gr->obj_bei(n);
+		int kind, desc = -1, a = 0, b = 0;
+		switch (obj->get_typ()) {
+			case obj_t::way: {
+				const weg_t *w = static_cast<const weg_t *>(obj);
+				kind = SCENE_WAY;
+				desc = catalog_index(cat, DESC_WAYS, w->get_desc());
+				a = w->get_ribi_unmasked();
+				b = way_flags;
+				break;
+			}
+			case obj_t::gebaeude:
+			case obj_t::bahndepot:
+			case obj_t::strassendepot:
+			case obj_t::schiffdepot:
+			case obj_t::airdepot:
+			case obj_t::monoraildepot:
+			case obj_t::tramdepot:
+			case obj_t::maglevdepot:
+			case obj_t::narrowgaugedepot: {
+				const building_tile_desc_t *tile = static_cast<const gebaeude_t *>(obj)->get_tile();
+				kind = SCENE_BUILDING;
+				if (tile) {
+					desc = catalog_index(cat, DESC_BUILDINGS, tile->get_desc());
+					a = tile->get_layout();
+					const koord off = tile->get_offset();
+					b = off.x + 256 * off.y;
+				}
+				break;
+			}
+			case obj_t::baum: {
+				const baum_t *tree = static_cast<const baum_t *>(obj);
+				kind = SCENE_TREE;
+				desc = tree->get_desc_id();
+				a = tree_age_class(tree->get_age());
+				break;
+			}
+			case obj_t::bruecke:
+				kind = SCENE_BRIDGE;
+				desc = catalog_index(cat, DESC_BRIDGES, static_cast<const bruecke_t *>(obj)->get_desc());
+				a = gr->get_weg_ribi_unmasked(obj->get_waytype());
+				break;
+			case obj_t::tunnel:
+				kind = SCENE_TUNNEL;
+				desc = catalog_index(cat, DESC_TUNNELS, static_cast<const tunnel_t *>(obj)->get_desc());
+				a = gr->get_weg_ribi_unmasked(obj->get_waytype());
+				break;
+			case obj_t::roadsign:
+			case obj_t::signal: {
+				roadsign_t *sign = static_cast<roadsign_t *>(obj);
+				kind = SCENE_SIGN;
+				desc = catalog_index(cat, DESC_SIGNS, sign->get_desc());
+				a = sign->get_dir();
+				b = (int)sign->get_state() | (obj->get_typ() == obj_t::signal ? 256 : 0);
+				break;
+			}
+			case obj_t::wayobj: {
+				const wayobj_t *wo = static_cast<const wayobj_t *>(obj);
+				kind = SCENE_WAYOBJ;
+				desc = catalog_index(cat, DESC_WAYOBJS, wo->get_desc());
+				a = wo->get_dir();
+				b = wo->get_desc()->get_waytype();
+				break;
+			}
+			case obj_t::pillar:
+				kind = SCENE_PILLAR;
+				desc = catalog_index(cat, DESC_BRIDGES, static_cast<const pillar_t *>(obj)->get_desc());
+				break;
+			case obj_t::leitung:
+			case obj_t::pumpe:
+			case obj_t::senke: {
+				leitung_t *line = static_cast<leitung_t *>(obj);
+				kind = SCENE_POWERLINE;
+				desc = catalog_index(cat, DESC_WAYS, line->get_desc());
+				a = line->get_ribi();
+				b = obj->get_typ() == obj_t::leitung ? 0 : obj->get_typ() == obj_t::pumpe ? 1 : 2;
+				break;
+			}
+			case obj_t::field:
+				kind = SCENE_FIELD;
+				break;
+			case obj_t::groundobj:
+				kind = SCENE_GROUNDOBJ;
+				break;
+			case obj_t::label:
+			case obj_t::crossing:
+				kind = SCENE_OTHER;
+				a = obj->get_typ();
+				break;
+			default:
+				continue; // vehicles, pedestrians, city cars, animals, smoke, cursor
+		}
+		const scene_obj_t o = { (uint8)lx, (uint8)ly, gr->get_hoehe(), (uint8)kind, (sint16)desc, (uint16)a, (uint16)b, (sint8)owner_of(obj->get_owner_nr()) };
+		out.push_back(o);
+	}
+}
+
+
+/// the objects as columns of little endian integers (scene_obj_layout)
+static void pack_scene_objects(const std::vector<scene_obj_t> &objs, std::vector<uint8> &out)
+{
+	const size_t n = objs.size();
+	out.resize(n * SCENE_OBJ_BYTES);
+	uint8 *const x = out.data(), *const y = x + n, *const z = y + n, *const kind = z + n;
+	uint8 *const desc = kind + n, *const a = desc + 2 * n, *const b = a + 2 * n, *const owner = b + 2 * n;
+	for (size_t i = 0; i < n; i++) {
+		const scene_obj_t &o = objs[i];
+		x[i] = o.x;
+		y[i] = o.y;
+		z[i] = (uint8)o.z;
+		kind[i] = o.kind;
+		desc[2 * i] = (uint8)((uint16)o.desc & 0xFF);
+		desc[2 * i + 1] = (uint8)((uint16)o.desc >> 8);
+		a[2 * i] = (uint8)(o.a & 0xFF);
+		a[2 * i + 1] = (uint8)(o.a >> 8);
+		b[2 * i] = (uint8)(o.b & 0xFF);
+		b[2 * i + 1] = (uint8)(o.b >> 8);
+		owner[i] = (uint8)o.owner;
+	}
+}
+
+
+static bool append_zlib_base64(std::string &out, const std::vector<uint8> &data, int level)
+{
+	uLongf packed_len = compressBound((uLong)data.size());
+	std::vector<uint8> packed(packed_len);
+	if (compress2(packed.data(), &packed_len, data.data(), (uLong)data.size(), level) != Z_OK) {
+		return false;
+	}
+	append_base64(out, packed.data(), packed_len);
+	return true;
+}
+
+
+/// writes "key":"<zlib+base64 of data>"
+static bool write_zlib_block(json_t &j, const char *key, const std::vector<uint8> &data, int level)
+{
+	std::string encoded;
+	if (!append_zlib_base64(encoded, data, level)) {
+		return false;
+	}
+	j.key(key).safe_str(encoded.c_str(), encoded.size());
+	return true;
+}
+
+
+/**
+ * One chunk of the map for the 3D view: corner heights and ground types of the surface and the
+ * objects of all grounds except tunnel interiors, as zlib+base64 blocks (objs=json: rows of numbers).
+ * A heavy command: at most one runs per poll (see execute_requests).
+ */
+static const char *cmd_scene3d(const args_t &a, json_t &j)
+{
+	karte_t *welt = world();
+	const sint64 size = arg_int(a, "size", 64);
+	if (size != 16  &&  size != 32  &&  size != 64) {
+		return "size must be 16, 32 or 64";
+	}
+	if (!has_arg(a, "cx")  ||  !has_arg(a, "cy")) {
+		return "missing chunk coordinates cx,cy";
+	}
+	const sint64 cx = arg_int(a, "cx", 0), cy = arg_int(a, "cy", 0);
+	const koord map_size = welt->get_size();
+	if (cx < 0  ||  cy < 0  ||  cx >= map_size.x  ||  cy >= map_size.y  ||  cx * size >= map_size.x  ||  cy * size >= map_size.y) {
+		return "chunk is outside of the map";
+	}
+	const std::string objs_format = arg_str(a, "objs", "bin");
+	if (objs_format != "bin"  &&  objs_format != "json") {
+		return "objs must be bin or json";
+	}
+	// zlib level 4 compresses the object columns almost as well as 6 in less than half the time
+	const int level = (int)clamp<sint64>(arg_int(a, "level", 4), 1, 9);
+
+	const uint64 start = time_us();
+	const int x0 = (int)(cx * size), y0 = (int)(cy * size);
+	const int w = (int)std::min<sint64>(size, map_size.x - x0), h = (int)std::min<sint64>(size, map_size.y - y0);
+	map_tracking_start();
+	// the chunk lies in one tracking cell: scan it now, so that its first scan does not count as a change after rev
+	map_tracking_scan_at(koord((sint16)x0, (sint16)y0));
+	const desc_catalog_t &cat = get_desc_catalog();
+
+	std::vector<uint8> corners((size_t)w * h * 4), ground((size_t)w * h);
+	std::vector<scene_obj_t> objs;
+	objs.reserve(4096);
+	size_t i = 0;
+	for (int ly = 0; ly < h; ly++) {
+		for (int lx = 0; lx < w; lx++, i++) {
+			const planquadrat_t *plan = welt->access_nocheck((sint16)(x0 + lx), (sint16)(y0 + ly));
+			const grund_t *gr = plan->get_kartenboden();
+			const sint8 z = gr->get_hoehe();
+			const slope_t::type slope = gr->get_grund_hang();
+			corners[i * 4 + 0] = (uint8)(sint8)(z + corner_sw(slope));
+			corners[i * 4 + 1] = (uint8)(sint8)(z + corner_se(slope));
+			corners[i * 4 + 2] = (uint8)(sint8)(z + corner_ne(slope));
+			corners[i * 4 + 3] = (uint8)(sint8)(z + corner_nw(slope));
+			int type;
+			switch (gr->get_typ()) {
+				case grund_t::boden:         type = 0; break;
+				case grund_t::wasser:        type = 1; break;
+				case grund_t::fundament:     type = 2; break;
+				case grund_t::tunnelboden:   type = 3; break;
+				case grund_t::brueckenboden: type = 4; break;
+				default:                     type = 5; break;
+			}
+			if (gr->is_water()) {
+				type = 1;
+			}
+			ground[i] = (uint8)(type | (plan->get_climate() << 4));
+
+			for (unsigned g = 0; g < plan->get_boden_count(); g++) {
+				const grund_t *gnd = plan->get_boden_bei(g);
+				if (gnd->ist_im_tunnel()  ||  (!gnd->ist_karten_boden()  &&  gnd->is_dummy_ground())) {
+					continue;
+				}
+				collect_scene_objects(objs, cat, gnd, lx, ly);
+			}
+		}
+	}
+
+	j.kv("cx", (int)cx).kv("cy", (int)cy).kv("size", (int)size);
+	j.kv("x0", x0).kv("y0", y0).kv("w", w).kv("h", h);
+	j.kv("rev", map_gen);
+	j.kv("desc_gen", cat.gen);
+	j.kv("water", (int)welt->get_groundwater());
+	j.kv("season", (int)welt->get_season());
+	j.kv("snowline", (int)welt->get_snowline());
+	j.kv("rotation", (int)welt->get_settings().get_rotation());
+	j.kv("encoding", "zlib+base64");
+	if (!write_zlib_block(j, "corners", corners, level)  ||  !write_zlib_block(j, "ground", ground, level)) {
+		return "compression failed";
+	}
+	j.kv("count", (uint32)objs.size());
+	if (objs_format == "json") {
+		j.key("objs").arr();
+		for (const scene_obj_t &o : objs) {
+			const int row[8] = { o.x, o.y, o.z, o.kind, o.desc, o.a, o.b, o.owner };
+			j.int_row(row, 8);
+		}
+		j.end_arr();
+	}
+	else {
+		j.kv("objs_layout", scene_obj_layout);
+		std::vector<uint8> packed;
+		pack_scene_objects(objs, packed);
+		if (!write_zlib_block(j, "objs", packed, level)) {
+			return "compression failed";
+		}
+	}
+	j.kv("t_us", (sint64)(time_us() - start));
+	return NULL;
+}
+
+/// at most this many samples per heights request (256x256 squares at step 1): about 0.5-1 ms
+#define MAX_HEIGHT_SAMPLES (257*257)
+
+
+/// parses the inclusive region x1 y1 x2 y2 (default the whole map) and clips it to the map
+static const char *parse_map_region(const args_t &a, koord map_size, sint64 &x1, sint64 &y1, sint64 &x2, sint64 &y2)
+{
+	x1 = arg_int(a, "x1", 0);
+	y1 = arg_int(a, "y1", 0);
+	x2 = arg_int(a, "x2", map_size.x - 1);
+	y2 = arg_int(a, "y2", map_size.y - 1);
+	if (x1 > x2) {
+		std::swap(x1, x2);
+	}
+	if (y1 > y2) {
+		std::swap(y1, y2);
+	}
+	x1 = std::max<sint64>(x1, 0);
+	y1 = std::max<sint64>(y1, 0);
+	x2 = std::min<sint64>(x2, map_size.x - 1);
+	y2 = std::min<sint64>(y2, map_size.y - 1);
+	if (x1 > x2  ||  y1 > y2) {
+		return "region is outside of the map";
+	}
+	return NULL;
+}
+
+
+/**
+ * Terrain heights for a far terrain and a whole map overview: the heights of every step-th point of
+ * the height grid (the north-west corners of the squares, as the game keeps them for terraforming)
+ * and the water height there, int8 each, zlib+base64. A heavy command.
+ */
+static const char *cmd_heights(const args_t &a, json_t &j)
+{
+	karte_t *welt = world();
+	const koord map_size = welt->get_size();
+	const sint64 step = arg_int(a, "step", 1);
+	if (step != 1  &&  step != 2  &&  step != 4  &&  step != 8  &&  step != 16) {
+		return "step must be 1, 2, 4, 8 or 16";
+	}
+	sint64 x1, y1, x2, y2;
+	if (const char *err = parse_map_region(a, map_size, x1, y1, x2, y2)) {
+		return err;
+	}
+	// the points run from the north-west corner of (x1,y1) to the south-east corner of (x2,y2)
+	const sint64 w = (x2 + 1 - x1 + step - 1) / step + 1, h = (y2 + 1 - y1 + step - 1) / step + 1;
+	if (w * h > MAX_HEIGHT_SAMPLES) {
+		return "too many samples (at most 66049 per request): use a larger step or a smaller region";
+	}
+	const int level = (int)clamp<sint64>(arg_int(a, "level", 1), 1, 9);
+
+	const uint64 start = time_us();
+	map_tracking_start();
+	std::vector<uint8> heights((size_t)(w * h)), water((size_t)(w * h));
+	sint8 lo = 127, hi = -128;
+	size_t i = 0;
+	for (sint64 sy = 0; sy < h; sy++) {
+		const sint16 y = (sint16)std::min<sint64>(y1 + sy * step, y2 + 1);
+		const sint16 wy = (sint16)std::min<sint64>(y, map_size.y - 1);
+		for (sint64 sx = 0; sx < w; sx++, i++) {
+			const sint16 x = (sint16)std::min<sint64>(x1 + sx * step, x2 + 1);
+			const sint8 z = welt->lookup_hgt_nocheck(x, y);
+			heights[i] = (uint8)z;
+			water[i] = (uint8)welt->get_water_hgt_nocheck((sint16)std::min<sint64>(x, map_size.x - 1), wy);
+			lo = std::min(lo, z);
+			hi = std::max(hi, z);
+		}
+	}
+
+	j.kv("x1", (int)x1).kv("y1", (int)y1).kv("x2", (int)x2).kv("y2", (int)y2);
+	j.kv("step", (int)step).kv("w", (int)w).kv("h", (int)h);
+	j.kv("rev", map_gen);
+	j.kv("water", (int)welt->get_groundwater());
+	j.kv("min", (int)lo).kv("max", (int)hi);
+	j.kv("encoding", "zlib+base64");
+	if (!write_zlib_block(j, "heights", heights, level)  ||  !write_zlib_block(j, "water_heights", water, level)) {
+		return "compression failed";
+	}
+	j.kv("t_us", (sint64)(time_us() - start));
+	return NULL;
+}
+
+
+/// one vehicle of vehicles3d; the binary block stores the fields as columns, 16 bit columns first
+struct vehicle_row_t
+{
+	uint16 cnv;        ///< convoy id, 0 for city cars and pedestrians
+	sint16 desc;       ///< index in the desc_list list of the kind
+	uint16 x, y;       ///< square
+	sint16 ox, oy;     ///< position in the square relative to its centre, 1/256 square
+	sint16 zoff;       ///< height above z, 1/16 height level (slopes, flight altitude)
+	uint16 speed;      ///< yards per tick (steps per tick = speed / 4096)
+	uint16 flags;      ///< VEH_*
+	uint8 idx;         ///< index in the convoy
+	uint8 kind;        ///< VEH_KIND_*
+	sint8 z;           ///< height of the square's ground
+	uint8 dir;         ///< direction (ribi)
+	uint8 steps, steps_next;
+	sint8 nx, ny, nz;  ///< pos_next - pos, -128 when invalid or farther
+	sint8 owner;       ///< player number, -1 nobody
+};
+
+#define VEHICLE_ROW_BYTES 28
+static const char vehicle_row_layout[] =
+	"cnv:u16,desc:i16,x:u16,y:u16,ox:i16,oy:i16,zoff:i16,speed:u16,flags:u16,"
+	"idx:u8,kind:u8,z:i8,dir:u8,steps:u8,steps_next:u8,nx:i8,ny:i8,nz:i8,owner:i8";
+
+enum { VEH_KIND_CONVOY = 0, VEH_KIND_CITYCAR = 1, VEH_KIND_PEDESTRIAN = 2 };
+
+enum
+{
+	VEH_LEADING   = 1 << 0,  ///< first vehicle of its convoy (always set for city cars and pedestrians)
+	VEH_LAST      = 1 << 1,  ///< last vehicle of its convoy (likewise)
+	VEH_LEAVING   = 1 << 2,  ///< the convoy leaves a depot
+	VEH_ENTERING  = 1 << 3,  ///< the convoy drives into a depot
+	VEH_LOADING   = 1 << 4,  ///< the convoy loads at a stop
+	VEH_WAITING   = 1 << 5,  ///< the convoy waits (for a free way, to start, for a route)
+	VEH_TUNNEL    = 1 << 6,  ///< inside a tunnel (not on a portal)
+	VEH_HIDDEN    = 1 << 7,  ///< the game draws no image (e.g. half way into a tunnel portal)
+	VEH_FLYING    = 1 << 8,  ///< an aircraft in the air
+	VEH_OVERTAKE  = 1 << 9   ///< overtaking (road vehicles and city cars)
+};
+
+
+static sint8 clamp_delta(int d)
+{
+	return (sint8)(d < -127  ||  d > 127 ? -128 : d);
+}
+
+
+/// the fields of a row that every moving thing has
+static void fill_vehicle_row(vehicle_row_t &r, const vehicle_base_t *v, const grund_t *gr)
+{
+	const koord3d pos = v->get_pos();
+	r.x = (uint16)pos.x;
+	r.y = (uint16)pos.y;
+	r.z = pos.z;
+	r.dir = (uint8)v->get_direction();
+	r.steps = v->get_steps();
+	r.steps_next = v->get_steps_next();
+	// the drawing offset at a raster width of 256 (screen x = (x-y)*128, y = (x+y)*64) back in squares
+	const sint16 raster = 256;
+	int sx = tile_raster_scale_x(v->get_xoff(), raster), sy = tile_raster_scale_y(v->get_yoff(), raster);
+	v->get_screen_offset(sx, sy, raster);
+	const sint16 hoff = v->get_hoff(raster);
+	sy -= hoff / (4 * 16);
+	r.ox = (sint16)clamp(sx + 2 * sy, -32767, 32767);
+	r.oy = (sint16)clamp(2 * sy - sx, -32767, 32767);
+	// get_hoff(256) = -TILE_HEIGHT_STEP * 256 * height in levels
+	r.zoff = (sint16)(-hoff * 16 / (TILE_HEIGHT_STEP * 256));
+	const koord3d next = v->get_pos_next();
+	if (next == koord3d::invalid) {
+		r.nx = r.ny = r.nz = -128;
+	}
+	else {
+		r.nx = clamp_delta(next.x - pos.x);
+		r.ny = clamp_delta(next.y - pos.y);
+		r.nz = clamp_delta(next.z - pos.z);
+	}
+	r.owner = (sint8)owner_of(v->get_owner_nr());
+	r.flags = 0;
+	if (gr  &&  gr->ist_tunnel()  &&  !gr->ist_karten_boden()) {
+		r.flags |= VEH_TUNNEL;
+	}
+	if (v->get_image() == IMG_EMPTY) {
+		r.flags |= VEH_HIDDEN;
+	}
+}
+
+
+/// the rows as columns of little endian integers (vehicle_row_layout)
+static void pack_vehicle_rows(const std::vector<vehicle_row_t> &rows, std::vector<uint8> &out)
+{
+	const size_t n = rows.size();
+	out.resize(n * VEHICLE_ROW_BYTES);
+	uint8 *col16[9], *col8[10];
+	for (int c = 0; c < 9; c++) {
+		col16[c] = out.data() + 2 * n * c;
+	}
+	for (int c = 0; c < 10; c++) {
+		col8[c] = out.data() + 18 * n + n * c;
+	}
+	for (size_t i = 0; i < n; i++) {
+		const vehicle_row_t &r = rows[i];
+		const uint16 v16[9] = { r.cnv, (uint16)r.desc, r.x, r.y, (uint16)r.ox, (uint16)r.oy, (uint16)r.zoff, r.speed, r.flags };
+		for (int c = 0; c < 9; c++) {
+			col16[c][2 * i] = (uint8)(v16[c] & 0xFF);
+			col16[c][2 * i + 1] = (uint8)(v16[c] >> 8);
+		}
+		const uint8 v8[10] = { r.idx, r.kind, (uint8)r.z, r.dir, r.steps, r.steps_next, (uint8)r.nx, (uint8)r.ny, (uint8)r.nz, (uint8)r.owner };
+		for (int c = 0; c < 10; c++) {
+			col8[c][i] = v8[c];
+		}
+	}
+}
+
+
+/// at most this many squares are searched for city cars and pedestrians (vehicles3d extras=1)
+#define MAX_EXTRAS_SQUARES (256*256)
+
+
+/**
+ * The moving things in a region for the 3D view: every vehicle of the convoys on the map, with
+ * extras=1 also city cars and pedestrians, with what is needed to move them smoothly between
+ * samples. Convoy vehicles come from the convoy list (cheap for any region); city cars and
+ * pedestrians need a search of the region's squares, so a request with extras=1 is heavy
+ * (see is_heavy_request).
+ */
+static const char *cmd_vehicles3d(const args_t &a, json_t &j)
+{
+	karte_t *welt = world();
+	const koord map_size = welt->get_size();
+	sint64 x1, y1, x2, y2;
+	if (const char *err = parse_map_region(a, map_size, x1, y1, x2, y2)) {
+		return err;
+	}
+	const bool extras = arg_bool(a, "extras", false);
+	if (extras  &&  (x2 - x1 + 1) * (y2 - y1 + 1) > MAX_EXTRAS_SQUARES) {
+		return "extras=1: region too large (at most 65536 squares)";
+	}
+	const std::string objs_format = arg_str(a, "objs", "bin");
+	if (objs_format != "bin"  &&  objs_format != "json") {
+		return "objs must be bin or json";
+	}
+	// the samples are short-lived: the fastest zlib level, only 7 % larger than level 4
+	const int level = (int)clamp<sint64>(arg_int(a, "level", 1), 1, 9);
+
+	const uint64 start = time_us();
+	const desc_catalog_t &cat = get_desc_catalog();
+	const vehicle_desc_t *last_desc = NULL; // the vehicles of a convoy often share their type
+	int last_index = -1;
+	std::vector<vehicle_row_t> rows;
+	rows.reserve(1024);
+	for (convoihandle_t cnv : welt->convoys()) {
+		if (!cnv.is_bound()) {
+			continue;
+		}
+		const int state = cnv->get_state();
+		uint16 cnv_flags = 0;
+		switch (state) {
+			case convoi_t::LEAVING_DEPOT:  cnv_flags = VEH_LEAVING; break;
+			case convoi_t::ENTERING_DEPOT: cnv_flags = VEH_ENTERING; break;
+			case convoi_t::LOADING:        cnv_flags = VEH_LOADING; break;
+			case convoi_t::WAITING_FOR_CLEARANCE:
+			case convoi_t::WAITING_FOR_CLEARANCE_ONE_MONTH:
+			case convoi_t::WAITING_FOR_CLEARANCE_TWO_MONTHS:
+			case convoi_t::CAN_START:
+			case convoi_t::CAN_START_ONE_MONTH:
+			case convoi_t::CAN_START_TWO_MONTHS:
+			case convoi_t::NO_ROUTE:
+			case convoi_t::ROUTING_1:      cnv_flags = VEH_WAITING; break;
+			default: break;
+		}
+		const uint16 speed = (uint16)clamp<sint32>(cnv->get_akt_speed(), 0, 65535);
+		const uint8 count = cnv->get_vehicle_count();
+		for (uint8 n = 0; n < count; n++) {
+			vehicle_t *v = cnv->get_vehicle(n);
+			if (v == NULL  ||  v->get_flag(obj_t::not_on_map)) {
+				continue; // in a depot
+			}
+			const koord3d pos = v->get_pos();
+			if (pos.x < x1  ||  pos.x > x2  ||  pos.y < y1  ||  pos.y > y2) {
+				continue;
+			}
+			vehicle_row_t r;
+			fill_vehicle_row(r, v, welt->lookup(pos));
+			r.cnv = cnv.get_id();
+			r.idx = n;
+			r.kind = VEH_KIND_CONVOY;
+			if (v->get_desc() != last_desc) {
+				last_desc = v->get_desc();
+				last_index = catalog_index(cat, DESC_VEHICLES, last_desc);
+			}
+			r.desc = (sint16)last_index;
+			r.speed = speed;
+			r.flags |= cnv_flags;
+			if (v->is_leading()) {
+				r.flags |= VEH_LEADING;
+			}
+			if (v->is_last()) {
+				r.flags |= VEH_LAST;
+			}
+			if (v->get_typ() == obj_t::air_vehicle) {
+				const air_vehicle_t *air = static_cast<const air_vehicle_t *>(v);
+				if (air->is_flying()) {
+					r.flags |= VEH_FLYING;
+				}
+				// flying height in pixels at raster 64 (TILE_HEIGHT_STEP per level)
+				const int flying = air->get_flyingheight() + air->get_hoff() + 2;
+				r.zoff = (sint16)clamp(r.zoff + flying * 16 / TILE_HEIGHT_STEP, -32767, 32767);
+			}
+			if (v->get_waytype() == road_wt  &&  cnv->is_overtaking()) {
+				r.flags |= VEH_OVERTAKE;
+			}
+			rows.push_back(r);
+		}
+	}
+	const uint32 convoy_rows = (uint32)rows.size();
+
+	if (extras) {
+		for (sint64 y = y1; y <= y2; y++) {
+			for (sint64 x = x1; x <= x2; x++) {
+				const planquadrat_t *plan = welt->access_nocheck((sint16)x, (sint16)y);
+				for (unsigned g = 0; g < plan->get_boden_count(); g++) {
+					const grund_t *gr = plan->get_boden_bei(g);
+					if (!gr->hat_wege()) {
+						continue; // city cars and pedestrians only use roads
+					}
+					for (uint8 n = 0; n < gr->obj_count(); n++) {
+						const obj_t *obj = gr->obj_bei(n);
+						const obj_t::typ typ = obj->get_typ();
+						if (typ != obj_t::road_user  &&  typ != obj_t::pedestrian) {
+							continue;
+						}
+						vehicle_row_t r;
+						fill_vehicle_row(r, static_cast<const vehicle_base_t *>(obj), gr);
+						r.cnv = 0;
+						r.idx = 0;
+						r.flags |= VEH_LEADING | VEH_LAST;
+						if (typ == obj_t::road_user) {
+							const private_car_t *car = static_cast<const private_car_t *>(obj);
+							r.kind = VEH_KIND_CITYCAR;
+							r.desc = (sint16)catalog_index(cat, DESC_CITYCARS, car->get_desc());
+							r.speed = car->get_current_speed();
+							if (car->is_overtaking()) {
+								r.flags |= VEH_OVERTAKE;
+							}
+						}
+						else {
+							r.kind = VEH_KIND_PEDESTRIAN;
+							r.desc = (sint16)catalog_index(cat, DESC_PEDESTRIANS, static_cast<const pedestrian_t *>(obj)->get_desc());
+							r.speed = 128; // pedestrian_t::sync_step
+						}
+						rows.push_back(r);
+					}
+				}
+			}
+		}
+	}
+
+	j.kv("x1", (int)x1).kv("y1", (int)y1).kv("x2", (int)x2).kv("y2", (int)y2);
+	j.kv("ticks", (sint64)welt->get_ticks());
+	j.kv("paused", welt->is_paused()).kv("ff", welt->is_fast_forward()).kv("mult", (int)welt->get_time_multiplier());
+	j.kv("drive_left", welt->get_settings().is_drive_left());
+	j.kv("diag_steps", (int)vehicle_base_t::get_diagonal_vehicle_steps_per_tile());
+	j.kv("desc_gen", cat.gen);
+	j.kv("count", (uint32)rows.size()).kv("convoy_rows", convoy_rows);
+	if (objs_format == "json") {
+		j.key("objs").arr();
+		for (const vehicle_row_t &r : rows) {
+			const int row[19] = { r.cnv, r.desc, r.x, r.y, r.ox, r.oy, r.zoff, r.speed, r.flags,
+				r.idx, r.kind, r.z, r.dir, r.steps, r.steps_next, r.nx, r.ny, r.nz, r.owner };
+			j.int_row(row, 19);
+		}
+		j.end_arr();
+	}
+	else {
+		j.kv("encoding", "zlib+base64");
+		j.kv("objs_layout", vehicle_row_layout);
+		std::vector<uint8> packed;
+		pack_vehicle_rows(rows, packed);
+		if (!write_zlib_block(j, "objs", packed, level)) {
+			return "compression failed";
+		}
+	}
+	j.kv("t_us", (sint64)(time_us() - start));
 	return NULL;
 }
 
@@ -5339,8 +6503,9 @@ static const char *cmd_remove_password(const args_t &a, json_t &j)
 
 enum command_kind_t
 {
-	CMD_READ,  ///< only reads the game and the GUI, allowed with -remote_control_readonly
-	CMD_ACTION ///< changes the game, the GUI or files (input, view, time, scripts, screenshots, ...)
+	CMD_READ,       ///< only reads the game and the GUI, allowed with -remote_control_readonly
+	CMD_READ_HEAVY, ///< like CMD_READ, but takes milliseconds: at most one per poll (see execute_requests)
+	CMD_ACTION      ///< changes the game, the GUI or files (input, view, time, scripts, screenshots, ...)
 };
 
 struct command_t
@@ -5403,12 +6568,41 @@ static const command_t commands[] = {
 	{ "minimap",      cmd_minimap,      CMD_READ },
 	{ "map_changes",  cmd_map_changes,  CMD_READ },
 	{ "labels",       cmd_labels,       CMD_READ },
+	{ "desc_list",    cmd_desc_list,    CMD_READ_HEAVY },
+	{ "scene3d",      cmd_scene3d,      CMD_READ_HEAVY },
+	{ "heights",      cmd_heights,      CMD_READ_HEAVY },
+	{ "vehicles3d",   cmd_vehicles3d,   CMD_READ },
 	{ "subscribe",    cmd_subscribe,    CMD_READ },
 	{ "unsubscribe",  cmd_unsubscribe,  CMD_READ },
 };
 
-/// -remote_control_readonly: only CMD_READ commands
+/// -remote_control_readonly: only CMD_READ and CMD_READ_HEAVY commands
 static bool read_only = false;
+
+
+static const command_t *find_command(const std::string &name)
+{
+	for (command_t const &cmd : commands) {
+		if (name == cmd.name) {
+			return &cmd;
+		}
+	}
+	return NULL;
+}
+
+
+/// the request is heavy: a CMD_READ_HEAVY command, or vehicles3d with extras=1 (searches up to 65536 squares)
+static bool is_heavy_request(const std::string &line)
+{
+	const size_t space = line.find(' ');
+	const command_t *cmd = find_command(line.substr(0, space));
+	if (cmd  &&  cmd->fn == cmd_vehicles3d  &&  space != std::string::npos) {
+		args_t args;
+		parse_args(line.substr(space + 1), args);
+		return arg_bool(args, "extras", false);
+	}
+	return cmd  &&  cmd->kind == CMD_READ_HEAVY;
+}
 
 
 /// executes one request line, the reply (without newline) is written to j
@@ -5442,13 +6636,8 @@ static void execute_request(const std::string &line, json_t &j)
 	else if (world() == NULL) {
 		err = "no world loaded";
 	}
-	else {
-		for (command_t const &cmd : commands) {
-			if (name == cmd.name) {
-				err = (read_only  &&  cmd.kind != CMD_READ) ? "read-only remote control" : cmd.fn(args, j);
-				break;
-			}
-		}
+	else if (const command_t *cmd = find_command(name)) {
+		err = (read_only  &&  cmd->kind == CMD_ACTION) ? "read-only remote control" : cmd->fn(args, j);
 	}
 	if (err) {
 		j.kv("ok", false);
@@ -5809,6 +6998,9 @@ void remote_control_on_world(remote_control_world_event_t what)
 	}
 	// the squares are about to change or are new
 	map_tracking_stop();
+	if (what != REMOTE_WORLD_CLOSED  &&  listen_socket != INVALID_SOCKET) {
+		get_desc_catalog(); // built once (some ms), better while loading than in a frame of the running game
+	}
 	karte_t *welt = world();
 	if ((hook_topics & TOPIC_BIT(TOPIC_WORLD))  &&  welt) {
 		static const char *const names[] = { "loaded", "created", "closed" };
@@ -6372,15 +7564,24 @@ static bool next_line(remote_client_t &c, std::string &line)
 }
 
 
-/// handles the greeting or executes the next request of a client, false if no complete line is waiting
-static bool execute_next(remote_client_t &c)
+/**
+ * Handles the greeting or executes the next request of a client, false if no complete line is
+ * waiting or the next request is heavy and !allow_heavy (it stays first in the queue).
+ */
+static bool execute_next(remote_client_t &c, bool allow_heavy, bool &heavy)
 {
 	std::string line;
+	const size_t inpos = c.inpos;
 	do {
 		if (!next_line(c, line)) {
 			return false;
 		}
 	} while (c.greeted  &&  line.empty());
+	heavy = c.greeted  &&  is_heavy_request(line);
+	if (heavy  &&  !allow_heavy) {
+		c.inpos = inpos;
+		return false;
+	}
 
 	json_t j;
 	if (!c.greeted) {
@@ -6412,11 +7613,14 @@ static bool execute_next(remote_client_t &c)
 
 
 /**
- * Executes waiting requests round-robin: every client gets one request per poll, more while
- * the time budget lasts. The next request of a client waits until its last reply is sent,
- * so a client that does not read its replies only blocks itself.
+ * Executes waiting requests round-robin: every client gets one request per poll, more until
+ * POLL_TIME_BUDGET_US after start. A heavy request (CMD_READ_HEAVY, some ms) runs only within
+ * HEAVY_START_US after start and only one per poll; a client whose next request is heavy waits
+ * for the next poll, its requests keep their order. The first client changes with every poll, so
+ * every client gets the heavy slot in turn. The next request of a client waits until its last
+ * reply is sent, so a client that does not read its replies only blocks itself.
  */
-static void execute_requests()
+static void execute_requests(uint64 start)
 {
 	static size_t rotation = 0;
 	const size_t count = clients.size();
@@ -6424,16 +7628,19 @@ static void execute_requests()
 		return;
 	}
 	rotation++;
-	const uint32 start = dr_time();
+	bool heavy_done = false;
 	for (bool first_round = true;  ;  first_round = false) {
 		bool executed = false;
 		for (size_t k = 0; k < count; k++) {
-			if (!first_round  &&  dr_time() - start >= POLL_TIME_BUDGET) {
+			const uint64 elapsed = time_us() - start;
+			if (!first_round  &&  elapsed >= POLL_TIME_BUDGET_US) {
 				return;
 			}
 			remote_client_t &c = clients[(rotation + k) % count];
-			if (!c.closing  &&  !c.output_pending()  &&  execute_next(c)) {
+			bool heavy = false;
+			if (!c.closing  &&  !c.output_pending()  &&  execute_next(c, !heavy_done  &&  elapsed < HEAVY_START_US, heavy)) {
 				executed = true;
+				heavy_done |= heavy;
 			}
 		}
 		if (!executed) {
@@ -6449,6 +7656,7 @@ void remote_control_poll()
 		return;
 	}
 	in_poll = true;
+	const uint64 poll_start = time_us();
 
 	// accept new connections
 	while (true) {
@@ -6490,13 +7698,13 @@ void remote_control_poll()
 		}
 	}
 
-	execute_requests();
+	execute_requests(poll_start);
 
 	// events of hooks and watchers to the clients that subscribed them
 	process_events();
 
 	const uint32 now = dr_time();
-	map_tracking_poll(now, !clients.empty());
+	map_tracking_poll(now, !clients.empty(), poll_start);
 	bool subscriber_closed = false;
 	for (size_t i = 0; i < clients.size(); ) {
 		remote_client_t &c = clients[i];

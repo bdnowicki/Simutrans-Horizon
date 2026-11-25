@@ -2,7 +2,7 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced
+ * Simutrans-Horizon, 2026-11: with the option "Show future objects" toolbar menus offer also objects not yet introduced; get_all_desc() for the remote control
  */
 
 #include <string.h>
@@ -1054,5 +1054,13 @@ const vector_tpl<const building_desc_t*>* hausbauer_t::get_citybuilding_list(con
 		case building_desc_t::city_com:  return &city_commercial;
 		case building_desc_t::city_ind:  return &city_industry;
 		default:                      return NULL;
+	}
+}
+
+
+void hausbauer_t::get_all_desc(vector_tpl<const building_desc_t *> &list)
+{
+	for(auto const& i : desc_table) {
+		list.append(i.value);
 	}
 }

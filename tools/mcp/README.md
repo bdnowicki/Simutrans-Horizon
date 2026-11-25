@@ -28,7 +28,7 @@ commands that read the game and the windows (`ping`, `status`, `windows`, `tile`
 `screen_pos`, `messages`, `map`, `players`, `cities`, `stations`, `station`, `convoys`, `lines`,
 `factories`, `positions`, `poll`, `toolbars`, `subscribe`, `unsubscribe`, `palette`, `minimap`, `map_changes`,
 `labels`, `finance`, `line`, `convoy`, `line_route`, `city`, `factory`, `supply_chain`, `goods`,
-`world_stats`). Every other command, including `eval`, `tool`,
+`world_stats`, `desc_list`, `scene3d`, `heights`, `vehicles3d`). Every other command, including `eval`, `tool`,
 `screenshot`, GUI input, `view`, `zoom`, `pause` and `tool_visibility`, gets
 `{"ok":false,"error":"read-only remote control"}`. Most MCP tools that act on the game then fail.
 
@@ -46,8 +46,14 @@ commands that read the game and the windows (`ping`, `status`, `windows`, `tile`
 * A request whose decoded keys or values contain a NUL character (`%00`) is refused with
   `{"ok":false,"error":"arguments must not contain NUL characters"}`.
 * The game executes requests between two frames, round-robin over the connections: one request per
-  connection and frame, more while about 8 ms of the frame are left. A single request is not
+  connection and frame, more until about 4 ms of the frame are used. A single request is not
   interrupted, so a large `map` or `eval` still takes its time.
+* Heavy commands ("read, heavy" below: `scene3d`, `desc_list`, `heights`, and `vehicles3d` with
+  `extras=1`, about 1-3 ms each) run at most one per frame, and only within the first millisecond of the frame's request work. A connection whose next
+  request is heavy waits for a later frame; its later requests wait behind it (replies keep their
+  order), the other connections go on. The first connection changes with every frame, so every
+  connection gets its turn. A burst of `scene3d` requests is thus spread over frames, one chunk per
+  frame; a client that wants other replies meanwhile uses a second connection.
 * Replies are sent without blocking the game. The next request of a connection is executed only
   after its previous reply has been sent completely, so a client that does not read its replies
   only stops itself. A connection is closed when a reply would leave more than 32 MB unsent, when
@@ -89,6 +95,8 @@ files and are refused there. Commands marked with a section are described below.
 | `toolbars` | read | `[toolbar=N]` the toolbars with shown and hidden tools |
 | `messages`, `positions`, `poll` | read | see Commands for dashboards and tools |
 | `palette`, `minimap`, `map_changes`, `labels` | read | see Map export |
+| `desc_list`, `scene3d`, `heights` | read, heavy | see 3D export |
+| `vehicles3d` | read (heavy with `extras=1`) | see 3D export |
 | `subscribe`, `unsubscribe` | read | see Events (protocol 2); they only change the connection |
 
 The text input is queued: every `text` request keeps its text until the game has processed it.
@@ -497,19 +505,285 @@ minimap keeps the largest value it has seen since it was opened, so its scale ca
 of the tracking): another world, a rotation, a new map size, or the tracking was stopped; then
 fetch the whole map again.
 
-The tracking starts with the first `minimap` or `map_changes` request (one pass over the map, about
-40 ms on a 1024x1024 map; 2 bytes per square) and stops when no connection is left or for 2 minutes
-neither `minimap`, `map_changes` nor `poll` came. While it runs, every square that the game redraws
+The tracking starts with the first `minimap`, `map_changes`, `scene3d` or `heights` request (2 bytes
+per square) and stops when no connection is left or for 2 minutes neither `minimap`, `map_changes`,
+`scene3d`, `heights` nor `poll` came. Taking the colours of all squares (about 40 ms on a 1024x1024 map) is spread over the
+next frames, one 64x64 cell after the other, up to about 4 ms per frame (the NYC map: 10 frames); a
+`minimap` with `step=1` and a `scene3d` take the cells they cover at once, a `minimap` with a larger
+step computes the colours of cells not taken yet (slower, like the other modes). A cell counts as
+changed when its colours are taken, so right after the start `map_changes` may report areas once
+that did not change. While it runs, every square that the game redraws
 on the minimap (built or removed ways, buildings, stations, terraforming, city growth, ...) is
 compared with its kept `terrain` and `owner` colours and counts as changed only if one of them
 changed, so moving vehicles never do. A background re-check of all squares (65536 squares per
-second, about 16 s for 1024x1024) also finds changes that the game does not redraw (e.g. a new
-owner). Not tracked: the other modes change with the monthly statistics (`traffic`, `freight`,
+second, about 16 s for 1024x1024, at most 8192 per frame) also finds changes that the game does not redraw (e.g. a new
+owner). Changes that keep the minimap colours (a city building replaced by another one, a road
+extended, a sign added, a tree planted, ...) are reported by the engine itself, see
+[Map changes for the 3D view](#map-changes-for-the-3d-view). Not tracked: the other modes change with the monthly statistics (`traffic`, `freight`,
 `power`), with trees or connections; fetch them again when the month changes (event `month`) or
 when needed. Seasons and snow do not change minimap colours.
 
 `labels` (read): all labels (map markers) of the world:
 `{"labels":[{"pos":{"x","y","z"},"text":"..","owner":N},...]}` (`owner` -1 for nobody).
+
+### 3D export
+
+For a 3D view of the map: a catalogue of the pak objects (`desc_list`), the content of map chunks
+(`scene3d`), which refers to the objects by their index in the catalogue, the terrain heights of large
+areas for a far terrain (`heights`) and the moving vehicles (`vehicles3d`). All are read commands;
+`desc_list`, `scene3d`, `heights` and `vehicles3d extras=1` are heavy (at most one per frame, see
+Protocol notes).
+
+`desc_list [kinds=<list>]` (read, heavy): the objects of the loaded pakset, `kinds` is a comma
+separated subset of `buildings,vehicles,ways,bridges,tunnels,trees,signs,wayobjs,goods,citycars,pedestrians`
+(default all; an unknown kind is an error). Only the requested lists are in the reply:
+
+```
+{"pakset":"pak128/","gen":N,
+ "buildings":[{"i":0,"name":"..","type":"res","size":[x,y],"layouts":N,"level":N,"height":N,"climates":N,
+               "waytype":null,"enables":N,"intro":year,"retire":year},...],
+ "vehicles":[{"i","name","waytype","length":N,"freight":"..","capacity":N,"power":N,"speed":N,"intro","retire"}],
+ "ways":[{"i","name","waytype","system":"flat","speed":N}],
+ "bridges":[{"i","name","waytype","speed":N,"pillars":N}],
+ "tunnels":[{"i","name","waytype","speed":N}],
+ "trees":[{"i","name","climates":N}],
+ "signs":[{"i","name","waytype","flags":N,"traffic_light":bool}],
+ "wayobjs":[{"i","name","waytype","speed":N,"overhead":bool}],
+ "goods":[{"i","name","color":N,"catg":N}],
+ "citycars":[{"i","name","speed":N,"intro","retire"}],
+ "pedestrians":[{"i","name","intro","retire"}],
+ "t_us":N}
+```
+
+* `name` is the untranslated pak name (stable key, e.g. for a model manifest). Every list is sorted
+  by name (byte order) and `i` is the position in it; `trees` are in the engine's tree order (also by
+  name), `i` = tree id. `scene3d` `desc` values are these `i`.
+* `gen` identifies the catalogue: a 32-bit FNV-1a hash of all lists (independent of `kinds`). The
+  pakset is loaded only at the start, so the catalogue never changes while the game runs; the same
+  pakset files give the same `gen`, also after a restart, another pakset (or other addons) another
+  `gen`. Cache the lists by `gen`; `scene3d` replies carry it as `desc_gen`, so a client notices when
+  its cached lists are not the ones the indices refer to.
+* `waytype`: `road`, `track`, `water`, `overheadline`, `monorail`, `maglev`, `tram`, `narrowgauge`,
+  `air`, `powerline`, `other`, or null for none.
+* buildings: `type` `res`/`com`/`ind` (city buildings), `cur` (attraction), `mon` (monument), `tow`
+  (town hall), `hq` (headquarters), `stop` (station building, dock), `ext` (station extension),
+  `depot`, `factory`, `other` (e.g. the foundation of elevated ways). `size` is the size of layout 0
+  (layouts 1 and 3 swap x and y), `layouts` the number of layouts (rotations). `height` is the
+  clearance in height levels (tallest tile; use it for the height of a building, not `level`, which
+  is the size class: up to 200 on the NYC map). `climates` is a bit mask, bit c = climate c (0 water,
+  1 desert, 2 tropic, 3 mediterranean, 4 temperate, 5 tundra, 6 rocky, 7 arctic). `waytype` only for
+  stops, extensions, docks and depots; `enables` only for stops and extensions (bit 0 passengers,
+  1 mail, 2 goods). `intro`/`retire` are years.
+* vehicles: `length` in 1/16 of a square (16 = one square), `freight` the `goods` name (`None` for
+  vehicles without freight), `capacity` units, `power` kW, `speed` km/h.
+* ways: `system` `flat`, `elevated`, `runway` (elevated air way), `tram` (tram tracks, `waytype`
+  `tram`), `river`, `other`; `speed` km/h. The power line way is in this list too.
+* bridges: `pillars` = a pillar every N squares (0 none). signs (also signals): `flags` bits 1 one-way,
+  2 choose sign, 4 private road, 8 signal, 16 pre-signal, 32 only back image, 64 long block signal,
+  128 end of choose area, 256 priority signal. wayobjs: `waytype` of the way they belong to,
+  `overhead` = overhead line. goods: `color` is a palette index (`palette`), `catg` the category.
+  citycars: `speed` km/h. City cars and pedestrians are the `extras` of `vehicles3d`.
+
+The game builds the catalogue once, while the first world loads (about 3 ms on pak128: 1349
+buildings, 965 vehicles, 65 ways, 27 bridges, 21 tunnels, 40 trees, 46 signs, 18 way objects, 38
+goods, 140 city cars, 18 pedestrians); a reply then takes about 0.1 ms. The full reply is 364 KB (38 KB with gzip).
+
+`scene3d cx= cy= [size=64] [objs=bin|json] [level=1-9]` (read, heavy): chunk (cx, cy) of size x size
+squares (`size` 16, 32 or 64), i.e. squares `x0` = cx*size to `x0`+`w`-1 and likewise y (`w`, `h`
+are smaller at the map edge):
+
+```
+{"cx":N,"cy":N,"size":64,"x0":N,"y0":N,"w":N,"h":N,"rev":N,"desc_gen":N,
+ "water":N,"season":N,"snowline":N,"rotation":N,"encoding":"zlib+base64",
+ "corners":"eJ..","ground":"eJ..","count":N,
+ "objs_layout":"x:u8,y:u8,z:i8,kind:u8,desc:i16,a:u16,b:u16,owner:i8","objs":"eJ..","t_us":N}
+```
+
+Errors: `missing chunk coordinates cx,cy`, `chunk is outside of the map`, `size must be 16, 32 or 64`,
+`objs must be bin or json`.
+
+* Coordinates are map coordinates after the in-game rotation (`rotation` 0-3; a rotation changes all
+  of them, `map_changes` then says `full`): x grows to the east, y to the south (north = -y). The
+  blocks use chunk-local squares x = map x - `x0`, y = map y - `y0`, row after row: index = y*w + x.
+  Heights are height levels (the NYC map uses double slopes: a corner can be 2 levels above the
+  ground height).
+* `corners`, `ground` and `objs` are base64 encoded zlib streams (RFC 1950, as in `minimap`); `level`
+  is the zlib level (default 4: on these blocks nearly as small as 6 in less than half the time).
+* `corners`: w*h*4 bytes, int8: the absolute height of the four corners of the surface ground of
+  every square, in the order sw, se, ne, nw; nw is the corner at (x, y), ne at (x+1, y), se at
+  (x+1, y+1), sw at (x, y+1). Corners of neighbouring squares need not match (cliffs, foundations).
+  Water squares are flat at their own water height (`water` for the sea, lakes may be higher).
+* `ground`: w*h bytes: low nibble = surface type (0 land, 1 water, 2 foundation under a building,
+  3 tunnel portal, 4 bridge head, 5 other), high nibble = climate (0-7 as in `desc_list`).
+* `objs`: the `count` objects. Binary (default): 11*count bytes as columns, all values of one field,
+  then the next field, little endian, in the order of `objs_layout` (n = count): x u8 at 0, y u8 at
+  n, z i8 at 2n, kind u8 at 3n, desc i16 at 4n, a u16 at 6n, b u16 at 8n, owner i8 at 10n. The 16-bit
+  columns start at even offsets (in a browser: `new Int16Array(buffer, 4*n, n)` on the decompressed
+  ArrayBuffer). Check `objs_layout`: another value means another layout. `objs=json` sends the same
+  rows as `"objs":[[x,y,z,kind,desc,a,b,owner],...]` (no `objs_layout`; for tests and debugging, about
+  twice the size after gzip).
+* Order of the objects: squares row after row, per square its grounds from the bottom up (surface
+  first, then bridge decks and elevated ways; tunnel interiors and empty preview grounds are left
+  out), per ground in the engine's order. Moving things are not exported (vehicles, pedestrians,
+  city cars, animals, smoke). `z` is the height of the ground that carries the object (bridge decks
+  and elevated ways lie above the terrain), `desc` the index in the `desc_list` list of the kind (-1
+  none), `owner` the player number (-1 nobody).
+
+| kind | object | `desc` | `a` | `b` |
+| --- | --- | --- | --- | --- |
+| 0 | way | `ways` | ribi (N=1 E=2 S=4 W=8, unmasked) | bit 0 on a bridge (also its ramp) or elevated, bit 1 tunnel portal square, bits 8-15 slope of the way |
+| 1 | building (also stations, depots, factories, monuments) | `buildings` | layout | ox + 256*oy, offset of this square in the building (in its layout) |
+| 2 | tree | `trees` (tree id) | age class 0-4 | 0 |
+| 3 | bridge | `bridges` | ribi of the bridge's way | 0 |
+| 4 | tunnel portal | `tunnels` | ribi of the way | 0 |
+| 5 | sign or signal | `signs` | direction (ribi; traffic lights: the open directions of the current phase, 5 or 10, 0 while yellow) | state, +256 for signals |
+| 6 | way object (overhead line) | `wayobjs` | ribi (15 at closed diagonals) | waytype number of the way object (1 road, 2 track, 5 monorail, 7 tram, ...) |
+| 7 | bridge pillar | `bridges` | 0 | 0 |
+| 8 | power line | `ways` (power line way) | ribi | 0 line, 1 power source, 2 consumer (transformer) |
+| 9 | field | -1 | 0 | 0 |
+| 10 | ground object (rocks, ...) | -1 | 0 | 0 |
+| 11 | other | -1 | engine object type (27 label, 29 crossing) | 0 |
+
+The slope of a way is the engine slope code sw + 3*se + 9*ne + 27*nw, every corner raised 0-2 levels
+above `z`. On a bridge ramp built on a sloped ground the way can be flat while the ground slopes; it
+then lies at `z` + the highest corner of the ground. A bridge's deck is a later ground of the same
+square (larger `z`), its pillars stand on the ground below.
+
+* `rev` is the map gen (as `gen` of `minimap`): pass it as `since` to `map_changes`; the chunk is stale
+  when its 64x64 cell (cx*size/64, cy*size/64) is reported (`chunk=64`); see
+  [Map changes for the 3D view](#map-changes-for-the-3d-view) for what counts as a change.
+  `scene3d` starts the tracking like `minimap`.
+* `desc_gen` = `gen` of `desc_list`. `water` = groundwater (sea) level, `season` 0 summer, 1 autumn,
+  2 winter, 3 spring, `snowline` = height level above which there is snow in winter. `t_us` = time in
+  the game for this reply including compression.
+
+On the NYC map (1024x1024, 256 chunks of 64x64, laptop) a chunk takes 0.7 ms (median, 95 % below
+1.1 ms, at most 1.4 ms) and is 10 KB (7.5 KB with gzip; at most 17 / 13 KB); the densest chunk has
+8397 objects.
+
+`heights [step=1|2|4|8|16] [x1= y1= x2= y2=] [level=1-9]` (read, heavy): the terrain heights of a
+region for a far terrain and a whole map overview. `step` defaults to 1. The region is given in squares
+(inclusive, default the whole map, clipped to it; x1/x2 or y1/y2 given the wrong way round are swapped, as
+in `vehicles3d`):
+
+```
+{"x1":N,"y1":N,"x2":N,"y2":N,"step":N,"w":N,"h":N,"rev":N,"water":N,"min":N,"max":N,
+ "encoding":"zlib+base64","heights":"eJ..","water_heights":"eJ..","t_us":N}
+```
+
+Errors: `step must be 1, 2, 4, 8 or 16`, `region is outside of the map`,
+`too many samples (at most 66049 per request): use a larger step or a smaller region`.
+
+* The samples are points of the height grid, i.e. square corners: sample (i, j) is the grid point
+  (x1 + i*step, y1 + j*step), the north-west corner of that square. The last column and row are the
+  east and south edges of the region (x2+1, y2+1), closer than `step` when the size of the region is
+  not a multiple of it. So `w` = ceil((x2-x1+1)/step) + 1 and `h` likewise, and the samples are a
+  w x h vertex grid that covers the region (the whole 1024x1024 map at step 4: 257 x 257), row after
+  row (index = j*w + i). Neighbouring requests share their edge row or column.
+* `heights`: w*h bytes, int8: the height of the grid point as the game keeps it for terraforming. On
+  land this is the north-west corner of the surface ground (`corners` of `scene3d`, the nw value): on
+  the NYC map all 55570 compared land squares agree. Under water it is the sea floor.
+* `water_heights`: w*h bytes, int8: the water height of the square whose north-west corner the sample
+  is (at the east and south map edges the square next to it): `water` (the sea level) for the sea and
+  for dry land, higher for lakes. There is water where it is above the terrain.
+* `min`, `max`: of `heights`. `rev`: the map gen as in `scene3d` (`heights` starts the tracking);
+  terrain changes mark the cells, but so do all other changes, so `rev` is a conservative test.
+  `level`: zlib level, default 1.
+* At most 66049 samples per request: 256x256 squares at step 1, 512x512 at step 2, the whole
+  1024x1024 map at step 4 (the whole map at step 1 would take 8 ms in one request). On the NYC map
+  (laptop) a request takes 0.5 ms for 256x256 at step 1 (5.6 KB), 0.6 ms for 512x512 at step 2
+  (10 KB), 0.7 ms for the whole map at step 4 (13 KB), 0.25 ms at step 8 (4.8 KB) and 0.12 ms at
+  step 16 (1.8 KB). The whole map at step 1 takes 16 requests of 256x256, one per frame.
+
+`vehicles3d [x1= y1= x2= y2=] [extras=1] [objs=bin|json] [level=1-9]` (read; heavy with `extras=1`):
+the moving things in a region (squares, inclusive, default the whole map): every vehicle of the
+convoys on the map, one row per car (vehicles in a depot are left out), with `extras=1` also city
+cars and pedestrians (then the region may have at most 65536 squares, e.g. 256x256):
+
+```
+{"x1":N,"y1":N,"x2":N,"y2":N,"ticks":N,"paused":bool,"ff":bool,"mult":N,"drive_left":bool,
+ "diag_steps":N,"desc_gen":N,"count":N,"convoy_rows":N,"encoding":"zlib+base64",
+ "objs_layout":"cnv:u16,desc:i16,x:u16,y:u16,ox:i16,oy:i16,zoff:i16,speed:u16,flags:u16,idx:u8,kind:u8,z:i8,dir:u8,steps:u8,steps_next:u8,nx:i8,ny:i8,nz:i8,owner:i8",
+ "objs":"eJ..","t_us":N}
+```
+
+Errors: `region is outside of the map`, `objs must be bin or json`,
+`extras=1: region too large (at most 65536 squares)`.
+
+* `objs`: 28*count bytes as columns like in `scene3d` (n = count), all 16-bit columns first, so they
+  start at even offsets for any n: cnv at 0, desc 2n, x 4n, y 6n, ox 8n, oy 10n, zoff 12n, speed 14n,
+  flags 16n, idx 18n, kind 19n, z 20n, dir 21n, steps 22n, steps_next 23n, nx 24n, ny 25n, nz 26n,
+  owner 27n. `objs=json` sends `"objs":[[cnv,desc,x,y,ox,oy,zoff,speed,flags,idx,kind,z,dir,steps,
+  steps_next,nx,ny,nz,owner],...]` (no `encoding`, `objs_layout`). Order: the convoys in the game's
+  order with their cars front to back (`convoy_rows` rows), then city cars and pedestrians square by
+  square.
+
+| field | meaning |
+| --- | --- |
+| `cnv` | convoy id (as in `convoys`, `convoy id=`), 0 for city cars and pedestrians |
+| `desc` | index in the `desc_list` list `vehicles` (kind 0), `citycars` (1) or `pedestrians` (2) |
+| `x`, `y`, `z` | the square and the height of the ground the vehicle is on (bridge decks, tunnels) |
+| `ox`, `oy` | position in the square relative to its centre in 1/256 square (x east, y south; ±128 = the edges), as the game draws it: on maps that drive on the left and while overtaking with the lane shift, otherwise on the middle of the way (the pak images carry the right-hand lane) |
+| `zoff` | height above `z` in 1/16 height levels: the interpolated way height on slopes, plus the flight altitude of aircraft |
+| `speed` | current speed in yards per tick: the vehicle advances speed/4096 steps per tick; km/h = (speed*5+31)/64. All cars of a convoy have its speed; pedestrians 128 |
+| `flags` | bit 0 front car, 1 last car (city cars and pedestrians: both), 2 the convoy leaves a depot, 3 it drives into a depot, 4 it loads at a stop, 5 it waits (for a free way, to start, for a route), 6 inside a tunnel (not on a portal), 7 not drawn by the game (e.g. half way into a tunnel portal), 8 aircraft in the air, 9 overtaking |
+| `idx` | index of the car in its convoy, 0 = front |
+| `kind` | 0 convoy vehicle, 1 city car, 2 pedestrian |
+| `dir` | direction of travel as ribi: N=1, E=2, S=4, W=8, diagonals NE=3, SE=6, SW=12, NW=9 |
+| `steps`, `steps_next` | progress through the square: from 0 at the entry edge to `steps_next` at the exit edge (255 on straight squares, `diag_steps`-1 on diagonal ones; other values on the last square of a route, when an aircraft turns on a square (0), for city cars and pedestrians) |
+| `nx`, `ny`, `nz` | next square (pos_next) minus this square, -128 when unknown or farther; 0,0,0 at the end of the route |
+| `owner` | player number, -1 nobody |
+
+For moving the vehicles smoothly between samples (e.g. 5 per second):
+
+* `ticks` is the game time in ms (as in `poll`); it stands still while `paused`. Between two samples a
+  car moved about (ticks2 - ticks1) * speed / 4096 steps. The game runs about 1000 * `mult` / 16 ticks
+  per second (more with `ff`, as fast as the computer allows): estimate the rate from two replies.
+* On a straight square the car is at centre + (steps / (steps_next + 1) - 0.5) * direction; on a
+  diagonal square it goes from the middle of the entry edge to the middle of the exit edge (the exit
+  is the side towards `nx`,`ny`); `ox`,`oy` already hold this position.
+* When a convoy turns round at the end of its route, the game places its cars anew on the new route:
+  `dir` reverses and the positions jump. Do not interpolate when the direction reverses or a car moved
+  more than about two squares; convoys that enter a depot vanish from the rows, leaving ones appear on
+  the depot square (flag 2). `cnv` + `idx` identify a car; city cars and pedestrians have no id.
+
+Costs on the NYC map (1246 convoys, 2860 cars on the map, laptop): 128x128 squares of Manhattan 669
+rows in 0.4 ms (6.7 KB), 256x256 956 rows in 0.4-0.6 ms (9 KB), the whole map 1.1-1.6 ms (26 KB);
+with `extras=1` 128x128 3060 rows (476 city cars, 1915 pedestrians) in 1.3 ms (30 KB), 256x256 5116
+rows in 2.6 ms (49 KB). `level` is the zlib level (default 1: samples are short-lived; level 4 saves
+7 %).
+
+### Map changes for the 3D view
+
+`map_changes` (see Map export) also reports the changes that the minimap colours do not show: the
+engine tells the remote control about every visible change of a square that does not move:
+
+* objects added to or removed from a ground: ways, buildings, trees, bridges and their pillars,
+  tunnel portals, signs and signals, overhead lines, power lines, fields, ground objects, labels,
+  crossings (not vehicles, city cars, pedestrians, animals, smoke);
+* a building tile replaced by another one (city growth, renovation, rotation);
+* the directions (ribi) and types of ways, the directions of way objects and signs, the types of
+  bridges and tunnels;
+* terrain heights and slopes, grounds added, removed or replaced (bridge decks, elevated ways,
+  tunnels, foundations, water), climates.
+
+The hooks only set a flag of the 64x64 cells of the square and of its eight neighbours (an object also
+changes how the next squares look: ways, overhead lines and power lines join up), so a change at the
+edge of a cell also marks the next cell. The flags become changes, each with a new map gen, once per
+frame and whenever `poll`, `map_changes`, `minimap`, `scene3d` or `heights` read the map gen, so every
+reply sees all changes made before it. Not reported: tree growth (age class),
+signal, traffic light and crossing states (also the `a` of traffic lights), seasons and snow (reply
+fields of `scene3d`); owner changes come from the
+background re-check of the owner colours (within about 16 s). The hooks change nothing in the game and
+cost nothing while the map is not tracked.
+
+Checked on the NYC map with a content test: all 256 chunks decoded (tree age classes, sign and signal
+states and the directions of traffic lights left out), the game run at 8 times the normal speed while
+a road, a bus stop and a sign are built, a road square removed, a tree planted and a corner raised
+with `tool`, all chunks decoded again and compared with `map_changes since=<rev of the chunk>
+chunk=64`. Over 3 months 224 and 230 of 256 chunks changed (mostly trees), over 1.2 months 15, over
+0.3 months 1: every changed chunk was reported (no false negatives), one chunk was reported whose
+content was the same again at the end. The hooks ran about 70 times per second.
 
 ### Events (protocol 2)
 

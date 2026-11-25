@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_all_desc() for the remote control
  */
 
 #ifndef BUILDER_WEGBAUER_H
@@ -51,6 +52,9 @@ public:
 	static bool waytype_available( const waytype_t wtyp, uint16 time );
 
 	static const vector_tpl<const way_desc_t *>&  get_way_list(waytype_t, systemtype_t);
+
+	/// appends all registered way descriptions (also obsolete ones and powerlines) to @p list, unordered
+	static void get_all_desc(vector_tpl<const way_desc_t *> &list);
 
 	/**
 	 * Fill menu with icons of given waytype

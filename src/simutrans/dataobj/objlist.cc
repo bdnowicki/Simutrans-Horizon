@@ -1,10 +1,12 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: objects that do not move report added or removed objects to the remote control
  */
 
 #include <stdio.h>
 #include <algorithm>
+#include <typeinfo>
 
 #include "../simdebug.h"
 #include "../display/simgraph.h"
@@ -44,6 +46,7 @@
 #include "../dataobj/loadsave.h"
 #include "../dataobj/freelist.h"
 #include "../dataobj/environment.h"
+#include "../network/remote_control.h"
 
 #include "objlist.h"
 
@@ -394,6 +397,27 @@ bool objlist_t::intern_add_moving(obj_t* new_obj)
 /**
  * @returns true if tree1 must be sorted before tree2 (tree1 stands behind tree2)
  */
+/**
+ * Reports a static object added to or removed from a ground to the map change tracking (3D export).
+ * Moving things are told by their flag. obj_t::~obj_t removes objects deleted on the map; there
+ * the dynamic type is obj_t and get_typ() is pure virtual, but only static objects come this way
+ * (clouds leave the ground in their own destructor).
+ */
+static inline void note_map_change(const obj_t *obj)
+{
+	if(  remote_control_map_tracked  &&  !obj->is_moving()  ) {
+		bool is_static = typeid(*obj) == typeid(obj_t);
+		if(  !is_static  ) {
+			const uint8 pri = type_to_pri[obj->get_typ()];
+			is_static = pri < PRI_MOVABLE  ||  pri == PRI_POWERLINE;
+		}
+		if(  is_static  ) {
+			remote_control_mark_changed(obj->get_pos().x, obj->get_pos().y);
+		}
+	}
+}
+
+
 bool compare_trees(const obj_t *tree1, const obj_t *tree2)
 {
 	// the tree with larger yoff is in front
@@ -416,6 +440,7 @@ void objlist_t::sort_trees(uint8 index, uint8 count)
 
 bool objlist_t::add(obj_t* new_obj)
 {
+	note_map_change(new_obj);
 	if(capacity==0) {
 		// the first one save direct
 		obj.one = new_obj;
@@ -530,6 +555,9 @@ obj_t *objlist_t::remove_last()
 			obj.some[top] = NULL;
 		}
 	}
+	if(  last_obj  ) {
+		note_map_change(last_obj);
+	}
 	return last_obj;
 }
 
@@ -541,6 +569,7 @@ bool objlist_t::remove(const obj_t* remove_obj)
 	}
 	else if(  capacity == 1  ) {
 		if(  obj.one == remove_obj  ) {
+			note_map_change(remove_obj);
 			obj.one = NULL;
 			capacity = 0;
 			top = 0;
@@ -553,6 +582,7 @@ bool objlist_t::remove(const obj_t* remove_obj)
 	for(  uint8 i=0;  i<top;  i++  ) {
 		if(  obj.some[i] == remove_obj  ) {
 			// found it!
+			note_map_change(remove_obj);
 			top--;
 			while(  i < top  ) {
 				obj.some[i] = obj.some[i+1];
@@ -573,6 +603,7 @@ bool objlist_t::remove(const obj_t* remove_obj)
  */
 static void local_delete_object(obj_t *remove_obj, player_t *player)
 {
+	note_map_change(remove_obj);
 	vehicle_base_t* const v = obj_cast<vehicle_base_t>(remove_obj);
 	if (v  &&  remove_obj->get_typ() != obj_t::pedestrian  &&  remove_obj->get_typ() != obj_t::road_user  &&  remove_obj->get_typ() != obj_t::movingobj) {
 		v->leave_tile();

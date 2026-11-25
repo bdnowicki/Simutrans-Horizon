@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_all_desc() for the remote control
  */
 
 #include "pedestrian.h"
@@ -44,6 +45,14 @@ bool pedestrian_t::successfully_loaded()
 		DBG_MESSAGE("pedestrian_t", "No pedestrians found - feature disabled");
 	}
 	return true;
+}
+
+
+void pedestrian_t::get_all_desc(vector_tpl<const pedestrian_desc_t *> &list)
+{
+	for(auto const& i : table) {
+		list.append(i.value);
+	}
 }
 
 

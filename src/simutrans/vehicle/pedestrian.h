@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: get_all_desc() for the remote control
  */
 
 #ifndef VEHICLE_PEDESTRIAN_H
@@ -9,6 +10,8 @@
 
 #include "simroadtraffic.h"
 #include "../tpl/freelist_iter_tpl.h"
+
+template<class T> class vector_tpl;
 
 class pedestrian_desc_t;
 class grund_t;
@@ -82,6 +85,9 @@ public:
 	// class register functions
 	static bool register_desc(const pedestrian_desc_t *desc);
 	static bool successfully_loaded();
+
+	/// appends all registered pedestrian descriptions to @p list, unordered
+	static void get_all_desc(vector_tpl<const pedestrian_desc_t *> &list);
 
 	/**
 	 * Tries to generate some pedestrians on the square and the

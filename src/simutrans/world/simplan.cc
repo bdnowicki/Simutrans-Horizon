@@ -1,6 +1,7 @@
 /*
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
+ * Simutrans-Horizon, 2026-11: grounds added, removed or replaced are reported to the remote control
  */
 
 #include "../simdebug.h"
@@ -29,6 +30,7 @@
 #include "../dataobj/environment.h"
 
 #include "../gui/minimap.h"
+#include "../network/remote_control.h"
 
 
 karte_ptr_t planquadrat_t::welt;
@@ -104,6 +106,7 @@ sint16 planquadrat_t::get_overhead_clearance() const
 void planquadrat_t::boden_hinzufuegen(grund_t *bd)
 {
 	assert(!bd->ist_karten_boden());
+	remote_control_map_changed(bd->get_pos().x, bd->get_pos().y);
 	if(ground_size==0) {
 		// completely empty
 		data.one = bd;
@@ -164,6 +167,7 @@ DBG_MESSAGE("planquadrat_t::boden_hinzufuegen()","addition ground %s at (%i,%i,%
 bool planquadrat_t::boden_entfernen(grund_t *bd)
 {
 	assert(!bd->ist_karten_boden()  &&  ground_size>0);
+	remote_control_map_changed(bd->get_pos().x, bd->get_pos().y);
 	if(ground_size==1) {
 		ground_size = 0;
 		data.one = NULL;
@@ -196,6 +200,7 @@ bool planquadrat_t::boden_entfernen(grund_t *bd)
 void planquadrat_t::kartenboden_setzen(grund_t *bd, bool startup)
 {
 	assert(bd);
+	remote_control_map_changed(bd->get_pos().x, bd->get_pos().y);
 	grund_t *tmp = get_kartenboden();
 	if(tmp) {
 		boden_ersetzen(tmp,bd);
@@ -219,6 +224,7 @@ void planquadrat_t::kartenboden_setzen(grund_t *bd, bool startup)
 void planquadrat_t::boden_ersetzen(grund_t *alt, grund_t *neu)
 {
 	assert(alt!=NULL  &&  neu!=NULL  &&  !alt->is_halt()  );
+	remote_control_map_changed(neu->get_pos().x, neu->get_pos().y);
 
 	if(ground_size<=1) {
 		assert(data.one==alt  ||  ground_size==0);
