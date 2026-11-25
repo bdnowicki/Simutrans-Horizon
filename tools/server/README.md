@@ -22,6 +22,7 @@ simutrans/
   .env               chmod 600, see below
   base/              base files of the clients: config, text, script, ai, themes, font and pak128/
   user/              user directory: simuconf.tab, settings.xml, save/, server13353-*.sve
+  pak3d/             optional: clone of a pak 3D (models of the dashboard's 3D view)
 ```
 
 `.env`:
@@ -36,6 +37,9 @@ SIMUTRANS_DASHBOARD_TOKEN_PLAYER=<another one>
 
 `SIMUTRANS_DASHBOARD_HOSTS` lists the names the browsers use for the host (Host header check).
 Tokens: `python3 -c "import secrets; print(secrets.token_urlsafe(24))"`.
+
+Optional: `SIMUTRANS_PAK3D_DIR=./pak3d` gives the 3D view of the dashboard the models of a pak 3D, see
+[3D models](#3d-models-optional).
 
 ## Build and deploy
 
@@ -88,3 +92,28 @@ with a password ask for it.
 `http://<LAN IP>:13380/?token=<SIMUTRANS_DASHBOARD_TOKEN_VIEWER>` (read the token with
 `grep TOKEN_VIEWER .env` on the host). The remote control of the server is read only, so the
 player token can look but not act. The container log hides the tokens.
+
+## 3D models (optional)
+
+The 3D tab of the dashboard needs an image built from a source tree with the 3D export of the remote
+control (an older image keeps working, the dashboard then hides the tab). It draws every object with
+generated shapes; a pak 3D
+([tools/pak3d](../pak3d/README.md), e.g. the
+[Simutrans-Horizon pak 3D](https://github.com/bdnowicki/simutrans-horizon-pak3d) for pak128) adds glTF models
+for selected objects. To use one, clone it next to `compose.yaml` and name it in `.env`:
+
+```
+cd simutrans
+git clone https://github.com/bdnowicki/simutrans-horizon-pak3d.git pak3d
+echo 'SIMUTRANS_PAK3D_DIR=./pak3d' >> .env
+docker compose up -d
+```
+
+`compose.yaml` mounts the directory read only at `/simutrans/pak3d` and sets
+`SIMUTRANS_DASHBOARD_PAK3D` for the bridge (`--pak3d`), which serves it under `/pak3d/` behind the
+session (only model, texture and data files, never `.git`). Set the variable in `.env` as
+`SIMUTRANS_PAK3D_DIR` only: compose derives `SIMUTRANS_DASHBOARD_PAK3D` from it and overrides a
+value of its own in `.env`. Without `SIMUTRANS_PAK3D_DIR` nothing changes: the bridge serves no pak
+3D (the mount then shows `base/` again, unused, so Docker creates no directory on the host).
+Updating the models needs no restart: `git -C pak3d pull`, then reload the 3D tab. The container
+reads the clone as user 1000 (`UID` of the image), so the files must be readable for it.
