@@ -9,11 +9,13 @@
 # Never announce the server on the public server list (LAN only)
 server_announce = 0
 
-# Game time runs only while at least one client plays; the server saves the game
-# (server<port>-network.sve) whenever the last client leaves
-pause_server_no_clients = 1
+# Game time runs on while no client plays (the dashboard shows a live game). With 1 it runs only
+# while at least one client plays and the server saves the game whenever the last client leaves.
+pause_server_no_clients = 0
+
+# While no client plays, save the game (server<port>-network.sve, continued on the next start)
+# every this many months (Simutrans-Horizon; without pausing the server would save only when stopped)
+autosave = 1
 
 # Save the game (server<port>-restore.sve) when the server is stopped
 server_save_game_on_quit = 1
-
-# Note: "autosave" has no effect in network games.

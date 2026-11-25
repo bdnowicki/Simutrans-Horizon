@@ -2,7 +2,7 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: -remote_control polling in interactive(), is_available_for_players() and allow_future_objects(), world and month event hooks for the remote control
+ * Simutrans-Horizon, 2026-11: -remote_control polling in interactive(), is_available_for_players() and allow_future_objects(), world and month event hooks for the remote control, server autosave while no client plays
  */
 
 #include <algorithm>
@@ -2898,6 +2898,40 @@ inline sint32 get_population(stadt_t const* const c)
 }
 
 
+// Simutrans-Horizon: the game of a server saved into server<port>-network.sve (continued on its next start), without the
+// password hashes like the save sent to joining clients (karte_t::load restores them from server<port>-pwdhash.sve)
+static void save_server_game(karte_t *welt)
+{
+	dr_chdir(env_t::user_dir);
+	char fn[256];
+	sprintf(fn, "server%d-pwdhash.sve", env_t::server);
+	loadsave_t pwdwrfile;
+	if (pwdwrfile.wr_open(fn, loadsave_t::zipped, 1, "hashes", SAVEGAME_VER_NR) == loadsave_t::FILE_STATUS_OK) {
+		welt->rdwr_player_password_hashes(&pwdwrfile);
+		pwdwrfile.close();
+	}
+	for (uint8 i = 0; i < PLAYER_UNOWNED; i++) {
+		player_t *player = welt->get_player(i);
+		if (player && !player->access_password_hash().empty()) {
+			player->access_password_hash().clear();
+		}
+	}
+	// save() writes a temporary file and replaces the old save only when it succeeded
+	sprintf(fn, "server%d-network.sve", env_t::server);
+	bool old_restore_UI = env_t::restore_UI;
+	env_t::restore_UI = true;
+	welt->save(fn, false, SERVER_SAVEGAME_VER_NR, true);
+	env_t::restore_UI = old_restore_UI;
+
+	sprintf(fn, "server%d-pwdhash.sve", env_t::server);
+	loadsave_t pwdrdfile;
+	if (pwdrdfile.rd_open(fn) == loadsave_t::FILE_STATUS_OK) {
+		welt->rdwr_player_password_hashes(&pwdrdfile);
+		pwdrdfile.close();
+	}
+}
+
+
 void karte_t::new_month()
 {
 	bool need_locality_update = false;
@@ -3020,6 +3054,12 @@ void karte_t::new_month()
 		dr_chdir(env_t::user_dir); // make sure we are in the right directory
 		buf.printf( SAVE_PATH_X "autosave%02i.sve", last_month+1 );
 		save( buf, true, env_t::savegame_version_str, true );
+	}
+	// Simutrans-Horizon: a server whose time runs on without clients (pause_server_no_clients = 0) saves its game every
+	// autosave months while nobody plays, so that a crash does not lose everything since it was started
+	else if(  env_t::server  &&  !env_t::pause_server_no_clients  &&  env_t::autosave>0  &&  last_month%env_t::autosave==0
+	          &&  socket_list_t::get_playing_clients()==0  &&  !nwc_join_t::is_pending()  ) {
+		save_server_game(this);
 	}
 }
 

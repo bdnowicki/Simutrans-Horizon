@@ -10,8 +10,10 @@ the server never announces itself on the public server list.
   inside the container only) and the dashboard on port 13380. On `docker stop` the server saves the
   game before it quits.
 - `simuconf.tab` is copied once into the user directory: `server_announce = 0`,
-  `pause_server_no_clients = 1` (time runs only while someone plays), `server_save_game_on_quit = 1`.
-  `autosave` has no effect in network games; the server saves whenever the last client leaves.
+  `pause_server_no_clients = 0` (time runs on while nobody plays), `autosave = 1` (while nobody
+  plays the server saves its game every month) and `server_save_game_on_quit = 1`. With
+  `pause_server_no_clients = 1` time runs only while someone plays and the server saves whenever the
+  last client leaves. An existing copy in the user directory is not replaced: edit it there.
 - `compose.yaml` publishes 13353 (game) and 13380 (dashboard) on one LAN address only.
 
 ## Layout on the host
