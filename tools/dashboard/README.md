@@ -675,8 +675,12 @@ the renderer, the WebGL context and the worker again.
   of the four iso directions. Switching back to iso keeps the point looked at and takes the nearest iso
   direction. Keys (not while typing in a field): Q/E rotate, F iso/free, V follow the selected convoy (again:
   stop), L names on/off, + and - zoom, arrows pan, Escape stops following (and closes the quality panel or the
-  authors page). Toolbar (top right, in two columns on screens under 540 pixels high): rotate left/right, zoom
-  in/out, iso/free, city cars and pedestrians, names, quality panel, and with a pak 3D the model authors. Camera
+  authors page). A drag holds the ground: the point under the mouse or finger stays under it in both cameras
+  (in the iso view also while a pinch zooms, around the middle of the fingers), and a fast drag glides on after the
+  release and slows down like the 2D map; a press stops it. The camera code does this itself (`camera.js`);
+  MapControls only zoom and turn. Toolbar (top right, in two columns on screens under 540 pixels high): rotate
+  left/right, zoom in/out, iso/free, city cars and pedestrians, names, quality panel, and with a pak 3D the model
+  authors. Camera
   mode, rotation and zoom are remembered per browser (local storage `sdash.v3dCamera`); the view starts
   where the 2D map is, or where the 3D view was when the tab is opened again. **Follow:** "Follow in 3D" in
   the convoy panel or the convoy's info card (or V for the selected convoy) opens the 3D tab and keeps the

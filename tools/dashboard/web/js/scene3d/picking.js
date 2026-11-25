@@ -162,6 +162,21 @@ export class Picker {
 
 	/** The square under the client point: {x, y, source: "chunk"|"far", point: [x, y, z]} or null. */
 	tileAtClient(cx, cy) {
+		const t0 = performance.now();
+		const hit = this.rayHit(cx, cy);
+		this.stats.picks++;
+		this.stats.pickMs = Math.round((performance.now() - t0) * 100) / 100;
+		this.stats.lastTile = hit ? [hit.x, hit.y, hit.source] : null;
+		return hit;
+	}
+
+	/** The shown surface point under the client point ([x, y, z]) or null: what a drag of the camera holds. */
+	pointAtClient(cx, cy) {
+		const hit = this.rayHit(cx, cy);
+		return hit ? hit.point : null;
+	}
+
+	rayHit(cx, cy) {
 		const r = this.view.canvas.getBoundingClientRect();
 		if (!r.width || !r.height) {
 			return null;
@@ -170,12 +185,7 @@ export class Picker {
 		const cam = this.view.rig.camera;
 		cam.updateMatrixWorld(true);
 		this.ray.setFromCamera(ndc, cam);
-		const t0 = performance.now();
-		const hit = this.march(this.ray.ray);
-		this.stats.picks++;
-		this.stats.pickMs = Math.round((performance.now() - t0) * 100) / 100;
-		this.stats.lastTile = hit ? [hit.x, hit.y, hit.source] : null;
-		return hit;
+		return this.march(this.ray.ray);
 	}
 
 	/** Height of the grid point (gx, gz) as shown (a chunk's square corner, else the far terrain), in levels * step. */

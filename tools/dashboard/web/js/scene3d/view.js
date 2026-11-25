@@ -156,7 +156,8 @@ class View3D {
 		});
 
 		this.rig = new CameraRig(canvas, { onChange: () => this.viewChanged(),
-			groundAt: (x, z) => this.chunks.groundAt(x, z) ?? (this.far ? this.far.groundAt(x, z) : null) });
+			groundAt: (x, z) => this.chunks.groundAt(x, z) ?? (this.far ? this.far.groundAt(x, z) : null),
+			surfaceAt: (x, y) => (this.picker ? this.picker.pointAtClient(x, y) : null) });
 		this.chunks = new ChunkLayer(this);
 		this.far = new FarLayer(this);
 		this.picker = new Picker(this);
