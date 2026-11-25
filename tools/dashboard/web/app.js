@@ -11,11 +11,13 @@ import { MessagesView } from "/js/views/messages.js";
 import { ConvoysView } from "/js/views/convoys.js";
 import { LinesView } from "/js/views/lines.js";
 import { WorldView } from "/js/views/world.js";
+import { View3DTab, view3dSupported } from "/js/views/view3d.js";
 import { DetailPanel } from "/js/views/detailpanel.js";
 import "/js/panel.js";
 
 const TABS = [
 	["map", "tab_map", "map"],
+	["view3d", "tab_3d", "cube"],
 	["finances", "tab_finances", "money"],
 	["messages", "tab_messages", "msg"],
 	["convoys", "tab_convoys", "bus"],
@@ -47,9 +49,10 @@ if (window.matchMedia) {
 // --- components ------------------------------------------------------------------------------
 
 function Tabs() {
-	useTopics(["ui", "lang"]);
+	useTopics(["ui", "lang", "session", "game"]);
+	const tabs = TABS.filter(([id]) => id !== "view3d" || view3dSupported());
 	return html`<nav class="tabs" role="tablist" aria-label=${t("app_title")}>
-		${TABS.map(([id, label, icon]) => html`<button type="button" role="tab" aria-selected=${S.ui.tab === id}
+		${tabs.map(([id, label, icon]) => html`<button type="button" role="tab" aria-selected=${S.ui.tab === id}
 			class=${"tab" + (S.ui.tab === id ? " on" : "")} onClick=${() => setUi({ tab: id })}>
 			<${Icon} name=${icon} size=${20} /><span>${t(label)}</span>
 		</button>`)}
@@ -90,6 +93,7 @@ function App() {
 		<div class="workspace">
 			<main class="views">
 				<section class="view" hidden=${tab !== "map"}><${MapView} visible=${tab === "map"} /></section>
+				<section class="view" hidden=${tab !== "view3d"}><${View3DTab} visible=${tab === "view3d"} /></section>
 				<section class="view scroll" hidden=${tab !== "finances"}>${tab === "finances" ? html`<${FinancesView} />` : null}</section>
 				<section class="view scroll" hidden=${tab !== "messages"}><${MessagesView} /></section>
 				<section class="view" hidden=${tab !== "convoys"}><${ConvoysView} visible=${tab === "convoys"} /></section>

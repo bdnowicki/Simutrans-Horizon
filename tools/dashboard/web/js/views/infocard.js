@@ -11,6 +11,7 @@ import { ownerColor, stateColor, lineColor } from "/js/colors.js";
 import { Icon } from "/js/icons.js";
 import { openPanel } from "/js/panel.js";
 import { FactoryStatus, GoodsName } from "/js/views/detailparts.js";
+import { followIn3D, view3dSupported } from "/js/views/view3d.js";
 import { share, fmtShare } from "/js/views/citypanel.js";
 
 /** Load details for the selection; reload every `every` ms while it stays selected. */
@@ -90,7 +91,9 @@ function ConvoyCard({ sel }) {
 		</dl>
 		${det.error ? html`<p class="error small">${t("load_failed", det.error)}</p>` : !d ? html`<p class="muted small">${t("loading")}</p>` : null}
 		<div class="card-actions"><button type="button" class="btn small" onClick=${() => openPanel("convoy", sel.id)}>
-			<${Icon} name="info" size=${16} />${t("details")}</button></div>`;
+			<${Icon} name="info" size=${16} />${t("details")}</button>
+			${view3dSupported() ? html`<button type="button" class="btn small follow3d" onClick=${() => followIn3D(sel.id)}>
+				<${Icon} name="follow" size=${16} />${t("follow_3d")}</button>` : null}</div>`;
 }
 
 function linesAtStation(tiles) {
@@ -222,7 +225,8 @@ function TileCard({ sel }) {
 		${det.error ? html`<p class="error small">${t("load_failed", det.error)}</p>` : !d ? html`<p class="muted small">${t("loading")}</p>` : null}`;
 }
 
-export function InfoCard() {
+/** onLocate(x, y): shows a square in the view the card belongs to (default: the 2D map). */
+export function InfoCard({ onLocate } = {}) {
 	useTopics(["ui", "lang"]);
 	const sel = S.ui.selection;
 	if (!sel) {
@@ -243,7 +247,11 @@ export function InfoCard() {
 			}
 		}
 		if (typeof x === "number") {
-			mapCtl.locate(x, y);
+			if (onLocate) {
+				onLocate(x, y);
+			} else {
+				mapCtl.locate(x, y);
+			}
 		}
 	};
 	return html`<aside class="infocard" aria-live="polite">

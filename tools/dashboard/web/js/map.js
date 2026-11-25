@@ -63,6 +63,7 @@ class MapController {
 		this.pulses = new Map(); // halt id -> start of its arrival pulse
 		this.pulseReq = 0;
 		this.pulseLast = 0;
+		this.lastCenter = null; // Leaflet LatLng of the map centre while it was last visible
 	}
 
 	mount(el) {
@@ -100,6 +101,13 @@ class MapController {
 		this.labels = createOverlay((ctx, v) => this.drawLabels(ctx, v), { pane: "labels" }).addTo(map);
 		map.setView([-512, 512], -1);
 		map.on("click", (e) => this.onClick(e));
+		// the centre while the map is shown (a hidden map has no size; the 3D view starts here)
+		map.on("moveend", () => {
+			const s = map.getSize();
+			if (s.x > 0 && s.y > 0) {
+				this.lastCenter = map.getCenter();
+			}
+		});
 		this.terrain.on((what, arg) => {
 			if (what === "region") {
 				if (this.detail) {

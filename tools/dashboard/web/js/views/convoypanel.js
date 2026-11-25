@@ -1,5 +1,6 @@
 // Simutrans-Horizon dashboard: detail panel of a convoy (the game's convoy window: vehicles, schedule,
-// freight, 12-month chart) and the leg it drives now on the map. Artistic License, see LICENSE.txt.
+// freight, 12-month chart) and the leg it drives now on the map; "Follow in 3D" opens the 3D tab following it.
+// Artistic License, see LICENSE.txt.
 import { html, useEffect } from "/vendor/htm/standalone.module.js";
 import { S, useTopics, convoyIndex, convoyLive } from "/js/store.js";
 import { apiGet, canRead, isMissingCommand } from "/js/api.js";
@@ -13,6 +14,7 @@ import { fmtInt, fmtMoney, fmtMoneyCents, fmtNum, fmtPct, fmtPos } from "/js/for
 import { stateColor, isProblem, lineColor } from "/js/colors.js";
 import { Icon } from "/js/icons.js";
 import { Section, Fig, Meter, Owner, LineLink, StationLink, StopName, stopFlags, LoadNote, goToMap } from "/js/views/detailparts.js";
+import { followIn3D, view3dSupported } from "/js/views/view3d.js";
 
 const GROUPS = () => [
 	{ id: "money", label: t("grp_money"), unit: "money", cols: ["revenue", "operation", "profit", "toll"], optional: ["toll"] },
@@ -109,6 +111,8 @@ export function ConvoyPanel({ id }) {
 		<div class="panel-sub">${t("convoy")} #${id} · <${Owner} nr=${owner} /> · <${LineLink} id=${lineId} name=${c && c.line ? c.line.name : null} /></div>
 		<div class="panel-actions">
 			<button type="button" class="btn small" disabled=${!pos} onClick=${locate}><${Icon} name="locate" size=${16} />${t("locate_on_map")}</button>
+			${view3dSupported() ? html`<button type="button" class="btn small follow3d" onClick=${() => followIn3D(id)}>
+				<${Icon} name="follow" size=${16} />${t("follow_3d")}</button>` : null}
 		</div>
 		<${LoadNote} error=${old ? fb.error || (has ? det.error : { status: 403 }) : det.error} loading=${!c} />
 		<div class="figs">

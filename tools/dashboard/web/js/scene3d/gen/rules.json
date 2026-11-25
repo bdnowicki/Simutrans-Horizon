@@ -1,0 +1,249 @@
+{
+  "format": 1,
+  "about": "Rules of the procedural buildings of the 3D view (gen/buildings.js). A pak 3D manifest may later merge its own rules over these: objects merge key by key, arrays and strings are replaced. Colours are sRGB hex; lengths in squares; heights in height levels unless named *_sq.",
+  "units": { "storey": 0.62, "column": 0.13 },
+  "palettes": {
+    "brick": ["#8e3b2a", "#a3502f", "#7a3426", "#b0623f", "#93452f", "#9b5a44"],
+    "brownstone": ["#6e4a38", "#7d5643", "#5f3f30", "#86604a"],
+    "stone": ["#cfc6b4", "#d9d1bf", "#bdb3a0", "#e3dccb", "#c7bba2"],
+    "stucco": ["#e8dcc0", "#f0e6cf", "#e6d3b0", "#efe0c8", "#f2ead8", "#dcc8a6", "#e9d9c9"],
+    "pastel": ["#e7c9a9", "#d9b48f", "#f0d9b5", "#cfd8c4", "#e3c4c0", "#c9d3dc"],
+    "concrete": ["#a9a7a1", "#b8b5ae", "#9a9893", "#c4c1b9", "#8f8d88"],
+    "glass": ["#5f8196", "#4f7383", "#6c8c99", "#3f6274", "#7a95a0", "#4d6b5e", "#7d6f5c"],
+    "office": ["#b9bcbf", "#c9c2b5", "#a8acb0", "#d3cdc0", "#8f969c", "#d8d4cb"],
+    "metal": ["#7f8a94", "#8a9ba3", "#6f8a7a", "#9a6b4f", "#8c8f93", "#a3a59e", "#5f7a8c"],
+    "civic": ["#e9e3d3", "#d8ceb6", "#efe9dc", "#cbbf9f", "#e2d6bc"],
+    "roof_tile": ["#8a3a2c", "#9b4a34", "#6e3a2e", "#7a4b3a", "#a35a3c"],
+    "roof_slate": ["#4a4d55", "#575a60", "#3e434a", "#5b5650", "#62584e"],
+    "roof_copper": ["#5f9b86", "#6aa58f", "#4f8a76"],
+    "roof_flat": ["#6b6b6b", "#77736d", "#5e5f61", "#8a8580", "#6f6a64"],
+    "roof_metal": ["#7d848a", "#8c9196", "#6b7277"],
+    "lot_green": ["#6f9a4f", "#77a055", "#6a9449"],
+    "lot_paved": ["#a8a6a0", "#9e9c96"],
+    "accent": ["#b23a2e", "#2f5d8c", "#3b7a46", "#c08a2c", "#6b4a8a", "#2f7f86"]
+  },
+  "categories": {
+    "residential": {
+      "types": ["res"],
+      "form": "block",
+      "inset": { "low": [0.12, 0.2], "high": [0.04, 0.09] },
+      "lot": { "low": "lot_green" },
+      "facades": [
+        { "palette": "brick", "w": 4 }, { "palette": "stucco", "w": 3 }, { "palette": "brownstone", "w": 2 },
+        { "palette": "stone", "w": 2 }, { "palette": "pastel", "w": 2 }
+      ],
+      "windows": "punched",
+      "ground": "door",
+      "roofs": [
+        { "maxLevels": 3.5, "climate": "cold", "kinds": { "gable": 5, "hip": 2, "flat": 1 } },
+        { "maxLevels": 3.5, "climate": "warm", "kinds": { "flat": 5, "hip": 2 } },
+        { "maxLevels": 3.5, "kinds": { "gable": 4, "hip": 3, "flat": 2 } },
+        { "maxLevels": 7, "kinds": { "flat": 6, "hip": 1, "mansard": 1 } },
+        { "kinds": { "flat": 1 } }
+      ],
+      "roofPalettes": { "gable": ["roof_tile", "roof_slate"], "hip": ["roof_tile", "roof_slate"], "mansard": ["roof_slate", "roof_copper"], "flat": ["roof_flat"] },
+      "rooftop": { "watertank": 0.4, "hvac": 0.3, "bulkhead": 0.5 },
+      "cornice": 0.6,
+      "tower": { "minLevels": 7, "chance": 0.55, "setbacks": [1, 2], "step": [0.06, 0.12], "crown": { "flat": 6, "stepped": 2, "pyramid": 1 } }
+    },
+    "commercial": {
+      "types": ["com"],
+      "form": "block",
+      "inset": { "low": [0.06, 0.12], "high": [0.03, 0.07] },
+      "facades": [
+        { "palette": "office", "w": 3 }, { "palette": "stone", "w": 2 }, { "palette": "brick", "w": 1 },
+        { "palette": "glass", "w": 3, "windows": "curtain", "minLevels": 6 }, { "palette": "concrete", "w": 1 }
+      ],
+      "windows": "ribbon",
+      "windowsLow": "punched",
+      "ground": "shop",
+      "roofs": [
+        { "maxLevels": 3, "climate": "cold", "kinds": { "flat": 4, "gable": 2 } },
+        { "kinds": { "flat": 1 } }
+      ],
+      "roofPalettes": { "gable": ["roof_slate"], "flat": ["roof_flat"] },
+      "rooftop": { "watertank": 0.15, "hvac": 0.7, "bulkhead": 0.6, "antenna": 0.35 },
+      "cornice": 0.35,
+      "tower": { "minLevels": 6, "chance": 0.75, "setbacks": [1, 3], "step": [0.05, 0.11], "crown": { "flat": 5, "stepped": 3, "pyramid": 2, "spire": 2 } }
+    },
+    "industrial": {
+      "types": ["ind"],
+      "form": "hall",
+      "inset": { "low": [0.05, 0.12], "high": [0.04, 0.08] },
+      "facades": [{ "palette": "brick", "w": 3 }, { "palette": "concrete", "w": 2 }, { "palette": "metal", "w": 3 }],
+      "windows": "industrial",
+      "roofs": [{ "kinds": { "sawtooth": 3, "gable": 3, "flat": 2 } }],
+      "roofPalettes": { "gable": ["roof_metal", "roof_slate"], "sawtooth": ["roof_metal"], "flat": ["roof_flat"] },
+      "chimney": 0.3,
+      "loftAbove": 5,
+      "rooftop": { "watertank": 0.5, "hvac": 0.3 }
+    },
+    "attraction": {
+      "types": ["cur"],
+      "form": "civic",
+      "facades": [{ "palette": "civic", "w": 3 }, { "palette": "stone", "w": 2 }, { "palette": "brick", "w": 1 }],
+      "keywords": [
+        { "match": "russian|cathedral|onion", "form": "cathedral" },
+        { "match": "mosque", "form": "mosque" },
+        { "match": "church|chapel|abbys|benedict|st_peter|secession|sacred", "form": "church" },
+        { "match": "tv_tower|radio_tower|futuristic", "form": "mast" },
+        { "match": "lighthouse", "form": "lighthouse" },
+        { "match": "clock", "form": "clocktower" },
+        { "match": "castle|fort|ruin_|old_gate", "form": "castle" },
+        { "match": "triumph|gate", "form": "arch" },
+        { "match": "house_ruins", "form": "ruins" },
+        { "match": "park|garden|oasis", "form": "park" },
+        { "match": "stadium|tennis", "form": "stadium" },
+        { "match": "wheel", "form": "wheel" },
+        { "match": "windmill", "form": "windmill" },
+        { "match": "pagoda", "form": "pagoda" },
+        { "match": "temple|maya", "form": "steppyramid" },
+        { "match": "observatory", "form": "observatory" },
+        { "match": "radar", "form": "radar" },
+        { "match": "circus", "form": "tent" },
+        { "match": "market", "form": "market" },
+        { "match": "green_house|greenhouse", "form": "greenhouse" },
+        { "match": "rock", "form": "rock" },
+        { "match": "icarus|statue", "form": "statue" },
+        { "match": "museum|justice|courthouse|library", "form": "temple" },
+        { "match": "fire", "form": "block", "ground": "garage", "facades": [{ "palette": "brick", "w": 1 }] },
+        { "match": "ski", "form": "park" },
+        { "match": "school|radiant|hotel|manor|old_house", "form": "block", "inset": { "low": [0.08, 0.14], "high": [0.05, 0.09] }, "roofs": [{ "kinds": { "hip": 3, "flat": 2, "gable": 1 } }], "lot": { "low": "lot_green", "high": "lot_green" } }
+      ]
+    },
+    "monument": {
+      "types": ["mon"],
+      "form": "statue",
+      "facades": [{ "palette": "civic", "w": 2 }, { "palette": "stone", "w": 1 }],
+      "keywords": [
+        { "match": "roundabout", "form": "fountain" },
+        { "match": "server|forum|track", "form": "obelisk" }
+      ]
+    },
+    "townhall": {
+      "types": ["tow"],
+      "form": "townhall",
+      "facades": [{ "palette": "civic", "w": 2 }, { "palette": "brick", "w": 2 }, { "palette": "stone", "w": 2 }],
+      "roofPalettes": { "hip": ["roof_slate", "roof_copper"] }
+    },
+    "headquarters": {
+      "types": ["hq"],
+      "form": "headquarters",
+      "companyColor": true,
+      "facades": [{ "palette": "glass", "w": 2, "windows": "curtain" }, { "palette": "office", "w": 2 }, { "palette": "stone", "w": 1 }]
+    },
+    "factory": {
+      "types": ["factory"],
+      "form": "works",
+      "facades": [{ "palette": "brick", "w": 3 }, { "palette": "concrete", "w": 2 }, { "palette": "metal", "w": 3 }],
+      "recipe": { "hall": { "frac": 0.55, "roof": "sawtooth" }, "office": 0.5, "features": [{ "kind": "chimney", "n": [0, 1] }, { "kind": "tank", "n": [0, 2] }] },
+      "keywords": [
+        { "match": "oelbohrinsel|oil_?rig|offshore", "form": "oilrig" },
+        { "match": "fish_swarm", "form": "buoys" },
+        { "match": "wind", "form": "turbine" },
+        { "match": "stirling|solar_?pond|solarthermal|solar pond", "form": "solar" },
+        { "match": "solarpowertower|ps10", "recipe": { "hall": { "frac": 0.12, "roof": "flat" }, "features": [{ "kind": "solartower", "n": 1 }, { "kind": "panels", "n": [10, 14] }] } },
+        { "match": "raffinerie|refiner", "recipe": { "hall": { "frac": 0.2, "roof": "flat" }, "office": 0.3, "features": [{ "kind": "column", "n": [3, 4] }, { "kind": "tank", "n": [4, 6] }, { "kind": "flare", "n": 1 }, { "kind": "piperack", "n": [1, 2] }] } },
+        { "match": "oelfeld|oil_?field", "recipe": { "hall": { "frac": 0 }, "features": [{ "kind": "pumpjack", "n": [3, 5] }, { "kind": "tank", "n": [1, 2] }] } },
+        { "match": "geotherm", "recipe": { "hall": { "frac": 0.35, "roof": "flat" }, "features": [{ "kind": "cooling", "n": 2, "scale": 0.6 }, { "kind": "piperack", "n": 2 }, { "kind": "chimney", "n": 1 }] } },
+        { "match": "incinerator", "recipe": { "hall": { "frac": 0.6, "roof": "flat", "tall": 1.5 }, "features": [{ "kind": "chimney", "n": 1, "scale": 1.6 }] } },
+        { "match": "oilkraftwerk|oil_?power", "recipe": { "hall": { "frac": 0.45, "roof": "flat", "tall": 1.6 }, "features": [{ "kind": "chimney", "n": [2, 3], "scale": 1.4 }, { "kind": "tank", "n": [2, 3] }] } },
+        { "match": "kraftwerk|power", "recipe": { "hall": { "frac": 0.4, "roof": "flat", "tall": 1.6 }, "features": [{ "kind": "cooling", "n": [1, 2] }, { "kind": "chimney", "n": [2, 3], "scale": 1.3 }, { "kind": "pile", "n": 1, "color": "#2b2a29" }] } },
+        { "match": "shaft|bergwerk|erz", "recipe": { "hall": { "frac": 0.35, "roof": "gable" }, "features": [{ "kind": "headframe", "n": [1, 2] }, { "kind": "pile", "n": [1, 2], "color": "#3a3634" }, { "kind": "chimney", "n": [0, 1] }] } },
+        { "match": "open_coal|quarry|sand", "recipe": { "hall": { "frac": 0.12, "roof": "gable" }, "features": [{ "kind": "pit", "n": 1 }, { "kind": "pile", "n": [2, 4] }, { "kind": "conveyor", "n": 1 }] } },
+        { "match": "steel", "recipe": { "hall": { "frac": 0.45, "roof": "gable", "tall": 1.4 }, "features": [{ "kind": "furnace", "n": [1, 2] }, { "kind": "chimney", "n": [2, 3], "scale": 1.2 }, { "kind": "pile", "n": 1, "color": "#6b4a3a" }] } },
+        { "match": "cement|concrete|glass|ethanol|chemi", "recipe": { "hall": { "frac": 0.4, "roof": "flat" }, "features": [{ "kind": "silo", "n": [2, 4] }, { "kind": "chimney", "n": 1 }, { "kind": "conveyor", "n": 1 }] } },
+        { "match": "brew", "recipe": { "hall": { "frac": 0.45, "roof": "gable" }, "office": 0.6, "features": [{ "kind": "kettle", "n": [2, 3] }, { "kind": "silo", "n": [2, 3] }, { "kind": "chimney", "n": 1 }] } },
+        { "match": "grain_mill|mill", "recipe": { "hall": { "frac": 0.35, "roof": "gable" }, "features": [{ "kind": "silo", "n": [3, 4], "scale": 1.3 }] } },
+        { "match": "farm|corn|cotton|grain|cow|sheep|field", "recipe": { "lot": "lot_green", "hall": { "frac": 0.3, "roof": "barn" }, "features": [{ "kind": "farmhouse", "n": 1 }, { "kind": "silo", "n": [1, 2], "scale": 0.8 }, { "kind": "shed", "n": [0, 1] }] } },
+        { "match": "forest|plantation|saeg|saw", "recipe": { "lot": "lot_green", "hall": { "frac": 0.35, "roof": "gable" }, "features": [{ "kind": "logs", "n": [3, 5] }] } },
+        { "match": "fish_pond|fishery", "recipe": { "hall": { "frac": 0.4, "roof": "gable" }, "features": [{ "kind": "pond", "n": [1, 3] }] } },
+        { "match": "tanke|fuel", "form": "fuelstation" },
+        { "match": "mall|supermarket|dealer|moebelhaus|wholesale|autoshop|chicken_restaurant|fried", "recipe": { "hall": { "frac": 0.6, "roof": "flat", "sign": true }, "office": 0, "features": [{ "kind": "parking", "n": 1 }] } },
+        { "match": "waste|disposal", "recipe": { "hall": { "frac": 0.15, "roof": "gable" }, "features": [{ "kind": "pile", "n": [3, 5], "color": "#6f6a5a" }] } },
+        { "match": "car_assembly|electronics|textile|goods|moebel|papier|druckerei|publisher|bakery|dairy|cannery|food|meat", "recipe": { "hall": { "frac": 0.65, "roof": "sawtooth" }, "office": 0.7, "features": [{ "kind": "chimney", "n": [0, 1] }, { "kind": "tank", "n": [0, 2] }] } }
+      ]
+    },
+    "other": {
+      "types": ["other"],
+      "form": "plinth"
+    }
+  },
+  "trees": {
+    "keywords": [
+      { "match": "palm", "shape": "palm" },
+      { "match": "cact", "shape": "cactus" },
+      { "match": "birch|birke", "shape": "birch" },
+      { "match": "pine|spruce|fir|conifer|cedar|larch|tanne|fichte|kiefer|taiga", "shape": "conifer" },
+      { "match": "cypress|poplar|pappel", "shape": "poplar" },
+      { "match": "bush|shrub|busch", "shape": "shrub" },
+      { "match": "oak|beech|maple|elm|linden|eiche|buche|ahorn|willow|apple|olive", "shape": "round" }
+    ],
+    "climates": [
+      { "mask": 13, "shapes": { "palm": 1 } },
+      { "only": 192, "shapes": { "conifer": 1 } },
+      { "only": 96, "shapes": { "conifer": 4, "birch": 1 } },
+      { "only": 48, "shapes": { "conifer": 3, "birch": 2 } },
+      { "only": 8, "shapes": { "poplar": 2, "round": 1, "shrub": 1 } },
+      { "only": 12, "shapes": { "palm": 1, "round": 1 } },
+      { "only": 24, "shapes": { "round": 3, "poplar": 2 } },
+      { "only": 28, "shapes": { "round": 3, "poplar": 1, "palm": 1 } },
+      { "only": 16, "shapes": { "round": 4, "conifer": 2, "birch": 1 } },
+      { "shapes": { "round": 3, "conifer": 2 } }
+    ],
+    "colors": {
+      "round": ["#4f7d33", "#5b8a3a", "#476f2e", "#6a9241"],
+      "birch": ["#7aa04a", "#88aa52"],
+      "conifer": ["#2f5a34", "#2a4f30", "#37633a"],
+      "poplar": ["#3f6a32", "#4a7638"],
+      "palm": ["#5c8f3a", "#6b9a40"],
+      "shrub": ["#557f38", "#62893f"],
+      "cactus": ["#5f8a4a"],
+      "autumn": ["#c0762a", "#b4532a", "#d19a32", "#9a6b2a", "#7f8a35"],
+      "winter": ["#5e4c3e", "#6a5646", "#54443a"],
+      "spring": ["#7bab47", "#8cb852", "#a3c763"]
+    }
+  },
+  "fields": {
+    "crops": [
+      { "match": "grain|wheat|cornfield|bakery|mill|brew", "summer": "#d9b84a", "autumn": "#b99a52", "rows": "#bf9e3a" },
+      { "match": "corn", "summer": "#7c9a3a", "autumn": "#b09040", "rows": "#5f7f2e", "tall": 0.05 },
+      { "match": "cotton", "summer": "#c9c8a8", "autumn": "#d8d6c4", "rows": "#7f8f4e" },
+      { "match": "chicken", "summer": "#8a6a48", "autumn": "#8a6a48", "rows": "#6a4a30", "pens": true },
+      { "match": "cow|sheep|dairy|meat", "summer": "#79a64a", "autumn": "#8a9a4a", "rows": "#6a9640", "fence": true },
+      { "match": "forest|plantation", "summer": "#6e8f45", "autumn": "#7a8a45", "rows": "#3f6a32", "saplings": true }
+    ],
+    "default": { "summer": "#c9b04a", "autumn": "#a99a5a", "rows": "#9a8a3a" }
+  },
+  "vehicles": {
+    "about": "Bodies of the vehicles (gen/vehicles.js createClassifier): freight = goods name -> load kind (passenger, mail, none, box, tank, open, covered, reefer, stake, steel, container, autos, flat), else catg = goods category -> load kind; keywords (regular expressions on the pak name, first match of each kind wins) override the load, the locomotive kind or mark helicopters; families scale the bodies across (w) and up (h) per way type; locomotives without a keyword are steam before steamBefore, electric from electricFrom at 140 km/h or more, else diesel; ships are drawn scale times their length (squares, between min and max); aircraft by capacity (seats up to upTo) with their drawn length in squares; city cars by colour words in their name.",
+    "freight": { "Passagiere": "passenger", "Post": "mail", "Autos": "autos", "Cement": "covered", "Concrete": "covered", "Stahl": "steel", "None": "none" },
+    "catg": { "0": "box", "1": "box", "2": "open", "3": "tank", "4": "reefer", "5": "tank", "6": "stake", "7": "covered" },
+    "keywords": [
+      { "match": "container", "freight": "container" },
+      { "match": "tender", "freight": "open" },
+      { "match": "tank|kessel|tanker", "freight": "tank" },
+      { "match": "hopper|silo|grain", "freight": "covered" },
+      { "match": "steam|dampf", "loco": "steam" },
+      { "match": "diesel|dmu", "loco": "diesel" },
+      { "match": "electric|elektr|emu|_e[0-9]", "loco": "electric" },
+      { "match": "heli", "air": "heli" }
+    ],
+    "families": {
+      "track": { "w": 1, "h": 1, "y": 0 }, "narrowgauge": { "w": 0.78, "h": 0.84, "y": 0 }, "tram": { "w": 1, "h": 1, "y": 0 },
+      "monorail": { "w": 1, "h": 1, "y": 0 }, "maglev": { "w": 1, "h": 1, "y": 0 }, "road": { "w": 1, "h": 1, "y": 0 }
+    },
+    "steamBefore": 1935,
+    "electricFrom": 1960,
+    "ships": { "scale": 2, "min": 0.45, "max": 1.7 },
+    "aircraft": [
+      { "upTo": 30, "body": "air_prop", "length": 0.6 }, { "upTo": 110, "body": "air_regional", "length": 0.85 },
+      { "upTo": 280, "body": "air_narrow", "length": 1.05 }, { "upTo": 100000, "body": "air_wide", "length": 1.35 }
+    ],
+    "citycars": {
+      "length": 0.24, "van": "truck|van|bus|lorry|pickup|transporter", "vanLength": 0.3,
+      "palette": ["#b3312a", "#2f56a0", "#e9e9e6", "#262628", "#a9adb2", "#3f7a3a", "#d8b632", "#7d8186"]
+    },
+    "pedestrians": { "palette": ["#c0392b", "#2c6fb0", "#3e8e41", "#d9a42a", "#8e44ad", "#e67e22", "#ecf0f1", "#34495e", "#16a085"] }
+  }
+}

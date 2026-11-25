@@ -7,7 +7,7 @@ import { setPalette } from "/js/colors.js";
 const MAX_MESSAGES = 500;
 const MAX_SAMPLES = 4000;
 
-function loadPref(key, fallback) {
+export function loadPref(key, fallback) {
 	try {
 		const v = localStorage.getItem("sdash." + key);
 		return v === null ? fallback : JSON.parse(v);

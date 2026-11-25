@@ -13,10 +13,13 @@ messages, pause and cash changes arrive at once and the poller can poll less; wi
 protocol 2 the bridge only polls. Map tiles (/tiles/<mode>/<step>/<cx>/<cy>.png) are palette
 PNGs made from the game's minimap and kept until map_changes, a new month or another world
 makes them old. GET /api/factory_status gathers the factory windows of all factories (pipelined) for
-the factories table; goods and supply_chain travel as feeds. Only the Python standard library is
+the factories table; goods and supply_chain travel as feeds. The 3D view reads desc_list, scene3d,
+heights and vehicles3d through two more connections of its own (opened when needed), cached by the
+map changes; /pak3d/ serves the models of a pak 3D directory (--pak3d). Static files and large JSON
+replies are sent gzip compressed to browsers that accept it. Only the Python standard library is
 used (Python 3.10+).
 
-  python tools/dashboard/simutrans_dashboard.py [--game-port 13360] [--port 13380]
+  python tools/dashboard/simutrans_dashboard.py [--game-port 13360] [--port 13380] [--pak3d DIR]
 
 tools/dashboard/README.md documents the HTTP API and the security model.
 """
@@ -24,6 +27,7 @@ tools/dashboard/README.md documents the HTTP API and the security model.
 import argparse
 import base64
 import collections
+import gzip
 import hashlib
 import hmac
 import json
@@ -138,6 +142,43 @@ ROUTE_LINES = 64            # lines kept in the route cache (the least recently 
 FACTORY_STATUS_TTL = 30.0
 FACTORY_BATCH = 64          # factory requests sent at once (pipelined) on the request connection
 
+# 3D view (tools/mcp/README.md "3D export"): GET /api/desc_list, scene3d, heights, vehicles3d
+VIEW3D_READS = ("desc_list", "scene3d", "heights", "vehicles3d")
+DESC_KINDS = ("buildings", "vehicles", "ways", "bridges", "tunnels", "trees", "signs", "wayobjs", "goods", "citycars",
+              "pedestrians")
+SCENE_SIZES = (16, 32, 64)
+CELL = 64                   # squares per side of a cell of map_changes chunk=64 (the unit of the 3D change tracking)
+HEIGHTS_STEPS = (1, 2, 4, 8, 16)
+MAX_HEIGHT_SAMPLES = 66049
+HEIGHTS_REFRESH = 10.0      # s: a cached heights region whose cells changed is fetched again at most this often
+VERIFY_REVS = 64            # cached replies checked per map change whether a reported change predates them
+VEH_MAX_SIDE = 256          # vehicles3d regions: at most 256 x 256 squares (also the engine's limit with extras=1)
+VEH_CACHE = 0.1             # s: a vehicles3d reply is shared by the requests for the same region within this time
+SCENE_CACHE_BYTES = 64 * 1024 * 1024
+HEIGHTS_CACHE_BYTES = 8 * 1024 * 1024
+DESC_CACHE_BYTES = 8 * 1024 * 1024
+VEH_CACHE_BYTES = 4 * 1024 * 1024
+QUEUE_3D = 32               # requests waiting for the 3D game connection (desc_list, scene3d, heights) ...
+QUEUE_VEH = 8               # ... and for the vehicles3d connection; further ones get 503
+WAIT_3D = 30.0              # s a request waits for its turn and the game's answer, then 503
+IDLE_3D = 120.0             # s without requests after which a 3D game connection is closed (frees one of the 8)
+# own token buckets (per session, instead of the general one): chunks like map tiles, vehicles about 5/s
+VIEW3D_RATES = {"scene3d": (60.0, 120.0), "vehicles3d": (5.0, 10.0)}
+UNSUPPORTED_3D = {"ok": False, "error": "unsupported",
+                  "detail": "the game has no 3D export (desc_list, scene3d, heights, vehicles3d): it needs a newer "
+                            "Simutrans-Horizon"}
+
+# gzip: static files of these types and JSON replies of at least GZIP_MIN bytes, for browsers that accept it
+GZIP_MIN = 1024
+GZIP_CACHE_BYTES = 64 * 1024 * 1024   # compressed static files, by path, mtime and size
+STATIC_MAX = 32 * 1024 * 1024         # larger static files are streamed (not compressed)
+COMPRESSIBLE = frozenset((".html", ".js", ".mjs", ".css", ".svg", ".json", ".txt", ".md", ".map", ".gltf", ".glb",
+                          ".bin"))
+# /pak3d/...: files of the pak 3D directory (--pak3d), only these types; names with a content hash are immutable
+PAK3D_TYPES = frozenset((".json", ".glb", ".gltf", ".bin", ".png", ".webp", ".ktx2", ".jpg", ".jpeg", ".txt", ".md"))
+HASHED_NAME = re.compile(r"\.[0-9a-f]{8,64}\.[a-z0-9]+$")
+INT_ARG = re.compile(r"^-?\d{1,6}$")
+
 # seconds between polls of each feed, and the shortest gap when a feed is triggered early
 INTERVALS = {"poll": 1, "positions": 1, "messages": 5, "players": 5, "convoys": 15, "lines": 15,
              "stations": 30, "factories": 30, "cities": 30, "palette": 60, "map": 10, "goods": 600,
@@ -164,7 +205,9 @@ UNLIMITED = 1000000  # limit for engines without limit=0
 MESSAGE_TYPES = ("general", "ai", "city", "problems", "industry", "chat", "new_vehicle", "full",
                  "warnings", "traffic_jams", "scenario", "chat_common", "chat_company", "chat_private")
 
-CSP = ("default-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; "
+# connect-src blob:: three.js' GLTFLoader turns the textures embedded in a .glb into blob: URLs of the page and
+# fetches them (ImageBitmapLoader); such a URL only ever holds bytes the page already has (README, "Pak 3D")
+CSP = ("default-src 'self'; img-src 'self' data: blob:; connect-src 'self' blob:; frame-ancestors 'none'; "
        "base-uri 'none'; form-action 'self'")
 SECURITY_HEADERS = (
     ("Content-Security-Policy", CSP),
@@ -178,6 +221,8 @@ MIME = {
     ".png": "image/png", ".svg": "image/svg+xml", ".json": "application/json",
     ".woff2": "font/woff2", ".ico": "image/x-icon", ".txt": "text/plain; charset=utf-8",
     ".md": "text/plain; charset=utf-8", ".map": "application/json",
+    ".glb": "model/gltf-binary", ".gltf": "model/gltf+json", ".bin": "application/octet-stream",
+    ".webp": "image/webp", ".ktx2": "image/ktx2", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 }
 STATIC_EXACT = {"/index.html": "index.html", "/app.js": "app.js", "/style.css": "style.css"}
 STATIC_PREFIXES = ("/vendor/", "/img/", "/js/")
@@ -595,6 +640,259 @@ class RouteCache:
                 "schedule": e["schedule"], "fetched": e["wall"]}
 
 
+# --- 3D view: caches and game connections ----------------------------------------------------------
+
+def gzip_bytes(body):
+    return gzip.compress(body, 6, mtime=0)
+
+
+class Entry:
+    """A cached reply: JSON bytes (with "ok"), their gzip form (None when not worth it), the ETag (content without
+    t_us and rev, so a refetch of an unchanged chunk keeps it), the map gen it was made at and the cells it covers."""
+    __slots__ = ("body", "gz", "etag", "rev", "checked", "cells", "at", "size")
+
+    def __init__(self, reply, prefix, cells=(), etag=True):
+        reply.pop("rid", None)
+        reply["ok"] = True
+        self.body = utf8(json_dumps(reply))
+        gz = gzip_bytes(self.body) if len(self.body) >= GZIP_MIN else None
+        self.gz = gz if gz is not None and len(gz) < len(self.body) else None
+        self.etag = None
+        if etag:
+            content = {k: v for k, v in reply.items() if k not in ("t_us", "rev", "ok")}
+            self.etag = '"%s-%s"' % (prefix, hashlib.sha1(utf8(json_dumps(content))).hexdigest()[:24])
+        rev = reply.get("rev")
+        self.rev = rev if type(rev) is int else None
+        self.checked = self.rev  # map gen up to which the entry is known to be unchanged
+        self.cells = tuple(cells)
+        self.at = time.monotonic()
+        self.size = len(self.body) + len(self.gz or b"")
+
+
+class Flight:
+    """One game request that concurrent requests for the same key wait for. check: the cached entry to verify
+    (map_changes since=<its checked gen>) before fetching it again, or None."""
+    __slots__ = ("done", "result", "epoch", "check")
+
+    def __init__(self, epoch, check=None):
+        self.done = threading.Event()
+        self.result = None
+        self.epoch = epoch
+        self.check = check
+
+
+class Store3D:
+    """Replies of the 3D commands by key (LRU up to max_bytes) with single flight: requests for a key that is not
+    cached share one game request. map_changes tells which cells changed in a window (since, gen] of map gens, not
+    when: an entry made (or last checked) before `since` whose cell is reported is stale (with `grace`: only once it is
+    that many seconds old), one made within the window is checked (one light map_changes since=<its gen>) by the poller
+    at once or at its next request. Entries also expire after `max_age` seconds and with reset() (another world, a
+    reconnect, a full map change)."""
+
+    def __init__(self, max_bytes, max_age=None, grace=0.0):
+        self.lock = threading.Lock()
+        self.max_bytes, self.max_age, self.grace = max_bytes, max_age, grace
+        self.entries = collections.OrderedDict()
+        self.bytes = 0
+        self.epoch = 0
+        self.cell_gen = {}        # (cx, cy) of a CELL x CELL cell -> (since, gen) of its last reported change
+        self.first_rev = None     # smallest rev of an entry since the last reset (map_changes since=)
+        self.flights = {}
+        self.requested = None     # time.monotonic() of the last request (the bridge follows the map changes)
+
+    def reset(self):
+        with self.lock:
+            self.epoch += 1
+            self.entries.clear()
+            self.bytes = 0
+            self.cell_gen.clear()
+            self.first_rev = None
+            self.flights.clear()
+
+    def changed(self, since, gen, cells, exact=None):
+        """map_changes reported `cells` for (since, gen]. exact: {g: cells changed after g} for the entries checked up
+        to a gen g within that window (see ambiguous()): those whose cells did not change after g stay valid."""
+        with self.lock:
+            for c in cells:
+                self.cell_gen[(c[0], c[1])] = (since, gen)
+            if exact:
+                for e in self.entries.values():
+                    later = exact.get(e.checked)
+                    if later is not None and later.isdisjoint(e.cells):
+                        e.checked = max(e.checked, gen)
+
+    def confirm(self, e, gen, later):
+        """Result of the check of an entry: `later` = cells changed after e.checked up to gen. True if still valid."""
+        with self.lock:
+            if not later.isdisjoint(e.cells):
+                return False
+            e.checked = max(e.checked, gen)
+            return True
+
+    def ambiguous(self, since, gen, cells):
+        """the gens up to which entries are known unchanged that lie in (since, gen) while a cell of them is reported:
+        the reported change may or may not postdate them"""
+        cells = set(cells)
+        with self.lock:
+            return {e.checked for e in self.entries.values() if e.rev is not None and since < e.checked < gen
+                    and not cells.isdisjoint(e.cells)}
+
+    def note_request(self):
+        """True for the first request since the bridge stopped following the map changes."""
+        now = time.monotonic()
+        with self.lock:
+            first = self.requested is None or now - self.requested > MAP_FOLLOW
+            self.requested = now
+            return first
+
+    def following(self):
+        with self.lock:
+            return self.requested is not None and time.monotonic() - self.requested <= MAP_FOLLOW
+
+    def since_gen(self):
+        with self.lock:
+            return self.first_rev
+
+    def _state_locked(self, e, now):
+        """"hit", "check" (a reported change may predate the entry) or "stale"."""
+        if self.max_age is not None and now - e.at > self.max_age:
+            return "stale"
+        state = "hit"
+        if e.rev is not None and self.cell_gen:
+            for c in e.cells:
+                since, gen = self.cell_gen.get(c, (0, -1))
+                if gen > e.checked:
+                    if since >= e.checked:  # changed after the entry for sure
+                        return "hit" if now - e.at < self.grace else "stale"
+                    state = "check"
+        return "hit" if state == "check" and now - e.at < self.grace else state
+
+    def acquire(self, key):
+        """("hit", entry), ("wait", flight) while another request fetches or checks the key, or ("own", flight): the
+        caller checks flight.check (if set) or fetches the key, and calls finish()."""
+        now = time.monotonic()
+        with self.lock:
+            e = self.entries.get(key)
+            state = self._state_locked(e, now) if e is not None else "stale"
+            if state == "hit":
+                self.entries.move_to_end(key)
+                return "hit", e
+            f = self.flights.get(key)
+            if f is not None:
+                return "wait", f
+            f = self.flights[key] = Flight(self.epoch, e if state == "check" else None)
+            return "own", f
+
+    def finish(self, key, flight, result, entry=None):
+        with self.lock:
+            if entry is not None and flight.epoch == self.epoch:
+                old = self.entries.pop(key, None)
+                if old is not None:
+                    self.bytes -= old.size
+                self.entries[key] = entry
+                self.bytes += entry.size
+                if entry.rev is not None and (self.first_rev is None or entry.rev < self.first_rev):
+                    self.first_rev = entry.rev
+                while self.bytes > self.max_bytes and len(self.entries) > 1:
+                    _, dropped = self.entries.popitem(last=False)
+                    self.bytes -= dropped.size
+            if self.flights.get(key) is flight:
+                del self.flights[key]
+        flight.result = result
+        flight.done.set()
+
+
+class EngineWorker(threading.Thread):
+    """A game connection of its own with a FIFO of at most `depth` waiting requests, so that the heavy 3D requests
+    (the game answers at most one per frame) delay neither the poller nor the other browser requests. The
+    connection opens with the first request and closes after IDLE_3D seconds without one."""
+
+    def __init__(self, name, port, depth, idle=IDLE_3D):
+        super().__init__(name=name, daemon=True)
+        self.conn = EngineConnection(port, timeout=WAIT_3D)
+        self.depth = depth
+        self.idle = idle
+        self.cv = threading.Condition()
+        self.jobs = collections.deque()
+        self.stopped = False
+        self.last = time.monotonic()
+
+    def stop(self):
+        with self.cv:
+            self.stopped = True
+            self.cv.notify_all()
+        self.conn.close()
+
+    def submit(self, command, args, timeout=WAIT_3D):
+        """(HTTP status, reply dict): 200/400 as the game answered, 502 unreachable, 503 queue full or no answer
+        in time."""
+        job = {"command": command, "args": args, "done": threading.Event(), "result": None, "cancelled": False}
+        with self.cv:
+            if self.stopped:
+                return 503, {"ok": False, "error": "the bridge is stopping"}
+            if len(self.jobs) >= self.depth:
+                return 503, {"ok": False, "error": "too many 3D requests are waiting for the game, retry later"}
+            self.jobs.append(job)
+            self.cv.notify()
+        if not job["done"].wait(timeout):
+            job["cancelled"] = True
+            return 503, {"ok": False, "error": "the game did not answer the 3D request in time"}
+        return job["result"]
+
+    def run(self):
+        while True:
+            with self.cv:
+                while not self.jobs and not self.stopped:
+                    if self.conn.file is not None and time.monotonic() - self.last > self.idle:
+                        self.conn.close()
+                    self.cv.wait(min(self.idle, 30.0))
+                if self.stopped:
+                    return
+                job = self.jobs.popleft()
+            if job["cancelled"]:
+                continue
+            try:
+                reply = self.conn.call(job["command"], **job["args"])
+                result = ((200 if reply.get("ok") else 400), reply)
+            except Unreachable as e:
+                result = (502, {"ok": False, "error": str(e)})
+            except Exception:
+                log.exception("%s: request failed", self.name)
+                self.conn.close()
+                result = (500, {"ok": False, "error": "internal error"})
+            self.last = time.monotonic()
+            job["result"] = result
+            job["done"].set()
+
+
+class GzipCache:
+    """gzip forms of static files by (path, mtime, size), b"" when compressing does not pay; LRU up to max_bytes."""
+
+    def __init__(self, max_bytes=GZIP_CACHE_BYTES):
+        self.lock = threading.Lock()
+        self.max_bytes = max_bytes
+        self.entries = collections.OrderedDict()
+        self.bytes = 0
+
+    def get(self, key):
+        with self.lock:
+            gz = self.entries.get(key)
+            if gz is not None:
+                self.entries.move_to_end(key)
+            return gz
+
+    def put(self, key, gz):
+        with self.lock:
+            old = self.entries.pop(key, None)
+            if old is not None:
+                self.bytes -= len(old)
+            self.entries[key] = gz
+            self.bytes += len(gz)
+            while self.bytes > self.max_bytes and len(self.entries) > 1:
+                _, dropped = self.entries.popitem(last=False)
+                self.bytes -= len(dropped)
+
+
 # --- shared state + SSE fan-out --------------------------------------------------------------
 
 class SseClient:
@@ -631,7 +929,38 @@ class Hub:
         self.tiles = TileCache()
         self.routes = RouteCache()
         self.map_export = None        # the game has palette/minimap/map_changes (None: not known yet)
+        self.scenes = Store3D(SCENE_CACHE_BYTES)
+        self.heights = Store3D(HEIGHTS_CACHE_BYTES, grace=HEIGHTS_REFRESH)
+        self.descs = Store3D(DESC_CACHE_BYTES)
+        self.vehicles = Store3D(VEH_CACHE_BYTES, max_age=VEH_CACHE)
         self._clear_locked()
+
+    # -- map changes: the tiles and the 3D caches share the poller's map_changes (chunk=CELL)
+
+    def map_following(self):
+        return self.tiles.following() or self.scenes.following()
+
+    def map_since(self):
+        gens = [g for g in (self.tiles.since_gen(), self.scenes.since_gen(), self.heights.since_gen()) if g is not None]
+        return min(gens) if gens else None
+
+    def map_changed(self, since, gen, cells, exact=None):
+        per = CHUNK // CELL
+        self.tiles.changed(gen, [[x, y] for x, y in sorted({(c[0] // per, c[1] // per) for c in cells})])
+        self.scenes.changed(since, gen, cells, exact)
+        self.heights.changed(since, gen, cells, exact)
+
+    def ambiguous_revs(self, since, gen, cells):
+        return self.scenes.ambiguous(since, gen, cells) | self.heights.ambiguous(since, gen, cells)
+
+    def map_reset(self):
+        self.tiles.reset()
+        self.scenes.reset()
+        self.heights.reset()
+
+    def reset_3d(self):
+        for store in (self.scenes, self.heights, self.descs, self.vehicles):
+            store.reset()
 
     def _clear_locked(self):
         self.routes.clear()
@@ -1036,7 +1365,7 @@ class Poller(threading.Thread):
 
     def reset_state(self):
         self.caps = {"poll": None, "positions": None, "since": None, "map_export": None, "goods": None,
-                     "supply_chain": None}
+                     "supply_chain": None, "3d": None}
         self.hub.map_export = None
         self.map_gen = None   # map gen of the last map_changes (None: not following the map yet)
         self.rev_map = None   # poll.rev.map seen last
@@ -1179,6 +1508,7 @@ class Poller(threading.Thread):
         """Fetch every feed without publishing, then publish one snapshot."""
         self.hub.clear()
         self.hub.tiles.reset()  # the browsers load all tiles again after the snapshot
+        self.hub.reset_3d()
         self.map_gen = None
         self.fallback_keys = []
         self.world = None
@@ -1190,6 +1520,7 @@ class Poller(threading.Thread):
         self.hub.update_feed("poll", poll, publish=False, fetched_at=t0)
         for task in self.TASKS[1:]:
             self.run_task(task, publish=False)
+        self.probe_3d()
         self.need_full = False
         self.hub.set_game(True, None, sorted(self.missing))
         self.hub.publish_snapshot()
@@ -1293,7 +1624,7 @@ class Poller(threading.Thread):
         rev = (poll.get("rev") or {}).get("map")
         if rev != self.rev_map:
             self.rev_map = rev
-            if self.caps["map_export"] and rev != self.map_gen and self.hub.tiles.following():
+            if self.caps["map_export"] and rev != self.map_gen and self.hub.map_following():
                 self.trigger("map")
         seq, known = self.poll_msg_seq, self.hub.known_msg_seq()
         behind = seq is not None and seq != known
@@ -1341,15 +1672,16 @@ class Poller(threading.Thread):
         self.hub.update_feed("palette", reply, publish)
 
     def task_map(self):
-        """Follow the map changes (only while browsers request tiles) and tell the browsers which
-        chunks to load again: SSE map_changes {gen, full, chunks, world_gen}."""
-        tiles = self.hub.tiles
-        if not self.caps["map_export"] or not tiles.following():
+        """Follow the map changes (only while browsers request tiles or 3D chunks) in cells of CELL x CELL squares,
+        update the caches and tell the browsers what to load again: SSE map_changes {gen, full, chunks (CHUNK x
+        CHUNK, the tiles), cells (CELL x CELL, the scene3d chunks), world_gen}."""
+        hub = self.hub
+        if not self.caps["map_export"] or not hub.map_following():
             return
-        since = self.map_gen if self.map_gen is not None else tiles.since_gen()
+        since = self.map_gen if self.map_gen is not None else hub.map_since()
         if since is None:
-            return  # no tile fetched since the last reset: nothing to compare with
-        reply = self.call("map_changes", since=since, chunk=CHUNK)
+            return  # nothing fetched since the last reset: nothing to compare with
+        reply = self.call("map_changes", since=since, chunk=CELL)
         if not reply["ok"]:
             self.log_once("map_changes", reply["error"])
             return
@@ -1357,16 +1689,52 @@ class Poller(threading.Thread):
         if not isinstance(gen, int):
             return
         full = bool(reply.get("full"))
-        chunks = [c for c in reply.get("chunks") or () if isinstance(c, list) and len(c) == 2]
+        size = reply.get("chunk") if reply.get("chunk") in (CELL, 128, 256, 512, 1024, 2048, 4096) else CELL
+        per = size // CELL
+        cells = set()
+        for c in reply.get("chunks") or ():
+            if isinstance(c, list) and len(c) == 2 and all(type(v) is int and 0 <= v < 65536 for v in c):
+                cells.update((c[0] * per + i, c[1] * per + j) for i in range(per) for j in range(per))
         self.map_gen = gen
         if full:
-            tiles.reset()
-        elif chunks:
-            tiles.changed(gen, chunks)
+            hub.map_reset()
+        elif cells:
+            hub.map_changed(since, gen, cells, self.exact_changes(since, gen, cells))
         else:
             return
-        self.hub.publish("map_changes", {"gen": gen, "full": full, "chunks": [] if full else chunks,
-                                         "world_gen": reply.get("world_gen")})
+        cells = sorted(cells)
+        chunks = sorted({(x // (CHUNK // CELL), y // (CHUNK // CELL)) for x, y in cells})
+        hub.publish("map_changes", {"gen": gen, "full": full, "chunks": [] if full else [list(c) for c in chunks],
+                                    "cells": [] if full else [list(c) for c in cells],
+                                    "world_gen": reply.get("world_gen")})
+
+    def exact_changes(self, since, gen, cells):
+        """{g: cells changed after g} for the cached 3D replies made (or last checked, at g) between since and gen whose
+        cells were reported: the change may predate them. Typical after the start of the game's change tracking, which
+        reports every cell once while it takes its colours (some 250 on the NYC map within 0.3 s). One light
+        map_changes per g, pipelined; beyond VERIFY_REVS the entries are checked at their next request instead."""
+        revs = sorted(self.hub.ambiguous_revs(since, gen, cells))
+        if not revs or len(revs) > VERIFY_REVS:
+            return None
+        replies = self.conn.call_many([("map_changes", {"since": r, "chunk": CELL}) for r in revs])
+        if self.conn.generation != self.conn_generation:
+            raise Reconnected()
+        exact = {}
+        for r, reply in zip(revs, replies):
+            if reply.get("ok") and not reply.get("full") and reply.get("chunk") == CELL:
+                exact[r] = {(c[0], c[1]) for c in reply.get("chunks") or () if isinstance(c, list) and len(c) == 2}
+        return exact
+
+    def probe_3d(self):
+        """Whether the game has the 3D export (once per connection): a vehicles3d of one square is cheap."""
+        if self.caps["3d"] is not None:
+            return
+        reply = self.call("vehicles3d", x1=0, y1=0, x2=0, y2=0)
+        if is_unknown_command(reply):
+            self.caps["3d"] = False
+            self.add_missing("3d", "no 3D view")
+        else:
+            self.caps["3d"] = True
 
     def task_detail_feed(self, cmd, publish):
         """goods (once per world, then rarely) and supply_chain (every minute and at a new month): the
@@ -1714,13 +2082,14 @@ class Subscriber(threading.Thread):
 # --- sessions and rate limits ----------------------------------------------------------------
 
 class Session:
-    __slots__ = ("sid", "role", "created", "last_seen", "tokens", "stamp", "tile_tokens", "tile_stamp")
+    __slots__ = ("sid", "role", "created", "last_seen", "tokens", "stamp", "tile_tokens", "tile_stamp", "buckets")
 
     def __init__(self, sid, role):
         now = time.monotonic()
         self.sid, self.role, self.created, self.last_seen = sid, role, now, now
         self.tokens, self.stamp = RATE_BURST, now
         self.tile_tokens, self.tile_stamp = TILE_BURST, now
+        self.buckets = {}  # name of a VIEW3D_RATES bucket -> (tokens, stamp)
 
 
 class Sessions:
@@ -1785,6 +2154,17 @@ class Sessions:
                 return False
             s.tile_tokens -= 1
             return True
+
+    def allow_3d(self, s, name):
+        """Own token bucket of a 3D endpoint (VIEW3D_RATES: requests per second, burst)."""
+        rate, burst = VIEW3D_RATES[name]
+        now = time.monotonic()
+        with self.lock:
+            tokens, stamp = s.buckets.get(name, (burst, now))
+            tokens = min(burst, tokens + (now - stamp) * rate)
+            ok = tokens >= 1
+            s.buckets[name] = (tokens - 1 if ok else tokens, now)
+            return ok
 
 
 class TimeBudget:
@@ -1903,7 +2283,8 @@ LOGIN_ERRORS = {
 class App:
     def __init__(self, port, game_port, bind, allowed_hosts, tokens, intervals, min_gap, heartbeat, verbose,
                  event_intervals=None, events=True, event_interval_ms=EVENT_INTERVAL_MS, arrivals_gap=ARRIVALS_GAP,
-                 route_refresh=ROUTE_REFRESH, status_ttl=FACTORY_STATUS_TTL):
+                 route_refresh=ROUTE_REFRESH, status_ttl=FACTORY_STATUS_TTL, pak3d=None, queue_3d=QUEUE_3D,
+                 queue_veh=QUEUE_VEH):
         self.port = port
         self.game_port = game_port
         self.tokens = tokens  # [(role, token)]
@@ -1924,6 +2305,11 @@ class App:
         self.status_lock = threading.Lock()
         self.status_cache = None  # {"stamp", "at", "reply"} of GET /api/factory_status
         self.status_ttl = status_ttl
+        # 3D: heavy requests (desc_list, scene3d, heights) and vehicles3d on two game connections of their own
+        self.worker_3d = EngineWorker("game-3d", game_port, queue_3d)
+        self.worker_veh = EngineWorker("game-vehicles3d", game_port, queue_veh)
+        self.pak3d = os.path.normcase(os.path.realpath(pak3d)) if pak3d else None
+        self.gzip_cache = GzipCache()
         self.web_dir = os.path.normcase(os.path.realpath(WEB_DIR))
         hosts = {"127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port}
         if bind not in ("", "0.0.0.0", "::"):
@@ -2095,6 +2481,110 @@ class App:
         finally:
             tiles.end(key)
 
+    # -- 3D view
+
+    def fetch3d(self, store, key, worker, command, args, prefix, cells=(), etag=True):
+        """(200, Entry) from the cache or the game (one game request for concurrent requests of a key), else
+        (HTTP status, error reply)."""
+        if self.poller.caps.get("3d") is False:
+            return 501, UNSUPPORTED_3D
+        state, flight = store.acquire(key)
+        if state == "hit":
+            return 200, flight
+        if state == "wait":
+            if not flight.done.wait(WAIT_3D + 5) or flight.result is None:
+                return 503, {"ok": False, "error": "the game did not answer the 3D request in time"}
+            return flight.result
+        result, entry = (500, {"ok": False, "error": "internal error"}), None
+        try:
+            if flight.check is not None and self.check_entry(store, worker, flight.check):
+                result = (200, flight.check)
+                return result
+            code, reply = worker.submit(command, args)
+            if code == 200:
+                entry = Entry(reply, prefix, cells, etag)
+                result = (200, entry)
+            elif is_unknown_command(reply):
+                result = (501, UNSUPPORTED_3D)
+            else:
+                result = (code, reply)
+        finally:
+            store.finish(key, flight, result, entry)
+        return result
+
+    @staticmethod
+    def check_entry(store, worker, e):
+        """A cached reply whose cells were reported in a window that contains its rev: still valid if none of them
+        changed after it (one light map_changes on the same connection instead of fetching it again)."""
+        code, reply = worker.submit("map_changes", {"since": e.checked, "chunk": CELL})
+        if code != 200 or reply.get("full") or reply.get("chunk") != CELL or type(reply.get("gen")) is not int:
+            return False
+        later = {(c[0], c[1]) for c in reply.get("chunks") or () if isinstance(c, list) and len(c) == 2}
+        return store.confirm(e, reply["gen"], later)
+
+    def follow_3d(self):
+        """A chunk or heights request: the poller follows the map changes (again)."""
+        if self.hub.scenes.note_request():
+            # not followed until now, changes may have been missed
+            self.hub.scenes.reset()
+            self.hub.heights.reset()
+            self.poller.request("map")
+
+    NOT_READY = (503, {"ok": False, "error": "the game is not ready"})
+
+    def desc_list(self, kinds):
+        """kinds: None (all lists) or the validated comma separated list."""
+        if kinds is not None:
+            given = kinds.split(",")
+            if any(k not in DESC_KINDS for k in given) or len(set(given)) != len(given):
+                return 400, {"ok": False, "error": "kinds must be a comma separated list of " + ",".join(DESC_KINDS)}
+            kinds = ",".join(k for k in DESC_KINDS if k in given)
+        return self.fetch3d(self.hub.descs, kinds or "", self.worker_3d, "desc_list",
+                            {"kinds": kinds} if kinds else {}, "dl")
+
+    def scene3d(self, cx, cy, size):
+        world = self.hub.world_size()
+        if world is None:
+            return self.NOT_READY
+        if cx * size >= world[0] or cy * size >= world[1]:
+            return 404, {"ok": False, "error": "chunk is outside of the map"}
+        self.follow_3d()
+        cell = (cx * size // CELL, cy * size // CELL)
+        return self.fetch3d(self.hub.scenes, (cx, cy, size), self.worker_3d, "scene3d",
+                            {"cx": cx, "cy": cy, "size": size}, "s3", (cell,))
+
+    def heights(self, step, region):
+        world = self.hub.world_size()
+        if world is None:
+            return self.NOT_READY
+        x1, y1, x2, y2 = region or (0, 0, world[0] - 1, world[1] - 1)
+        if x1 >= world[0] or y1 >= world[1]:
+            return 400, {"ok": False, "error": "region is outside of the map"}
+        x2, y2 = min(x2, world[0] - 1), min(y2, world[1] - 1)
+        if (-(-(x2 - x1 + 1) // step) + 1) * (-(-(y2 - y1 + 1) // step) + 1) > MAX_HEIGHT_SAMPLES:
+            return 400, {"ok": False, "error": "too many samples (at most %d per request): use a larger step or a "
+                                               "smaller region" % MAX_HEIGHT_SAMPLES}
+        self.follow_3d()
+        # the samples of the east and south edge are corners of the next squares
+        ex, ey = min(x2 + 1, world[0] - 1), min(y2 + 1, world[1] - 1)
+        cells = [(cx, cy) for cy in range(y1 // CELL, ey // CELL + 1) for cx in range(x1 // CELL, ex // CELL + 1)]
+        return self.fetch3d(self.hub.heights, (step, x1, y1, x2, y2), self.worker_3d, "heights",
+                            {"step": step, "x1": x1, "y1": y1, "x2": x2, "y2": y2}, "h3", cells)
+
+    def vehicles3d(self, region, extras):
+        world = self.hub.world_size()
+        if world is None:
+            return self.NOT_READY
+        x1, y1, x2, y2 = region
+        if x1 >= world[0] or y1 >= world[1]:
+            return 400, {"ok": False, "error": "region is outside of the map"}
+        x2, y2 = min(x2, world[0] - 1), min(y2, world[1] - 1)
+        args = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+        if extras:
+            args["extras"] = 1
+        return self.fetch3d(self.hub.vehicles, (x1, y1, x2, y2, extras), self.worker_veh, "vehicles3d", args, "v3",
+                            etag=False)
+
 
 def check_args(pairs):
     """dict of validated request arguments, or an error text."""
@@ -2132,6 +2622,52 @@ def check_map_region(args):
     if as_int(args.get("max_size"), 0) > 512:
         return "max_size must be at most 512"
     return None
+
+
+VIEW3D_ARGS = {"desc_list": ("kinds",), "scene3d": ("cx", "cy", "size"), "heights": ("step", "x1", "y1", "x2", "y2"),
+               "vehicles3d": ("x1", "y1", "x2", "y2", "extras")}
+
+
+def view3d_args(name, args):
+    """Validated arguments of a 3D request (dict, numbers as int), or an error text."""
+    out = {}
+    for k, v in args.items():
+        if k not in VIEW3D_ARGS[name]:
+            return "unknown argument: %s" % k
+        if k == "kinds":
+            if not v:
+                return "kinds must not be empty"
+            out[k] = v
+        elif not INT_ARG.match(v):
+            return "%s must be an integer" % k
+        else:
+            out[k] = int(v)
+    if name == "scene3d":
+        if "cx" not in out or "cy" not in out:
+            return "missing chunk coordinates cx,cy"
+        if out["cx"] < 0 or out["cy"] < 0:
+            return "chunk is outside of the map"
+        out.setdefault("size", 64)
+        if out["size"] not in SCENE_SIZES:
+            return "size must be 16, 32 or 64"
+    if name == "heights" and out.get("step") not in HEIGHTS_STEPS:
+        return "step must be 1, 2, 4, 8 or 16"
+    if name in ("heights", "vehicles3d"):
+        given = [k for k in ("x1", "y1", "x2", "y2") if k in out]
+        if given and len(given) != 4 or name == "vehicles3d" and not given:
+            return "the region needs all of x1, y1, x2, y2"
+        if given:
+            if min(out[k] for k in given) < 0:
+                return "region is outside of the map"
+            if out["x1"] > out["x2"] or out["y1"] > out["y2"]:
+                return "the region needs x1 <= x2 and y1 <= y2"
+            out["region"] = (out["x1"], out["y1"], out["x2"], out["y2"])
+    if name == "vehicles3d":
+        if out["x2"] - out["x1"] >= VEH_MAX_SIDE or out["y2"] - out["y1"] >= VEH_MAX_SIDE:
+            return "region too large (at most %d x %d squares)" % (VEH_MAX_SIDE, VEH_MAX_SIDE)
+        if out.get("extras", 0) not in (0, 1):
+            return "extras must be 0 or 1"
+    return out
 
 
 def general_tool_number(value):
@@ -2229,7 +2765,73 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def send_json(self, code, obj, headers=()):
-        self.send_bytes(code, utf8(json_dumps(obj)), "application/json; charset=utf-8", headers=headers)
+        self.send_body(code, utf8(json_dumps(obj)), "application/json; charset=utf-8", headers=headers)
+
+    def accepts_gzip(self):
+        star = False
+        for header in self.headers.get_all("Accept-Encoding") or ():
+            for part in header.split(","):
+                token, _, params = part.partition(";")
+                token = token.strip().lower()
+                q = 1.0
+                for p in params.split(";"):
+                    k, _, v = p.partition("=")
+                    if k.strip().lower() == "q":
+                        try:
+                            q = float(v)
+                        except ValueError:
+                            q = 0.0
+                if token in ("gzip", "x-gzip"):
+                    return q > 0
+                if token == "*":
+                    star = q > 0
+        return star
+
+    def etag_matches(self, etag):
+        """If-None-Match against an ETag ('"tag"'; the gzip form is sent as '"tag-gz"'), weak comparison."""
+        header = self.headers.get("If-None-Match")
+        if not header:
+            return False
+        base = etag[1:-1]
+        for t in header.split(","):
+            t = t.strip()
+            if t == "*":
+                return True
+            if t.startswith("W/"):
+                t = t[2:]
+            if len(t) >= 2 and t[0] == t[-1] == '"' and t[1:-1] in (base, base + "-gz"):
+                return True
+        return False
+
+    def send_not_modified(self, cache, headers=()):
+        self.send_response(304)
+        for k, v in headers:
+            if k in ("ETag", "Vary"):
+                self.send_header(k, v)
+        self.send_header("Cache-Control", cache)
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        self.end_headers()
+
+    def send_body(self, code, body, ctype, cache="no-store", headers=(), gz=None, compress=True, etag=None):
+        """send_bytes, gzip compressed for browsers that accept it (gz: the known gzip form; compress: make one for
+        bodies of at least GZIP_MIN bytes), and with an ETag 304 for a matching If-None-Match."""
+        headers = list(headers)
+        may = gz is not None or (compress and len(body) >= GZIP_MIN)
+        if may:
+            headers.append(("Vary", "Accept-Encoding"))
+        use_gz = may and self.accepts_gzip()
+        if etag:
+            headers.append(("ETag", etag[:-1] + '-gz"' if use_gz else etag))
+            if code == 200 and self.etag_matches(etag):
+                return self.send_not_modified(cache, headers)
+        if use_gz:
+            if gz is None:
+                gz = gzip_bytes(body)
+            if len(gz) < len(body):
+                headers.append(("Content-Encoding", "gzip"))
+                body = gz
+        self.send_bytes(code, body, ctype, cache, headers)
 
     def send_err(self, code, error, headers=()):
         self.send_json(code, {"ok": False, "error": error}, headers)
@@ -2378,15 +2980,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_bytes(200, utf8(LOGIN_CSS), "text/css; charset=utf-8")
         if path == "/favicon.ico":
             return self.send_text(404, "not found")
-        if path.startswith(("/api/", "/tiles/")) and not self.same_origin():
+        if path.startswith(("/api/", "/tiles/", "/pak3d/")) and not self.same_origin():
             return self.send_err(403, "cross-site request")
         sess = self.session()
         if path.startswith("/api/"):
             if sess is None:
                 return self.send_err(401, "not signed in")
-            if not self.app.sessions.allow(sess):
-                return self.send_err(429, "rate limit", [("Retry-After", "1")])
             name = path[5:]
+            if not (self.app.sessions.allow_3d(sess, name) if name in VIEW3D_RATES else self.app.sessions.allow(sess)):
+                return self.send_err(429, "rate limit", [("Retry-After", "1")])
             if name == "session":
                 return self.api_session(sess)
             if name == "events":
@@ -2396,6 +2998,10 @@ class Handler(BaseHTTPRequestHandler):
             if sess is None:
                 return self.send_err(401, "not signed in")
             return self.map_tile(sess, path)
+        if path.startswith("/pak3d/"):
+            if sess is None:
+                return self.send_text(401, "not signed in")
+            return self.pak3d(path)
         if sess is None:
             return self.send_text(401, "not signed in")
         return self.static(path)
@@ -2455,19 +3061,24 @@ class Handler(BaseHTTPRequestHandler):
         game = self.app.hub.game_state()
         self.send_json(200, {
             "role": sess.role,
-            "allowed": {"read": list(READ_COMMANDS) + list(BRIDGE_READS), "action": list(ROLE_ACTIONS[sess.role])},
+            "allowed": {"read": list(READ_COMMANDS) + list(BRIDGE_READS) + list(VIEW3D_READS),
+                        "action": list(ROLE_ACTIONS[sess.role])},
             "game": {"connected": game["connected"], "missing": game["missing"], "events": game["events"]},
             "bridge": {"version": VERSION, "game_port": self.app.game_port},
+            # supported: the game has the 3D export (null: not known yet); pak3d: /pak3d/ serves a directory
+            "view3d": {"supported": self.app.poller.caps.get("3d"), "pak3d": self.app.pak3d is not None},
         })
 
     def api_read(self, name, query):
-        if name not in READ_COMMANDS and name not in BRIDGE_READS:
+        if name not in READ_COMMANDS and name not in BRIDGE_READS and name not in VIEW3D_READS:
             return self.send_err(403, "command not allowed")
         if len(query) > 4096:
             return self.send_err(400, "query too long")
         args = check_args(urllib.parse.parse_qsl(query, keep_blank_values=True))
         if isinstance(args, str):
             return self.send_err(400, args)
+        if name in VIEW3D_READS:
+            return self.api_view3d(name, args)
         if name == "map":
             error = check_map_region(args)
             if error:
@@ -2480,6 +3091,27 @@ class Handler(BaseHTTPRequestHandler):
             code, reply = self.app.engine_request(name, args, is_heavy(name, args))
         headers = [("Retry-After", "1")] if code == 429 else ()
         self.send_json(code, reply, headers)
+
+    def api_view3d(self, name, args):
+        """GET /api/desc_list, scene3d, heights, vehicles3d: the game's reply unchanged (plus "ok"), from the caches
+        of the bridge; scene3d, heights and desc_list with an ETag (304), vehicles3d not cached by the browser."""
+        a = view3d_args(name, args)
+        if isinstance(a, str):
+            return self.send_err(400, a)
+        app = self.app
+        if name == "desc_list":
+            code, result = app.desc_list(a.get("kinds"))
+        elif name == "scene3d":
+            code, result = app.scene3d(a["cx"], a["cy"], a["size"])
+        elif name == "heights":
+            code, result = app.heights(a["step"], a.get("region"))
+        else:
+            code, result = app.vehicles3d(a["region"], a.get("extras", 0))
+        if code != 200:
+            return self.send_json(code, result, [("Retry-After", "1")] if code in (429, 503) else ())
+        cache = "no-store" if name == "vehicles3d" else "private, no-cache"
+        self.send_body(200, result.body, "application/json; charset=utf-8", cache, gz=result.gz, compress=False,
+                       etag=result.etag)
 
     def api_action(self, name, body):
         if name == "cash":
@@ -2639,14 +3271,86 @@ class Handler(BaseHTTPRequestHandler):
             inside = False
         if not inside or not os.path.isfile(full):
             return self.send_text(404, "not found")
+        ctype = MIME.get(os.path.splitext(full)[1], "application/octet-stream")
+        cached = rel.startswith(STATIC_CACHED)
+        self.send_file(full, ctype, "private, max-age=3600" if cached else "no-store", etag=cached)
+
+    def pak3d(self, path):
+        """GET /pak3d/<path>: a file of the --pak3d directory (only PAK3D_TYPES, no hidden names, no links out of
+        the directory), with an ETag; names with a content hash (name.<hex>.ext) may be cached for a year."""
+        root = self.app.pak3d
+        if root is None:
+            return self.send_text(404, "not found")
         try:
-            with open(full, "rb") as f:
-                body = f.read()
+            rel = urllib.parse.unquote(path[len("/pak3d/"):], errors="strict")
+        except UnicodeDecodeError:
+            return self.send_text(404, "not found")
+        parts = rel.split("/")
+        if (any(c in rel for c in "\\:\0") or any(p in ("", ".", "..") or p.startswith(".") for p in parts)
+                or os.path.splitext(rel)[1].lower() not in PAK3D_TYPES):
+            return self.send_text(404, "not found")
+        full = os.path.normcase(os.path.realpath(os.path.join(root, *parts)))
+        try:
+            inside = os.path.commonpath([full, root]) == root and full != root
+        except ValueError:
+            inside = False
+        # a link may point to another file of the directory, not out of it nor to a hidden one (e.g. in .git)
+        if (not inside or any(p.startswith(".") for p in os.path.relpath(full, root).split(os.sep))
+                or os.path.splitext(full)[1].lower() not in PAK3D_TYPES or not os.path.isfile(full)):
+            return self.send_text(404, "not found")
+        cache = "private, max-age=31536000, immutable" if HASHED_NAME.search(parts[-1]) else "private, no-cache"
+        self.send_file(full, MIME[os.path.splitext(full)[1].lower()], cache, etag=True)
+
+    def send_file(self, full, ctype, cache, etag=False):
+        """A static file: gzip compressed (cached in memory by path, mtime and size) for browsers that accept it
+        when its type is COMPRESSIBLE; with etag an ETag of mtime and size and 304 for a matching If-None-Match."""
+        try:
+            f = open(full, "rb")
         except OSError:
             return self.send_text(404, "not found")
-        ctype = MIME.get(os.path.splitext(full)[1], "application/octet-stream")
-        cache = "private, max-age=3600" if rel.startswith(STATIC_CACHED) else "no-store"
-        self.send_bytes(200, body, ctype, cache)
+        with f:
+            st = os.fstat(f.fileno())
+            may = os.path.splitext(full)[1].lower() in COMPRESSIBLE and GZIP_MIN <= st.st_size <= STATIC_MAX
+            headers = [("Vary", "Accept-Encoding")] if may else []
+            accepts = may and self.accepts_gzip()
+            key = (full, st.st_mtime_ns, st.st_size)
+            gz = self.app.gzip_cache.get(key) if accepts else None
+            tag = '"%x-%x"' % (st.st_mtime_ns, st.st_size) if etag else None
+            if tag and self.etag_matches(tag):
+                return self.send_not_modified(cache, headers + [("ETag", tag[:-1] + '-gz"' if accepts and gz != b""
+                                                                 else tag)])
+            if st.st_size > STATIC_MAX:
+                return self.stream_file(f, st.st_size, ctype, cache, headers + ([("ETag", tag)] if tag else []))
+            body = None if gz else f.read()  # with the gzip form cached the file need not be read
+        if accepts and gz is None:
+            gz = gzip_bytes(body)
+            if len(gz) > len(body) * 0.9:
+                gz = b""  # not worth it (e.g. a mesh that is compressed already)
+            self.app.gzip_cache.put(key, gz)
+        if gz:
+            if tag:
+                headers.append(("ETag", tag[:-1] + '-gz"'))
+            return self.send_bytes(200, gz, ctype, cache, headers + [("Content-Encoding", "gzip")])
+        if tag:
+            headers.append(("ETag", tag))
+        self.send_bytes(200, body, ctype, cache, headers)
+
+    def stream_file(self, f, size, ctype, cache, headers):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", cache)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        left = size
+        while left > 0:
+            data = f.read(min(1 << 20, left))
+            if not data:
+                self.close_connection = True  # the file became shorter: the length was wrong
+                break
+            self.wfile.write(data)
+            left -= len(data)
 
 
 class Server(ThreadingHTTPServer):
@@ -2730,6 +3434,9 @@ def parse_args(argv=None):
                    help="also create an admin token (adds the cash command)")
     p.add_argument("--no-events", action="store_true",
                    help="do not subscribe the events of the game (protocol 2), only poll")
+    p.add_argument("--pak3d", metavar="DIR", default=os.environ.get("SIMUTRANS_DASHBOARD_PAK3D") or None,
+                   help="directory of a pak 3D (models and textures of the 3D view) served under /pak3d/ "
+                        "(default: $SIMUTRANS_DASHBOARD_PAK3D, else none)")
     p.add_argument("--verbose", action="store_true", help="log every request")
     # hidden: short intervals and heartbeat for automated tests
     p.add_argument("--test-fast", action="store_true", help=argparse.SUPPRESS)
@@ -2754,9 +3461,15 @@ def main(argv=None):
         min_gap = {k: v * 0.2 for k, v in min_gap.items()}
         heartbeat = 2
         event_ms, arrivals_gap = 250, 0.25
+    pak3d = args.pak3d
+    if pak3d and not os.path.isdir(pak3d):
+        # e.g. a volume that is not mounted: the dashboard works without models (the 3D view draws stand-ins)
+        log.warning("--pak3d %s is not a directory, /pak3d/ answers 404", pak3d)
+        pak3d = None
     app = App(args.port, args.game_port, args.bind, args.allowed_host, tokens, intervals, min_gap,
               heartbeat, args.verbose, event_intervals, not args.no_events, event_ms, arrivals_gap,
-              1.0 if args.test_fast else ROUTE_REFRESH, 1.0 if args.test_fast else FACTORY_STATUS_TTL)
+              1.0 if args.test_fast else ROUTE_REFRESH, 1.0 if args.test_fast else FACTORY_STATUS_TTL, pak3d,
+              8 if args.test_fast else QUEUE_3D, 4 if args.test_fast else QUEUE_VEH)
     if not os.path.isfile(os.path.join(WEB_DIR, "index.html")):
         log.warning("%s has no index.html", WEB_DIR)
     try:
@@ -2773,11 +3486,14 @@ def main(argv=None):
     app.poller.start()
     if app.subscriber:
         app.subscriber.start()
+    app.worker_3d.start()
+    app.worker_veh.start()
     if args.bind in ("127.0.0.1", "0.0.0.0", "::", "localhost"):
         host = "127.0.0.1"
     else:
         host = "[%s]" % args.bind if ":" in args.bind else args.bind
-    print("Simutrans dashboard %s on http://%s:%d/ (game port %d)" % (VERSION, host, args.port, args.game_port))
+    print("Simutrans dashboard %s on http://%s:%d/ (game port %d)%s" % (
+        VERSION, host, args.port, args.game_port, ", pak 3D %s" % pak3d if pak3d else ""))
     for role, token in tokens:
         print("  %-6s http://%s:%d/?token=%s" % (role, host, args.port, token))
     if args.bind not in ("127.0.0.1", "::1", "localhost"):
@@ -2791,6 +3507,8 @@ def main(argv=None):
         app.poller.stop()
         if app.subscriber:
             app.subscriber.stop()
+        app.worker_3d.stop()
+        app.worker_veh.stop()
         app.hub.close()
         end = time.monotonic() + 1.0  # let the event streams send their last chunk
         while app.hub.stream_count() and time.monotonic() < end:

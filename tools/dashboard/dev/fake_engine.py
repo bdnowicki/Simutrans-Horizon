@@ -22,6 +22,10 @@ convoys, arrivals and overflow. Test-only commands:
   fake_legs [shift=N]    the convoys of every line drive the next legs of their schedule (or leg N)
   fake_schedule          a schedule changed (poll.rev.schedules + 1)
   fake_event topic= data=  an event with any JSON data (e.g. of an unexpected shape)
+  fake_stats [reset=1]   how often desc_list, scene3d, heights and vehicles3d were asked (cache tests)
+  fake_time [month=1-12][&day=1][&hour=0-24]  jump to that time of the current year (next year when it would go
+                         back before the start; month event); scene3d season and snowline follow the game's
+                         formulas (winter snowline 3, summer 9)
 
 --markup puts HTML with script (<img onerror>, <svg onload>) into every name, message and label, so a
 test can check that the dashboard shows game strings as text.
@@ -36,13 +40,28 @@ goods, world_stats and factories links=1 describe a small world of 6 cities and 
 supply links (storage, histories and which links are active change every month); --old answers the
 lists only, without city ids and links.
 
-  python tools/dashboard/dev/fake_engine.py [--port 13399] [--old] [--no-events] [--no-map]
-         [--convoys 60] [--size 256x256] [--markup]
+The 3D export (desc_list, scene3d, heights, vehicles3d) answers in the block layouts of the game
+(tools/mcp/README.md "3D export") for the synthetic map: heights in 16 x 16 blocks, the river as water,
+the roads (also those of fake_build) as ways, trees, a few buildings, a stop building on the square of every
+station, a 2 x 2 factory building at every factory and a 2 x 2 town hall at every city (picking tests), the
+convoys with two cars each. The first four convoys of a world drive scripted routes in vehicles3d (smooth, from the
+game time): a train of 4 cars on a loop around squares 99-131 x 66-80 with a tunnel (squares 108-116 of its south
+side), a push-pull shuttle of 3 cars on squares 100-112 of row 90 that turns round at both ends (the cars are placed
+anew, as in the game), a bus with a trailer that leaves a depot at (104, 96), drives round a block and enters the
+depot again (then stays away for 1.5 s), and an aircraft circling (116, 74) at 5 levels; the fifth is a ship loading
+at the dock (a 2 x 1 Harbour on the river squares 88-89 of row 104, the ship on 89). A 2 x 2 FakeOffice stands on
+squares 127-128 x 127-128, over the corner of four chunks. City cars and pedestrians (extras=1) move along the roads.
+`tile` names the station of a square.
 
---old imitates an engine without poll, positions, messages since=, paging, events and the map
-export (limit=0 then returns nothing, like the engine before phase 0b). --no-events imitates an
+  python tools/dashboard/dev/fake_engine.py [--port 13399] [--old] [--no-events] [--no-map] [--no-3d]
+         [--convoys 60] [--size 256x256] [--markup] [--delay-3d S]
+
+--old imitates an engine without poll, positions, messages since=, paging, events, the map export and
+the 3D export (limit=0 then returns nothing, like the engine before phase 0b). --no-events imitates an
 engine with the phase 0b commands but only protocol 1. Both close the connection on HELLO
-simutrans-remote 2, as such engines do. --no-map leaves out only the map export.
+simutrans-remote 2, as such engines do. --no-map leaves out the map export (and the 3D export, which
+came later), --no-3d only the 3D export (like the engine before it). --delay-3d makes every 3D request
+take that many seconds more (tests of the queues and of the single flight of the bridge).
 """
 
 import argparse
@@ -50,6 +69,7 @@ import base64
 import json
 import random
 import socketserver
+import struct
 import threading
 import time
 import urllib.parse
@@ -78,6 +98,210 @@ HEIGHT_COLORS = [97, 99, 19, 21, 23, 160, 161, 162, 163, 164, 165, 166, 167, 176
 SEVERITY_COLORS = [106, 2, 85, 86, 29, 30, 171, 71, 39, 132]
 COL_ROAD = 208
 MAP_SEVERITY_MODES = ("traffic", "freight", "speed", "power", "level")
+# 3D export
+VIEW3D_COMMANDS = ("desc_list", "scene3d", "heights", "vehicles3d")
+DESC_KINDS = ["buildings", "vehicles", "ways", "bridges", "tunnels", "trees", "signs", "wayobjs", "goods", "citycars",
+              "pedestrians"]
+SCENE_LAYOUT = "x:u8,y:u8,z:i8,kind:u8,desc:i16,a:u16,b:u16,owner:i8"
+VEH_LAYOUT = ("cnv:u16,desc:i16,x:u16,y:u16,ox:i16,oy:i16,zoff:i16,speed:u16,flags:u16,idx:u8,kind:u8,z:i8,dir:u8,"
+              "steps:u8,steps_next:u8,nx:i8,ny:i8,nz:i8,owner:i8")
+COL_FMT = {"u8": "B", "i8": "b", "u16": "H", "i16": "h"}
+CLIMATE = 4  # temperate
+
+
+def pack_columns(rows, layout):
+    """rows -> the column block of the game: all values of a field, then the next field, little endian"""
+    out = []
+    for k, field in enumerate(layout.split(",")):
+        out.append(struct.pack("<%d%s" % (len(rows), COL_FMT[field.split(":")[1]]), *(r[k] for r in rows)))
+    return b"".join(out)
+
+
+def b64z(data, level=4):
+    return base64.b64encode(zlib.compress(bytes(data), level)).decode("ascii")
+
+
+def fake_descs():
+    """the catalogue of desc_list, every list sorted by name"""
+    def year(d):
+        return dict(d, intro=1900, retire=2999)
+    lists = {
+        "buildings": [year({"name": "FakeHouse", "type": "res", "size": [1, 1], "layouts": 1, "level": 1, "height": 1,
+                            "climates": 16, "waytype": None}),
+                      year({"name": "FakeOffice", "type": "com", "size": [2, 2], "layouts": 2, "level": 12, "height": 6,
+                            "climates": 16, "waytype": None}),
+                      year({"name": "FakeStop", "type": "stop", "size": [1, 1], "layouts": 2, "level": 1, "height": 1,
+                            "climates": 255, "waytype": "road", "enables": 3}),
+                      year({"name": "FakeTownhall", "type": "tow", "size": [2, 2], "layouts": 1, "level": 4, "height": 4,
+                            "climates": 255, "waytype": None}),
+                      year({"name": "FakeWorks", "type": "factory", "size": [2, 2], "layouts": 1, "level": 1, "height": 3,
+                            "climates": 255, "waytype": None}),
+                      year({"name": "Harbour", "type": "stop", "size": [2, 1], "layouts": 4, "level": 1, "height": 1,
+                            "climates": 255, "waytype": "water", "enables": 4})],
+        "vehicles": [year({"name": "Fake airliner", "waytype": "air", "length": 8, "freight": "Passagiere",
+                           "capacity": 150, "power": 8000, "speed": 800}),
+                     year({"name": "Fake bus", "waytype": "road", "length": 8, "freight": "Passagiere", "capacity": 40,
+                           "power": 150, "speed": 80}),
+                     year({"name": "Fake coach", "waytype": "track", "length": 8, "freight": "Passagiere",
+                           "capacity": 60, "power": 0, "speed": 160}),
+                     year({"name": "Fake loco", "waytype": "track", "length": 8, "freight": "None", "capacity": 0,
+                           "power": 2000, "speed": 160}),
+                     year({"name": "Mail trailer", "waytype": "road", "length": 6, "freight": "Post", "capacity": 20,
+                           "power": 0, "speed": 80}),
+                     year({"name": "Steamer", "waytype": "water", "length": 8, "freight": "Kohle", "capacity": 400,
+                           "power": 900, "speed": 30})],
+        "ways": [{"name": "fake_road", "waytype": "road", "system": "flat", "speed": 50},
+                 {"name": "fake_track", "waytype": "track", "system": "flat", "speed": 120},
+                 {"name": "powerline", "waytype": "powerline", "system": "flat", "speed": 0}],
+        "bridges": [{"name": "fake_bridge", "waytype": "road", "speed": 50, "pillars": 2}],
+        "tunnels": [{"name": "fake_tunnel", "waytype": "road", "speed": 50}],
+        "trees": [{"name": "Birch", "climates": 16}, {"name": "Oak", "climates": 16}, {"name": "Pine", "climates": 48}],
+        "signs": [{"name": "fake_oneway", "waytype": "road", "flags": 1, "traffic_light": False},
+                  {"name": "fake_signal", "waytype": "track", "flags": 8, "traffic_light": False}],
+        "wayobjs": [{"name": "fake_catenary", "waytype": "track", "speed": 160, "overhead": True}],
+        "goods": [{"name": g[1], "color": g[7], "catg": g[5]} for g in sorted(GOODS, key=lambda g: g[1].encode())],
+        "citycars": [year({"name": "FakeCar red", "speed": 60}), year({"name": "FakeVan", "speed": 50})],
+        "pedestrians": [year({"name": "FakeWalker"})],
+    }
+    for kind in DESC_KINDS:
+        lists[kind] = [dict({"i": i}, **d) for i, d in enumerate(lists[kind])]
+    gen = 0x811C9DC5  # FNV-1a over all lists, like the game's catalogue hash
+    for b in json.dumps([lists[k] for k in DESC_KINDS], separators=(",", ":")).encode("utf-8"):
+        gen = ((gen ^ b) * 0x01000193) & 0xFFFFFFFF
+    return lists, gen
+
+
+# -- scripted vehicles of vehicles3d (the first four convoys of a world): positions from the game time
+
+SIDE_BIT = {(0, -1): 1, (1, 0): 2, (0, 1): 4, (-1, 0): 8}
+VF_FRONT, VF_LAST, VF_LEAVING, VF_ENTERING, VF_LOADING = 1, 2, 4, 8, 16
+VF_TUNNEL, VF_HIDDEN, VF_FLYING = 64, 128, 256
+SCRIPTS = ("loop", "shuttle", "depot", "air", "ship")
+DOCK = ((88, 104), (89, 104))  # the Harbour's squares (river), the ship lies on the second
+OFFICE_CORNER = (127, 127)  # a 2 x 2 FakeOffice over the corner of chunks (1,1), (2,1), (1,2), (2,2)
+# seasons and snowline as the game computes them (world/simworld.cc recalc_season_snowline)
+MONTH_SEASON = (2, 2, 2, 3, 3, 0, 0, 0, 0, 1, 1, 2)
+SNOW_FACTOR = (99, 95, 80, 50, 25, 10, 0, 5, 20, 35, 65, 85)
+WINTER_LINE, SUMMER_LINE = 3, 9
+
+
+def make_track(tiles, closed):
+    """squares -> segments (tile, entry and exit edge middles, dir, steps_next, next square, length) + total"""
+    segs, cum, n = [], 0.0, len(tiles)
+    for i, (x, y) in enumerate(tiles):
+        nxt = tiles[(i + 1) % n] if closed or i < n - 1 else None
+        prv = tiles[i - 1] if closed or i > 0 else None
+        if prv is None:
+            prv = (2 * x - nxt[0], 2 * y - nxt[1])
+        if nxt is None:
+            nxt = (2 * x - prv[0], 2 * y - prv[1])
+        ein, eout = (prv[0] - x, prv[1] - y), (nxt[0] - x, nxt[1] - y)
+        straight = ein == (-eout[0], -eout[1])
+        d = SIDE_BIT[eout] if straight else SIDE_BIT[eout] | SIDE_BIT[(-ein[0], -ein[1])]
+        ln = 1.0 if straight else 0.5 ** 0.5
+        segs.append({"tx": x, "ty": y, "a": (x + 0.5 + ein[0] * 0.5, y + 0.5 + ein[1] * 0.5),
+                     "b": (x + 0.5 + eout[0] * 0.5, y + 0.5 + eout[1] * 0.5), "dir": d, "sn": 255 if straight else 180,
+                     "next": eout, "len": ln, "cum": cum})
+        cum += ln
+    return segs, cum
+
+
+def track_at(track, s, closed):
+    segs, total = track
+    s = s % total if closed else min(max(s, 0.0), total - 1e-4)
+    lo, hi = 0, len(segs) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if segs[mid]["cum"] <= s:
+            lo = mid
+        else:
+            hi = mid - 1
+    g = segs[lo]
+    f = (s - g["cum"]) / g["len"]
+    x = g["a"][0] + (g["b"][0] - g["a"][0]) * f
+    z = g["a"][1] + (g["b"][1] - g["a"][1]) * f
+    return g, f, x, z
+
+
+def tile_rows(track, closed, fronts, descs, speed, flags_of, cnv, owner, height):
+    """one vehicles3d row per car: fronts = arc positions of the cars, front first"""
+    rows = []
+    for k, s in enumerate(fronts):
+        g, f, x, z = track_at(track, s, closed)
+        tx, ty = g["tx"], g["ty"]
+        fl = flags_of(g, f) | (VF_FRONT if k == 0 else 0) | (VF_LAST if k == len(fronts) - 1 else 0)
+        rows.append((cnv & 0xFFFF, descs[k], tx, ty, int(round((x - tx - 0.5) * 256)), int(round((z - ty - 0.5) * 256)), 0,
+                     speed, fl, k, 0, height(tx, ty), g["dir"], min(g["sn"], int(f * (g["sn"] + 1))), g["sn"],
+                     g["next"][0], g["next"][1], 0, owner))
+    return rows
+
+
+LOOP = make_track([(x, 66) for x in range(100, 132)] + [(131, y) for y in range(67, 81)]
+                  + [(x, 80) for x in range(130, 98, -1)] + [(99, y) for y in range(79, 65, -1)], True)
+SHUTTLE_E = make_track([(x, 90) for x in range(100, 113)], False)
+SHUTTLE_W = make_track([(x, 90) for x in range(112, 99, -1)], False)
+DEPOT = make_track([(104, 96)] + [(x, 96) for x in range(105, 118)] + [(117, y) for y in range(95, 90, -1)]
+                   + [(x, 91) for x in range(116, 103, -1)] + [(104, y) for y in range(92, 97)], False)
+LOOP_V, SHUTTLE_V, DEPOT_V, AIR_V = 2.0, 2.0, 1.5, 8.0  # squares per 1000 ticks
+SHUTTLE_RUN, SHUTTLE_WAIT, DEPOT_AWAY = (13.0 - 1.5) / SHUTTLE_V * 1000, 3000, 3000
+AIR_C, AIR_R = (116.0, 74.0), 12.0
+
+
+def yards(v):
+    return int(v / 1000 * 256 * 4096)
+
+
+def loop_flags(g, f):
+    if g["ty"] == 80 and 109 <= g["tx"] <= 115:
+        return VF_TUNNEL
+    if g["ty"] == 80 and ((g["tx"] == 116 and f >= 0.5) or (g["tx"] == 108 and f < 0.5)):
+        return VF_HIDDEN
+    return 0
+
+
+def script_rows(role, ticks, cnv, owner, height, vi):
+    """rows of a scripted convoy at game time ticks (empty while it is away), and the square of its front"""
+    t = float(ticks)
+    if role == "loop":
+        s0 = t * LOOP_V / 1000
+        return tile_rows(LOOP, True, [s0 - 0.5 * k for k in range(4)], [vi["Fake loco"]] + [vi["Fake coach"]] * 3,
+                         yards(LOOP_V), loop_flags, cnv, owner, height)
+    if role == "shuttle":
+        half = SHUTTLE_RUN + SHUTTLE_WAIT
+        ph = t % (2 * half)
+        west = ph >= half
+        ph -= half if west else 0
+        run = min(ph, SHUTTLE_RUN)
+        s0 = 1.5 + run * SHUTTLE_V / 1000
+        waiting = ph >= SHUTTLE_RUN
+        descs = [vi["Fake loco"], vi["Fake coach"], vi["Fake loco"]]
+        return tile_rows(SHUTTLE_W if west else SHUTTLE_E, False, [s0 - 0.5 * k for k in range(3)], descs,
+                         0 if waiting else yards(SHUTTLE_V), lambda g, f: VF_LOADING if waiting else 0, cnv, owner, height)
+    if role == "depot":
+        total = DEPOT[1]
+        drive = (total - 0.6) / DEPOT_V * 1000
+        ph = t % (drive + DEPOT_AWAY)
+        if ph >= drive:
+            return []
+        s0 = 0.55 + ph * DEPOT_V / 1000
+        fl = VF_LEAVING if s0 < 1.6 else VF_ENTERING if s0 > total - 1.6 else 0
+        return tile_rows(DEPOT, False, [s0, s0 - 0.5], [vi["Fake bus"], vi["Mail trailer"]], yards(DEPOT_V),
+                         lambda g, f: fl, cnv, owner, height)
+    if role == "ship":
+        x, y = DOCK[1]
+        return [(cnv & 0xFFFF, vi["Steamer"], x, y, 0, 0, 0, 0, VF_FRONT | VF_LAST | VF_LOADING, 0, 0, 0, 2, 128, 255, 1, 0,
+                 0, owner)]
+    if role == "air":
+        import math
+        a = t * AIR_V / 1000 / AIR_R
+        x, z = AIR_C[0] + AIR_R * math.cos(a), AIR_C[1] + AIR_R * math.sin(a)
+        hx, hz = -math.sin(a), math.cos(a)
+        tx, ty = int(x), int(z)
+        sx, sz = (1 if hx > 0.38 else -1 if hx < -0.38 else 0), (1 if hz > 0.38 else -1 if hz < -0.38 else 0)
+        d = (2 if sx > 0 else 8 if sx < 0 else 0) | (4 if sz > 0 else 1 if sz < 0 else 0)
+        return [(cnv & 0xFFFF, vi["Fake airliner"], tx, ty, int(round((x - tx - 0.5) * 256)), int(round((z - ty - 0.5) * 256)),
+                 80, yards(AIR_V), VF_FRONT | VF_LAST | VF_HIDDEN | VF_FLYING, 0, 0, height(tx, ty), d, 128, 255, sx, sz, 0, owner)]
+    return []
 
 
 # goods: index, internal name, translated, unit, category, catg, catg_index, colour index, value, speed bonus, weight
@@ -146,6 +370,9 @@ def date_obj(months):
     return {"year": months // 12, "month": months % 12 + 1}
 
 
+VEH_INDEX = {d["name"]: d["i"] for d in fake_descs()[0]["vehicles"]}
+
+
 class World:
     def __init__(self, opts):
         self.opts = opts
@@ -200,6 +427,8 @@ class World:
             self.convoys.append({"id": base + i, "name": "(%d) Bus" % (base + i) + MARK, "owner": line["owner"],
                                  "line": line["id"], "x": rng.randrange(SIZE), "y": rng.randrange(SIZE_Y),
                                  "z": 0, "dx": rng.choice((-1, 1)), "state": 6, "load": rng.randrange(101)})
+        for c, role in zip(self.convoys, SCRIPTS):
+            c["script"] = role
         self.messages = []
         for k in range(3):
             self._add_message("World %d message %d" % (self.gen, k) + MARK, 0)
@@ -274,6 +503,10 @@ class World:
             for c in self.convoys:
                 if c["state"] == 6:
                     c["x"] = (c["x"] + c["dx"]) % SIZE
+                if "script" in c:
+                    rows = script_rows(c["script"], self.ticks, c["id"], c["owner"], lambda x, y: 0, VEH_INDEX)
+                    if rows:
+                        c["x"], c["y"] = rows[0][2], rows[0][3]
                 if c["state"] in (6, 7) and self.rng.random() < 0.02:  # states set by fake_set_state stay
                     c["state"] = 7 if c["state"] == 6 else 6
                     c["load"] = self.rng.randrange(101)
@@ -346,6 +579,7 @@ class Engine:
         self.conns_lock = threading.Lock()
         self.deliver_lock = threading.Lock()
         self.next_id = 1
+        self.calls = {}  # 3D command -> number of requests (fake_stats)
 
     # -- events
 
@@ -1257,11 +1491,264 @@ class Engine:
         w.build(int(a["x"]), int(a["y"]), int(a.get("w", "1") or 1), int(a.get("h", "1") or 1))
         return {"gen": w.map_gen}
 
+    # -- 3D export (absent with --old, --no-map and --no-3d)
+
+    def grid_height(self, gx, gy):
+        """height of a grid point (the north-west corner of square gx, gy): 16 x 16 blocks of heights 1-4"""
+        return 1 + (gx // 16 + gy // 16) % 4
+
+    def is_water(self, x, y):
+        return self.w.terrain[min(y, SIZE_Y - 1) * SIZE + min(x, SIZE - 1)] == HEIGHT_COLORS[2]
+
+    def is_road(self, x, y):
+        return 0 <= x < SIZE and 0 <= y < SIZE_Y and self.w.terrain[y * SIZE + x] == COL_ROAD
+
+    def specials(self):
+        """squares of the stop, factory and town hall buildings: (x, y) -> (desc name, ox, oy, owner)"""
+        w = self.w
+        if getattr(self, "_spec_gen", None) != w.gen:
+            sp = {}
+            for f in FACTORIES:
+                for oy in (0, 1):
+                    for ox in (0, 1):
+                        sp[(f[2] + ox, f[3] + oy)] = ("FakeWorks", ox, oy, -1)
+            for c in CITIES:
+                for oy in (0, 1):
+                    for ox in (0, 1):
+                        sp[(c[1] + ox, c[2] + oy)] = ("FakeTownhall", ox, oy, 1)
+            for st in w.stations:
+                sp[(st["pos"]["x"], st["pos"]["y"])] = ("FakeStop", 0, 0, st["owner"])
+            for k, sq in enumerate(DOCK):
+                sp[sq] = ("Harbour", k, 0, 0)
+            for oy in (0, 1):
+                for ox in (0, 1):
+                    sp[(OFFICE_CORNER[0] + ox, OFFICE_CORNER[1] + oy)] = ("FakeOffice", ox, oy, -1)
+            self._spec, self._spec_gen = sp, w.gen
+        return self._spec
+
+    def season_snowline(self):
+        """season and snowline of the game at the fake's time (month and the share of it gone)"""
+        w = self.w
+        m0 = w.months % 12
+        frac = (w.ticks % w.ticks_per_month) / w.ticks_per_month
+        factor = SNOW_FACTOR[m0] + int((SNOW_FACTOR[(m0 + 1) % 12] - SNOW_FACTOR[m0]) * frac)
+        return MONTH_SEASON[m0], SUMMER_LINE - (SUMMER_LINE - WINTER_LINE) * factor // 100
+
+    def int_arg(self, a, key, default=None):
+        if key not in a:
+            if default is None:
+                raise ValueError("missing %s" % key)
+            return default
+        try:
+            return int(a[key])
+        except ValueError:
+            raise ValueError("%s must be a number" % key) from None
+
+    def region(self, a):
+        """x1 y1 x2 y2 (inclusive, default the whole map) clipped to the map"""
+        x1, y1 = self.int_arg(a, "x1", 0), self.int_arg(a, "y1", 0)
+        x2, y2 = self.int_arg(a, "x2", SIZE - 1), self.int_arg(a, "y2", SIZE_Y - 1)
+        x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, SIZE - 1), min(y2, SIZE_Y - 1)
+        if x1 > x2 or y1 > y2:
+            raise ValueError("region is outside of the map")
+        return x1, y1, x2, y2
+
+    def level(self, a, default):
+        lv = self.int_arg(a, "level", default)
+        if not 1 <= lv <= 9:
+            raise ValueError("level must be 1-9")
+        return lv
+
+    def cmd_desc_list(self, a):
+        lists, gen = fake_descs()
+        kinds = DESC_KINDS
+        if "kinds" in a:
+            kinds = [k.strip() for k in a["kinds"].split(",")]
+            for k in kinds:
+                if k not in DESC_KINDS:
+                    raise ValueError("unknown kind: %s" % k)
+        reply = {"pakset": "fake/", "gen": gen}
+        for k in DESC_KINDS:
+            if k in kinds:
+                reply[k] = lists[k]
+        reply["t_us"] = 90
+        return reply
+
+    def cmd_scene3d(self, a):
+        w = self.w
+        if "cx" not in a or "cy" not in a:
+            raise ValueError("missing chunk coordinates cx,cy")
+        size = self.int_arg(a, "size", 64)
+        if size not in (16, 32, 64):
+            raise ValueError("size must be 16, 32 or 64")
+        cx, cy = self.int_arg(a, "cx"), self.int_arg(a, "cy")
+        x0, y0 = cx * size, cy * size
+        if cx < 0 or cy < 0 or x0 >= SIZE or y0 >= SIZE_Y:
+            raise ValueError("chunk is outside of the map")
+        objs_mode = a.get("objs", "bin")
+        if objs_mode not in ("bin", "json"):
+            raise ValueError("objs must be bin or json")
+        level = self.level(a, 4)
+        cw, ch = min(size, SIZE - x0), min(size, SIZE_Y - y0)
+        corners, ground, objs = bytearray(), bytearray(), []
+        spec = self.specials()
+        bidx = {d["name"]: d["i"] for d in fake_descs()[0]["buildings"]}
+        for ly in range(ch):
+            for lx in range(cw):
+                x, y = x0 + lx, y0 + ly
+                if self.is_water(x, y):
+                    cs = (0, 0, 0, 0)
+                    ground.append(CLIMATE << 4 | 1)
+                else:
+                    gh = self.grid_height
+                    cs = (gh(x, y + 1), gh(x + 1, y + 1), gh(x + 1, y), gh(x, y))  # sw se ne nw
+                z = min(cs)
+                cs = tuple(min(c, z + 2) for c in cs)
+                corners.extend(c & 0xFF for c in cs)
+                sp = spec.get((x, y))
+                if self.is_water(x, y):
+                    if sp and sp[0] == "Harbour":
+                        objs.append((lx, ly, z, 1, bidx["Harbour"], 0, sp[1] + 256 * sp[2], sp[3]))
+                    continue
+                slope = (cs[0] - z) + 3 * (cs[1] - z) + 9 * (cs[2] - z) + 27 * (cs[3] - z)
+                if self.is_road(x, y):
+                    ribi = (1 if self.is_road(x, y - 1) else 0) | (2 if self.is_road(x + 1, y) else 0) | \
+                           (4 if self.is_road(x, y + 1) else 0) | (8 if self.is_road(x - 1, y) else 0)
+                    objs.append((lx, ly, z, 0, 0, ribi, slope << 8, w.owned[y * SIZE + x] - 1))
+                    if sp and sp[0] == "FakeStop":  # a stop on the road
+                        objs.append((lx, ly, z, 1, bidx["FakeStop"], 0, 0, sp[3]))
+                    ground.append(CLIMATE << 4)
+                elif sp:
+                    objs.append((lx, ly, z, 1, bidx[sp[0]], 0, sp[1] + 256 * sp[2], sp[3]))
+                    ground.append(CLIMATE << 4 | 2)
+                elif x % 32 == 8 and y % 32 == 8:
+                    objs.append((lx, ly, z, 1, 0, 0, 0, -1))  # FakeHouse
+                    ground.append(CLIMATE << 4 | 2)
+                elif 16 <= x % 32 <= 17 and 16 <= y % 32 <= 17:
+                    objs.append((lx, ly, z, 1, 1, 0, x % 32 - 16 + 256 * (y % 32 - 16), -1))  # FakeOffice 2 x 2
+                    ground.append(CLIMATE << 4 | 2)
+                else:
+                    if (x * 7 + y * 13) % 11 == 0:
+                        objs.append((lx, ly, z, 2, (x + y) % 3, (x * 3 + y) % 5, 0, -1))
+                    ground.append(CLIMATE << 4)
+        season, snowline = self.season_snowline()
+        reply = {"cx": cx, "cy": cy, "size": size, "x0": x0, "y0": y0, "w": cw, "h": ch, "rev": w.map_gen,
+                 "desc_gen": fake_descs()[1], "water": 0, "season": season, "snowline": snowline, "rotation": 0,
+                 "encoding": "zlib+base64", "corners": b64z(corners, level), "ground": b64z(ground, level),
+                 "count": len(objs)}
+        if objs_mode == "json":
+            reply["objs"] = [list(r) for r in objs]
+        else:
+            reply["objs_layout"] = SCENE_LAYOUT
+            reply["objs"] = b64z(pack_columns(objs, SCENE_LAYOUT), level)
+        reply["t_us"] = 700
+        return reply
+
+    def cmd_heights(self, a):
+        step = self.int_arg(a, "step", 1)
+        if step not in (1, 2, 4, 8, 16):
+            raise ValueError("step must be 1, 2, 4, 8 or 16")
+        x1, y1, x2, y2 = self.region(a)
+        level = self.level(a, 1)
+        cols = [x1 + i * step for i in range(-(-(x2 - x1 + 1) // step))] + [x2 + 1]
+        rows = [y1 + j * step for j in range(-(-(y2 - y1 + 1) // step))] + [y2 + 1]
+        if len(cols) * len(rows) > 66049:
+            raise ValueError("too many samples (at most 66049 per request): use a larger step or a smaller region")
+        hs = [-2 if self.is_water(gx, gy) else self.grid_height(gx, gy) for gy in rows for gx in cols]
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "step": step, "w": len(cols), "h": len(rows),
+                "rev": self.w.map_gen, "water": 0, "min": min(hs), "max": max(hs), "encoding": "zlib+base64",
+                "heights": b64z((h & 0xFF for h in hs), level), "water_heights": b64z(bytes(len(hs)), level),
+                "t_us": 300}
+
+    def cmd_vehicles3d(self, a):
+        w = self.w
+        x1, y1, x2, y2 = self.region(a)
+        extras = a.get("extras") == "1"
+        if extras and (x2 - x1 + 1) * (y2 - y1 + 1) > 65536:
+            raise ValueError("extras=1: region too large (at most 65536 squares)")
+        objs_mode = a.get("objs", "bin")
+        if objs_mode not in ("bin", "json"):
+            raise ValueError("objs must be bin or json")
+        level = self.level(a, 1)
+        rows = []
+        descs = (VEH_INDEX["Fake bus"], VEH_INDEX["Mail trailer"])
+        for c in w.convoys:
+            if "script" in c:
+                for r in script_rows(c["script"], w.ticks, c["id"], c["owner"], self.grid_height, VEH_INDEX):
+                    if x1 <= r[2] <= x2 and y1 <= r[3] <= y2:
+                        rows.append(r)
+                continue
+            if not (x1 <= c["x"] <= x2 and y1 <= c["y"] <= y2):
+                continue
+            for idx in (0, 1):
+                flags = (1 if idx == 0 else 2) | (16 if c["state"] == 7 else 0)
+                rows.append((c["id"] & 0xFFFF, descs[idx], c["x"], c["y"], 0, 0, 0, 640 if c["state"] == 6 else 0, flags,
+                             idx, 0, self.grid_height(c["x"], c["y"]), 2 if c["dx"] > 0 else 8, (w.ticks // 8) % 256,
+                             255, c["dx"], 0, 0, c["owner"]))
+        convoy_rows = len(rows)
+        if extras:
+            # city cars drive east along the roads of the rows, pedestrians walk south along the roads of the columns
+            shift = w.gen * 8
+            for y in range(y1, y2 + 1):
+                if (y + shift) % 32 == 0:
+                    for k in range(SIZE // 12):
+                        x = (k * 12 + 5 + w.ticks * 1.2 / 1000) % SIZE
+                        tx = int(x)
+                        if x1 <= tx <= x2 and self.is_road(tx, y):
+                            rows.append((0, k % 2, tx, y, int((x - tx - 0.5) * 256), 0, 0, yards(1.2), 3, 0, 1,
+                                         self.grid_height(tx, y), 2, int((x - tx) * 255), 255, 1, 0, 0, -1))
+            for x in range(x1, x2 + 1):
+                if (x + shift) % 32 == 0:
+                    for k in range(SIZE_Y // 16):
+                        y = (k * 16 + 3 + w.ticks * 0.15 / 1000) % SIZE_Y
+                        ty = int(y)
+                        if y1 <= ty <= y2 and self.is_road(x, ty):
+                            rows.append((0, 0, x, ty, 0, int((y - ty - 0.5) * 256), 0, 128, 3, 0, 2,
+                                         self.grid_height(x, ty), 4, int((y - ty) * 255), 255, 0, 1, 0, -1))
+        reply = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "ticks": w.ticks, "paused": w.paused, "ff": w.ff,
+                 "mult": w.mult, "drive_left": False, "diag_steps": 181, "desc_gen": fake_descs()[1],
+                 "count": len(rows), "convoy_rows": convoy_rows}
+        if objs_mode == "json":
+            reply["objs"] = [list(r) for r in rows]
+        else:
+            reply.update(encoding="zlib+base64", objs_layout=VEH_LAYOUT, objs=b64z(pack_columns(rows, VEH_LAYOUT), level))
+        reply["t_us"] = 400
+        return reply
+
+    def cmd_fake_time(self, a):
+        w = self.w  # execute() holds w.lock
+        month = self.int_arg(a, "month", w.months % 12 + 1)
+        day, hour = float(a.get("day", "1") or 1), float(a.get("hour", "12") or 12)
+        if not 1 <= month <= 12 or not 1 <= day <= 31 or not 0 <= hour <= 24:
+            raise ValueError("month 1-12, day 1-31, hour 0-24")
+        old = w.months
+        target = (w.months // 12) * 12 + month - 1
+        if target < w.start_months:
+            target += 12
+        days = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[month - 1]
+        frac = min(0.9999, (min(day, days) - 1 + hour / 24.0) / days)
+        w.ticks = (target - w.start_months) * w.ticks_per_month + int(frac * w.ticks_per_month)
+        if w.months != old:
+            w.add_event("month", {"date": date_obj(w.months), "year_changed": w.months // 12 != old // 12})
+        season, snowline = self.season_snowline()
+        return {"ticks": w.ticks, "date": date_obj(w.months), "season": season, "snowline": snowline}
+
+    def cmd_fake_stats(self, a):
+        calls = dict(self.calls)
+        if a.get("reset") == "1":
+            self.calls.clear()
+        return {"calls": {k: calls.get(k, 0) for k in VIEW3D_COMMANDS}}
+
     def cmd_tile(self, a):
         if "x" not in a or "y" not in a:
             raise ValueError("missing tile coordinates x,y")
-        return {"grounds": [{"pos": {"x": int(a["x"]), "y": int(a["y"]), "z": 0}, "type": "Boden",
-                             "objects": []}]}
+        x, y = int(a["x"]), int(a["y"])
+        g = {"pos": {"x": x, "y": y, "z": 0}, "type": "Boden", "objects": []}
+        st = next((s for s in self.w.stations if s["pos"]["x"] == x and s["pos"]["y"] == y), None)
+        if st:
+            g["halt"] = st["name"]
+            g["objects"].append({"type": "building", "name": "FakeStop", "owner": st["owner"]})
+        return {"grounds": [g]}
 
     def cmd_pause(self, a):
         w = self.w
@@ -1361,6 +1848,10 @@ class Engine:
             fn = None
         if (self.opts.old or self.opts.no_map) and name in ("palette", "minimap", "map_changes", "labels", "fake_build", "fake_fail"):
             fn = None
+        if (self.opts.old or self.opts.no_map or self.opts.no_3d) and name in VIEW3D_COMMANDS:
+            fn = None
+        if name in VIEW3D_COMMANDS:
+            self.calls[name] = self.calls.get(name, 0) + 1
         if fn is None:
             reply.update(ok=False, error="unknown command")
             return reply
@@ -1400,6 +1891,8 @@ class Handler(socketserver.StreamRequestHandler):
                     continue
                 if engine.opts.delay:
                     time.sleep(engine.opts.delay)
+                if engine.opts.delay_3d and line.split(" ", 1)[0] in VIEW3D_COMMANDS:
+                    time.sleep(engine.opts.delay_3d)
                 reply = engine.execute(line, conn)
                 conn.send((json.dumps(reply, separators=(",", ":")) + "\n").encode("utf-8"))
                 engine.process_events()  # the next "frame": watchers see what the request changed
@@ -1419,7 +1912,9 @@ def main():
     p.add_argument("--port", type=int, default=13399)
     p.add_argument("--old", action="store_true", help="imitate an engine before phase 0b")
     p.add_argument("--no-events", action="store_true", help="imitate an engine with protocol 1 only")
-    p.add_argument("--no-map", action="store_true", help="imitate an engine without the map export")
+    p.add_argument("--no-map", action="store_true", help="imitate an engine without the map export (and 3D export)")
+    p.add_argument("--no-3d", action="store_true", help="imitate an engine without the 3D export")
+    p.add_argument("--delay-3d", type=float, default=0.0, help="extra seconds per 3D request")
     p.add_argument("--size", default="256x256", help="world size WxH (default 256x256)")
     p.add_argument("--convoys", type=int, default=60)
     p.add_argument("--month-seconds", type=float, default=20.0, help="wall seconds per game month")
@@ -1452,8 +1947,9 @@ def main():
             engine.process_events()
             last = now
     threading.Thread(target=ticker, daemon=True).start()
-    print("fake engine on 127.0.0.1:%d%s" % (opts.port, " (old protocol)" if opts.old else
-                                             " (protocol 1 only)" if opts.no_events else ""), flush=True)
+    print("fake engine on 127.0.0.1:%d%s%s" % (opts.port, " (old protocol)" if opts.old else
+                                               " (protocol 1 only)" if opts.no_events else "",
+                                               " (no 3D export)" if opts.no_3d else ""), flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

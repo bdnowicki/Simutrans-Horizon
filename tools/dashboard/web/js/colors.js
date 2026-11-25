@@ -4,7 +4,7 @@
 const OWNER = ["#1f6fd1", "#7a7a7a", "#d1491f", "#2f9e44", "#9c36b5", "#e8a200", "#0b9aa8", "#c2255c",
 	"#5c7cfa", "#8d6e3f", "#37b24d", "#f76707", "#1098ad", "#ae3ec9", "#495057", "#a61e4d"];
 
-let palette = null; // {colors: ["#rrggbb" x 256], players: Map nr -> css colour}
+let palette = null; // {colors: ["#rrggbb" x 256], players: Map nr -> css colour, players2: Map nr -> second colour}
 
 /** The game's palette (reply of `palette`, or null): player colours as in the game's minimap. */
 export function setPalette(p) {
@@ -13,13 +13,16 @@ export function setPalette(p) {
 		return;
 	}
 	const colors = p.colors.map((c) => (Array.isArray(c) ? "#" + c.map((v) => (v & 255).toString(16).padStart(2, "0")).join("") : "#000000"));
-	const players = new Map();
+	const players = new Map(), players2 = new Map();
 	for (const pl of p.players || []) {
 		if (pl && typeof pl.nr === "number" && typeof pl.minimap_color === "number") {
 			players.set(pl.nr, colors[pl.minimap_color & 255]);
 		}
+		if (pl && typeof pl.nr === "number" && typeof pl.color2 === "number") {
+			players2.set(pl.nr, colors[(pl.color2 + 3) & 255]); // the middle of its 8 shades, like minimap_color
+		}
 	}
-	palette = { colors, players };
+	palette = { colors, players, players2 };
 }
 
 /** CSS colour of a palette index of the game, or null without a palette. */
@@ -33,6 +36,15 @@ export function ownerColor(nr) {
 	}
 	const c = palette && palette.players.get(nr);
 	return c || OWNER[nr % OWNER.length];
+}
+
+/** The second company colour of player nr (3D models, material "player2"): the game's when known. */
+export function ownerColor2(nr) {
+	if (typeof nr !== "number" || nr < 0) {
+		return "#868e96";
+	}
+	const c = palette && palette.players2.get(nr);
+	return c || OWNER[(nr + 8) % OWNER.length];
 }
 
 const lineCache = new Map();
