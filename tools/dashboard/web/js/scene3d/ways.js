@@ -1,7 +1,7 @@
 // Simutrans-Horizon dashboard, 3D view: the transport network of a chunk (worker side, no three.js): ways with a
 // look per way type (road, highway, rail, narrow gauge, tram, monorail, maglev, river, canal, runway, taxiway), their
 // slopes, elevated ways and bridge decks with railings and supports, bridge heads, bridge pillars, tunnel portals,
-// overhead lines, signals and signs, power lines and level crossings. Ways are bands along the pieces of wayshape.js,
+// overhead lines, signals and signs (arrows painted on runways and taxiways), power lines and level crossings. Ways are bands along the pieces of wayshape.js,
 // with a cross-section profile of strips. Artistic License, see LICENSE.txt.
 import { rgb8, rgbLin } from "./meshbuf.js";
 import { K, SW, SE, NE, NW } from "./decode.js";
@@ -505,6 +505,14 @@ export function createWayBuilder(cat, hs) {
 			// `dir` points towards the vehicles a sign is meant for (the game tests the direction back along the route):
 			// the sign stands right of their travel direction and faces them
 			const dirs = DIRS.filter((dd) => a & dd);
+			if (!model && !signal && WT[d.waytype] === WT.air) {
+				// signs of runways and taxiways are markings on the surface: an arrow in the direction of travel
+				const yAt = r ? r.yAt : (u, v) => terrainY(t, u, v);
+				for (const dd of dirs.length ? dirs : [N]) {
+					groundArrow(out.way, lx, ly, [-STEP[dd][0], -STEP[dd][1]], dirs.length > 1 ? 0.2 : 0, yAt);
+				}
+				return;
+			}
 			for (const dd of dirs.length ? dirs : [N]) {
 				const T = [-STEP[dd][0], -STEP[dd][1]], R = [-T[1], T[0]];
 				const px = lx + 0.5 + R[0] * off, pz = ly + 0.5 + R[1] * off;
@@ -572,6 +580,50 @@ function signRgb(d) {
 
 function clamp01(x) {
 	return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+/** The polygon [[x, y]] grown outwards by g (mitred corners). */
+function grown(poly, g) {
+	const m = poly.length;
+	let area = 0;
+	for (let i = 0; i < m; i++) {
+		const [x0, y0] = poly[i], [x1, y1] = poly[(i + 1) % m];
+		area += x0 * y1 - x1 * y0;
+	}
+	const s = area > 0 ? 1 : -1; // counter-clockwise: the outward normal of an edge (dx, dy) is (dy, -dx)
+	const nrm = (i) => {
+		const [x0, y0] = poly[i], [x1, y1] = poly[(i + 1) % m], l = Math.hypot(x1 - x0, y1 - y0);
+		return [s * (y1 - y0) / l, -s * (x1 - x0) / l];
+	};
+	return poly.map((p, i) => {
+		const a = nrm((i + m - 1) % m), b = nrm(i), k = g / (1 + a[0] * b[0] + a[1] * b[1]);
+		return [p[0] + (a[0] + b[0]) * k, p[1] + (a[1] + b[1]) * k];
+	});
+}
+
+// arrow painted on a runway or taxiway: [along, across] outline of a shaft and a head pointing to +along, with a dark edge
+const ARROW = [[-0.28, -0.035], [0.04, -0.035], [0.04, -0.12], [0.3, 0], [0.04, 0.12], [0.04, 0.035], [-0.28, 0.035]];
+const ARROW_TRIS = [[0, 1, 5], [0, 5, 6], [2, 3, 4]];
+const ARROW_LAYERS = [[grown(ARROW, 0.022), 0.003, rgb8([0.08, 0.08, 0.08])], [ARROW, 0.004, rgb8(LINE_Y)]];
+
+/** Arrow on the way surface of square (lx, ly) pointing along T (a unit step), `side` right of the centre line. */
+function groundArrow(buf, lx, ly, T, side, yAt) {
+	const R = [-T[1], T[0]];
+	for (const [poly, h, c] of ARROW_LAYERS) {
+		const ids = poly.map(([al, ac]) => {
+			const u = clamp01(0.5 + T[0] * al + R[0] * (ac + side)), v = clamp01(0.5 + T[1] * al + R[1] * (ac + side));
+			return [buf.v(lx + u, yAt(u, v) + h, ly + v, c), u, v];
+		});
+		for (const [i, j, k] of ARROW_TRIS) {
+			const p = ids[i], q = ids[j], s = ids[k];
+			// facing up: the same turn as the surface quads
+			if ((q[2] - p[2]) * (s[1] - p[1]) - (q[1] - p[1]) * (s[2] - p[2]) > 0) {
+				buf.tri(p[0], q[0], s[0]);
+			} else {
+				buf.tri(p[0], s[0], q[0]);
+			}
+		}
+	}
 }
 
 // --- band geometry ----------------------------------------------------------------------------------------
