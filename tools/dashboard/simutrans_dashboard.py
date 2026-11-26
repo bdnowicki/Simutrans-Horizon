@@ -19,7 +19,13 @@ map changes; /pak3d/ serves the models of a pak 3D directory (--pak3d). Static f
 replies are sent gzip compressed to browsers that accept it. Only the Python standard library is
 used (Python 3.10+).
 
-  python tools/dashboard/simutrans_dashboard.py [--game-port 13360] [--port 13380] [--pak3d DIR]
+The access tokens live in a SQLite database (--db; without it in memory, filled from the environment
+at every start) together with the history of the AI team (package team/: /api/team/* routes and a
+per-company event stream /api/team/events; player and admin tokens are bound to a company).
+
+  python tools/dashboard/simutrans_dashboard.py [--game-port 13360] [--port 13380] [--pak3d DIR] [--db FILE]
+  python tools/dashboard/simutrans_dashboard.py token add --role player --company N [--label X] --db FILE
+  python tools/dashboard/simutrans_dashboard.py token list|revoke ID --db FILE
 
 tools/dashboard/README.md documents the HTTP API and the security model.
 """
@@ -27,9 +33,10 @@ tools/dashboard/README.md documents the HTTP API and the security model.
 import argparse
 import base64
 import collections
+import copy
 import gzip
 import hashlib
-import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -55,6 +62,17 @@ try:
     from simutrans_mcp import GameConnection, GameError
 finally:
     sys.path.remove(_MCP_DIR)
+sys.path.insert(0, HERE)
+try:
+    # the AI team: database (tokens, history), event streams, routes, runtime (package tools/dashboard/team)
+    from team import api as team_api
+    from team import db as team_db
+    from team import engine as team_engine
+    from team import events as team_events
+    from team import roles as team_roles
+    from team import runtime as team_runtime
+finally:
+    sys.path.remove(HERE)
 
 VERSION = "0.1.0"
 DEFAULT_GAME_PORT = 13360
@@ -89,9 +107,12 @@ ROLE_ACTIONS = {
 }
 # the actions a read-only remote control accepts when the game allows time control (-remote_control_time)
 TIME_ACTIONS = ("pause", "fast_forward")
-# never reachable through the bridge, whatever the role (also refused as unknown commands)
+# never reachable through the bridge, whatever the role (also refused as unknown commands); the engine agent
+# commands (agent_tool, depot_op, line_op, convoy_op, plan_way, estimate, depot) only run on the bridge's own team
+# connection, for the company of the session (App.team_engine)
 NEVER_PROXIED = frozenset(("eval", "screenshot", "click", "move", "drag", "wheel", "key", "text",
-                           "unlock_game", "remove_password", "tool_visibility", "windows"))
+                           "unlock_game", "remove_password", "tool_visibility", "windows")
+                          + team_engine.AGENT_COMMANDS + team_engine.AGENT_READS)
 TOOL_REFUSED_ARGS = ("player", "unowned")
 # general tools the dashboard never applies (number = index in simmenu.h): locking the game sets a
 # password and switches off changing the player; the others run scripts or write files
@@ -103,6 +124,10 @@ MAX_HEAVY = 2
 MAX_SSE = 64
 MAX_SESSIONS = 1000
 MAX_BODY = 16 * 1024
+TEAM_MAX_BODY = 32 * 1024   # POST /api/team/* (answers to questions may carry more)
+DRAIN_MAX = 1024 * 1024     # a refused body up to this size is read (and dropped) before the 413 ...
+DRAIN_SECONDS = 3.0         # ... for at most this long
+TOKEN_CHECK = 2.0           # seconds a token's "not revoked" is trusted before the database is asked again
 SESSION_IDLE = 12 * 3600
 RATE_PER_SECOND = 30.0
 RATE_BURST = 60.0
@@ -114,7 +139,8 @@ ARG_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 MAX_ARG_VALUE = 512
 SESSION_CHECK = 5.0         # seconds between session checks of an open event stream
 MAX_CONNECTIONS = 256       # open HTTP connections (one thread each) at once ...
-MAX_CONNECTIONS_PER_IP = 32  # ... and from one address other than the loopback (proxies, tunnels)
+MAX_CONNECTIONS_PER_IP = 32  # ... and from one address other than the loopback (proxies, tunnels; --max-conn-per-ip)
+MAX_FORWARDED = 32          # X-Forwarded-For entries looked at (from the right) for a trusted proxy (--trusted-proxy)
 # map exports of the browsers (map, minimap, uncached tiles) run in a frame of the game, a minimap of a
 # whole 1024 x 1024 map in a statistics mode takes some 0.2 s: their round-trip time is limited to this
 # many seconds per second (bursts up to EXPORT_BURST s), further ones get 429
@@ -122,7 +148,8 @@ EXPORT_COMMANDS = ("map", "minimap")
 EXPORT_RATE = 0.25
 EXPORT_BURST = 2.0
 
-assert not NEVER_PROXIED & (set(READ_COMMANDS) | set(ACTION_ARGS) | set(BRIDGE_READS))
+assert not NEVER_PROXIED & (set(READ_COMMANDS) | set(ACTION_ARGS) | set(BRIDGE_READS) | {"desc_list", "scene3d", "heights",
+                                                                                      "vehicles3d"})
 
 # map tiles: /tiles/<mode>/<step>/<cx>/<cy>.png, one chunk of CHUNK x CHUNK minimap samples
 MAP_MODES = ("terrain", "owner", "traffic", "freight", "passengers", "mail", "tracks", "speed", "power",
@@ -164,6 +191,11 @@ QUEUE_3D = 32               # requests waiting for the 3D game connection (desc_
 QUEUE_VEH = 8               # ... and for the vehicles3d connection; further ones get 503
 WAIT_3D = 30.0              # s a request waits for its turn and the game's answer, then 503
 IDLE_3D = 120.0             # s without requests after which a 3D game connection is closed (frees one of the 8)
+# the team's game connection (reads and agent commands of the team runtime), opened with its first request
+QUEUE_TEAM = 16
+WAIT_TEAM = 60.0
+# what the team runtime may send there: reads and the agent commands, never eval, tool, cash, input or files
+TEAM_ENGINE_COMMANDS = frozenset(READ_COMMANDS + VIEW3D_READS + team_engine.AGENT_COMMANDS + team_engine.AGENT_READS)
 # own token buckets (per session, instead of the general one): chunks like map tiles, vehicles about 5/s
 VIEW3D_RATES = {"scene3d": (60.0, 120.0), "vehicles3d": (5.0, 10.0)}
 UNSUPPORTED_3D = {"ok": False, "error": "unsupported",
@@ -230,10 +262,22 @@ STATIC_EXACT = {"/index.html": "index.html", "/app.js": "app.js", "/style.css": 
 STATIC_PREFIXES = ("/vendor/", "/img/", "/js/")
 STATIC_CACHED = ("vendor/", "img/")
 TOKEN_RE = re.compile(r"(token=)[^&\s\"']*", re.IGNORECASE)
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def has_api_key():
+    """A key of the language model is configured (DEEPSEEK_API_KEY; its value never leaves the process)."""
+    return bool(os.environ.get("DEEPSEEK_API_KEY", "").strip())
 
 
 def json_dumps(obj):
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def _no_constant(name):
+    """json.loads parse_constant: NaN, Infinity and -Infinity are refused (ValueError)."""
+    raise ValueError("%s is not JSON" % name)
 
 
 def utf8(text):
@@ -807,13 +851,15 @@ class Store3D:
 class EngineWorker(threading.Thread):
     """A game connection of its own with a FIFO of at most `depth` waiting requests, so that the heavy 3D requests
     (the game answers at most one per frame) delay neither the poller nor the other browser requests. The
-    connection opens with the first request and closes after IDLE_3D seconds without one."""
+    connection opens with the first request and closes after IDLE_3D seconds without one. raw: replies exactly as the
+    game sent them (an error reply keeps all its keys, e.g. "reason" of plan_way), not reduced to {"ok","error"}."""
 
-    def __init__(self, name, port, depth, idle=IDLE_3D):
+    def __init__(self, name, port, depth, idle=IDLE_3D, timeout=WAIT_3D, raw=False):
         super().__init__(name=name, daemon=True)
-        self.conn = EngineConnection(port, timeout=WAIT_3D)
+        self.conn = EngineConnection(port, timeout=timeout)
         self.depth = depth
         self.idle = idle
+        self.raw = raw
         self.cv = threading.Condition()
         self.jobs = collections.deque()
         self.stopped = False
@@ -854,7 +900,12 @@ class EngineWorker(threading.Thread):
             if job["cancelled"]:
                 continue
             try:
-                reply = self.conn.call(job["command"], **job["args"])
+                if self.raw:
+                    reply = self.conn.call_many([(job["command"], job["args"])])[0]
+                    if not isinstance(reply, dict):
+                        raise Unreachable("the game sent an invalid reply")
+                else:
+                    reply = self.conn.call(job["command"], **job["args"])
                 result = ((200 if reply.get("ok") else 400), reply)
             except Unreachable as e:
                 result = (502, {"ok": False, "error": str(e)})
@@ -923,6 +974,7 @@ class Hub:
         self.ring = collections.deque()
         self.ring_bytes = 0
         self.clients = set()
+        self.slots = team_events.StreamSlots(MAX_SSE)  # shared with the team streams (App.team_events)
         self.closed = False
         self.game_base = {"connected": False, "error": None, "missing": []}  # as the poller sees it
         self.events_live = False      # the event connection is subscribed
@@ -1264,7 +1316,7 @@ class Hub:
         """Register a stream. Returns (client, event id, replay chunks or None, snapshot or None);
         None as client when too many streams are open."""
         with self.lock:
-            if self.closed or len(self.clients) >= MAX_SSE:
+            if self.closed or not self.slots.take():
                 return None, 0, None, None
             client = SseClient(sid)
             self.clients.add(client)
@@ -1279,7 +1331,30 @@ class Hub:
 
     def unsubscribe(self, client):
         with self.lock:
-            self.clients.discard(client)
+            if client in self.clients:
+                self.clients.discard(client)
+                self.slots.give()
+
+    def feed_copy(self, name):
+        """A copy of a cached feed (players, lines, convoys, stations, factories, cities, goods, supply_chain, poll)
+        that the caller may keep and change, or None. Feeds are replaced as a whole and their items are never changed
+        in place (only the convoys list gets new items), so the lists are copied under the lock and the rest after."""
+        with self.lock:
+            feed = self.feeds.get(name)
+            if not isinstance(feed, dict):
+                return copy.deepcopy(feed)
+            snap = {k: list(v) if isinstance(v, list) else v for k, v in feed.items()}
+        return copy.deepcopy(snap)
+
+    def player_name(self, nr):
+        """The name of a player from the cached players feed, or None."""
+        with self.lock:
+            items = (self.feeds.get("players") or {}).get("players")
+            for p in items if isinstance(items, list) else ():
+                if isinstance(p, dict) and p.get("nr") == nr:
+                    name = p.get("name")
+                    return name if isinstance(name, str) else None
+        return None
 
     def stream_count(self):
         with self.lock:
@@ -2084,11 +2159,15 @@ class Subscriber(threading.Thread):
 # --- sessions and rate limits ----------------------------------------------------------------
 
 class Session:
-    __slots__ = ("sid", "role", "created", "last_seen", "tokens", "stamp", "tile_tokens", "tile_stamp", "buckets")
+    """A signed-in browser. token_id: the database row of the token it signed in with (revoking the token ends the
+    session); company: the company a player or admin token is bound to (None for viewers)."""
+    __slots__ = ("sid", "role", "token_id", "company", "created", "last_seen", "tokens", "stamp", "tile_tokens",
+                 "tile_stamp", "buckets")
 
-    def __init__(self, sid, role):
+    def __init__(self, sid, role, token_id=None, company=None):
         now = time.monotonic()
         self.sid, self.role, self.created, self.last_seen = sid, role, now, now
+        self.token_id, self.company = token_id, company
         self.tokens, self.stamp = RATE_BURST, now
         self.tile_tokens, self.tile_stamp = TILE_BURST, now
         self.buckets = {}  # name of a VIEW3D_RATES bucket -> (tokens, stamp)
@@ -2103,7 +2182,7 @@ class Sessions:
         for sid in [s for s, v in self.items.items() if now - v.last_seen > SESSION_IDLE]:
             del self.items[sid]
 
-    def create(self, role):
+    def create(self, role, token_id=None, company=None):
         sid = secrets.token_urlsafe(32)
         now = time.monotonic()
         with self.lock:
@@ -2114,7 +2193,7 @@ class Sessions:
                 same = [s for s in self.items.values() if s.role == role]
                 oldest = min(same or self.items.values(), key=lambda s: s.last_seen)
                 del self.items[oldest.sid]
-            self.items[sid] = Session(sid, role)
+            self.items[sid] = Session(sid, role, token_id, company)
         return sid
 
     def get(self, sid):
@@ -2195,7 +2274,8 @@ class TimeBudget:
 
 
 class LoginLimiter:
-    """At most LOGIN_FAILURES failed logins per IP and minute; further attempts get 429."""
+    """At most LOGIN_FAILURES failed logins per client address (Handler.client_ip) and minute; further attempts
+    get 429."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -2243,27 +2323,53 @@ LOGIN_PAGE = """<!doctype html>
 <p class="hint">The bridge prints the access links when it starts. Signed in already?
 <a href="/">Open the dashboard</a></p>
 </main>
+<script src="/login.js"></script>
 </body>
 </html>
 """
 
-# answer to a token link: sets the cookie, then moves on by itself (see Handler.login)
+# answer to a token link: sets the cookie, then moves on by itself (see Handler.login): /login.js goes to / with the
+# #hash of the link (a deep link such as #team/coordinator); without script the refresh goes to / (the hash is lost)
 LOGIN_BOUNCE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="0;url=/">
+<noscript><meta http-equiv="refresh" content="0;url=/"></noscript>
 <title>Simutrans dashboard</title>
 <link rel="stylesheet" href="/login.css">
 </head>
-<body>
+<body data-next="/">
 <main>
 <h1>Simutrans dashboard</h1>
 <p class="hint">Signed in. <a href="/">Open the dashboard</a></p>
 </main>
+<script src="/login.js"></script>
 </body>
 </html>
+"""
+
+# the script of the sign-in pages (a file of the same origin: the CSP allows no inline script). It keeps the #hash of
+# the address through the sign-in: the page of a token link goes on to "/" + hash (location.replace: the token link
+# leaves no history entry), the sign-in form posts to "/login" + hash (a redirect without a fragment keeps the one of
+# the request). The hash only ever follows a fixed path of this site, so it cannot lead elsewhere; it is used only when
+# it is short and has no spaces or control characters.
+LOGIN_JS = """"use strict";
+(function () {
+  var hash = location.hash;
+  if (hash.length > 512 || /[\\s\\u0000-\\u001f\\u007f]/.test(hash)) {
+    hash = "";
+  }
+  var next = document.body.getAttribute("data-next");
+  if (next === "/") {
+    location.replace("/" + hash);
+    return;
+  }
+  var form = document.querySelector("form[action='/login']");
+  if (form && hash) {
+    form.setAttribute("action", "/login" + hash);
+  }
+})();
 """
 
 LOGIN_CSS = """:root{color-scheme:light dark;--bg:#f4f5f7;--fg:#1d2330;--card:#fff;--line:#c9ced8;--accent:#2f6fde;--err:#b3261e}
@@ -2283,14 +2389,17 @@ LOGIN_ERRORS = {
 
 
 class App:
-    def __init__(self, port, game_port, bind, allowed_hosts, tokens, intervals, min_gap, heartbeat, verbose,
+    def __init__(self, port, game_port, bind, allowed_hosts, db, intervals, min_gap, heartbeat, verbose,
                  event_intervals=None, events=True, event_interval_ms=EVENT_INTERVAL_MS, arrivals_gap=ARRIVALS_GAP,
                  route_refresh=ROUTE_REFRESH, status_ttl=FACTORY_STATUS_TTL, pak3d=None, queue_3d=QUEUE_3D,
-                 queue_veh=QUEUE_VEH):
+                 queue_veh=QUEUE_VEH, enable_admin=False, team=True, test_team=False, test_fast=False,
+                 send_limit=None):
         self.port = port
         self.game_port = game_port
-        self.tokens = tokens  # [(role, token)]
-        self.roles = [role for role, _ in tokens]
+        self.db = db  # team.db.TeamDB: the tokens (hashes) and the team's history
+        self.enable_admin = enable_admin
+        self.alive_lock = threading.Lock()
+        self.alive = {}  # token id -> (time.monotonic() of the check, not revoked)
         self.heartbeat = heartbeat
         self.verbose = verbose
         self.cookie_name = "sdash_%d" % port
@@ -2323,14 +2432,109 @@ class App:
                 hosts.add("%s:%d" % (name, port))
         self.allowed_hosts = frozenset(hosts)
         self.allowed_origins = frozenset(s + "://" + h for h in hosts for s in ("http", "https"))
+        # the AI team: its own game connection (opened with the first request of the runtime), its own event streams
+        # (one per company, counted with the main streams), the runtime and the /api/team/* routes
+        self.worker_team = EngineWorker("game-team", game_port, QUEUE_TEAM, timeout=WAIT_TEAM, raw=True)
+        self.team_events = team_events.TeamEvents(self.hub.slots)
+        self.runtime = None
+        self.team_api = None
+        if team:
+            self.runtime = team_runtime.TeamRuntime(db, self.team_events, self.team_engine, {
+                "api_key": os.environ.get("DEEPSEEK_API_KEY", "").strip() or None,
+                "base_url": os.environ.get("DEEPSEEK_BASE_URL", "").strip() or DEEPSEEK_BASE_URL,
+                "feed": self.hub.feed_copy, "company_name": self.hub.player_name, "engine_agent": self.engine_agent,
+                "test_fast": test_fast})
+            # chat messages per token (send_limit: (burst, seconds per message)); the hidden --test-fast of the
+            # automated tests leaves them practically unlimited, unless --test-send-limit sets them
+            if send_limit is None:
+                send_limit = (1000, 0.001) if test_fast else (team_api.SEND_BURST, team_api.SEND_EVERY)
+            self.team_api = team_api.TeamAPI(db, self.team_events, self.runtime, self.hub.player_name,
+                                             self.engine_agent, has_api_key, test_publish=test_team,
+                                             send_limit=send_limit)
 
     def check_token(self, token):
-        given = utf8(token)
-        role = None
-        for r, t in self.tokens:  # compare with every token, constant time each
-            if hmac.compare_digest(given, utf8(t)):
-                role = r
-        return role
+        """The active token with this value ({id, role, company, label}) or None. Only the sha256 of tokens is
+        stored, so the lookup by hash reveals nothing about other tokens. Admin tokens need --enable-admin."""
+        try:
+            t = self.db.lookup_token(token)
+        except Exception:
+            log.exception("token lookup failed")
+            return None
+        if t is not None and t["role"] == "admin" and not self.enable_admin:
+            log.warning("an admin token was used, but the admin role needs --enable-admin")
+            return None
+        return t
+
+    def token_alive(self, token_id):
+        """False once the token is revoked (asked again after TOKEN_CHECK seconds); a database error counts as
+        revoked (refusing beats guessing)."""
+        now = time.monotonic()
+        with self.alive_lock:
+            hit = self.alive.get(token_id)
+            if hit is not None and now - hit[0] < TOKEN_CHECK:
+                return hit[1]
+        try:
+            alive = self.db.token_active(token_id)
+        except Exception:
+            log.exception("token check failed")
+            alive = False
+        with self.alive_lock:
+            if len(self.alive) > 10000:
+                self.alive.clear()
+            self.alive[token_id] = (now, alive)
+        return alive
+
+    def live_session(self, sid):
+        """The session of a cookie if it is valid and its token is not revoked, else None (a revoked token's session
+        ends here, with its event streams)."""
+        s = self.sessions.get(sid)
+        if s is not None and s.token_id is not None and not self.token_alive(s.token_id):
+            log.info("session of revoked token %s ended", s.token_id)
+            self.end_session(s.sid)
+            return None
+        return s
+
+    def end_session(self, sid):
+        self.sessions.delete(sid)
+        self.hub.close_session(sid)
+        self.team_events.close_session(sid)
+
+    def engine_hello(self):
+        """The handshake reply of the game, or None: the poller's first (it reconnects at once when the game restarts,
+        maybe in another mode; the handshake of an idle connection may be of an earlier game)."""
+        return self.poller.conn.hello or self.worker_team.conn.hello or self.req_conn.hello
+
+    def engine_agent(self):
+        """The game accepts the engine agent commands (HELLO "agent"; missing in older engines = no)."""
+        hello = self.engine_hello()
+        return bool(hello) and hello.get("agent") is True
+
+    def team_engine(self, command, args=None):
+        """engine(command, args) -> reply dict for the team runtime, on the team's own game connection. Only reads and
+        agent commands; the agent commands that act for a company must name it (player=). A game that cannot be
+        reached or does not answer in time gives {"ok": false, "error", "status": 502|503}."""
+        if command not in TEAM_ENGINE_COMMANDS:
+            return {"ok": False, "error": "%s is not available to the team" % command}
+        params = {}
+        for k, v in (args or {}).items():
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                v = "1" if v else "0"
+            if not isinstance(k, str) or not ARG_NAME.match(k) or not isinstance(v, (str, int, float)):
+                return {"ok": False, "error": "invalid argument %r" % (k,)}
+            v = str(v)
+            if "\0" in v or "\n" in v or "\r" in v:
+                return {"ok": False, "error": "argument %s contains an invalid character" % k}
+            params[k] = v
+        if command in team_engine.PLAYER_COMMANDS:
+            company = as_int(params.get("player"))
+            if company is None or not team_db.valid_company(company):
+                return {"ok": False, "error": "agent commands act for a company: player=N (not the public service)"}
+        code, reply = self.worker_team.submit(command, params, timeout=WAIT_TEAM)
+        if code in (502, 503):
+            reply = dict(reply, status=code)
+        return reply
 
     def engine_actions(self):
         """The actions the game accepts, from its handshake: None (all, or not known yet); a game started with
@@ -2735,6 +2939,37 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.app = self.server.app
         self._cache_set = False
+        # the address of the request (login limit, log): the TCP peer, or behind a trusted proxy the client that
+        # X-Forwarded-For names (set per request: a proxy may carry the requests of several users on one connection)
+        self.client_ip = self.client_address[0]
+        self.via_proxy = self.server.limits.trusted(self.client_address[0])
+
+    def handle_one_request(self):
+        self.client_ip = self.client_address[0]
+        try:
+            super().handle_one_request()
+        finally:
+            if self.via_proxy:
+                self.server.limits.leave(self.request)  # the request is answered (or its stream ended)
+
+    def parse_request(self):
+        """After the headers: a request of a trusted proxy counts for the client it names (X-Forwarded-For), at most
+        --max-conn-per-ip of them at once, like direct connections of one address (see ConnectionLimits)."""
+        if not super().parse_request():
+            return False
+        if self.via_proxy:
+            limits = self.server.limits
+            self.client_ip = limits.client(self.client_address[0], self.headers.get_all("X-Forwarded-For") or ())
+            if not limits.enter(self.request, self.client_ip):
+                self.close_connection = True
+                error = "too many connections from your address"
+                if self.path.startswith("/api/"):
+                    body, ctype = utf8(json_dumps({"ok": False, "error": error})), "application/json; charset=utf-8"
+                else:
+                    body, ctype = utf8(error + "\n"), "text/plain; charset=utf-8"
+                self.send_bytes(429, body, ctype, headers=[("Retry-After", "5")])
+                return False
+        return True
 
     # -- headers on every response
 
@@ -2755,7 +2990,7 @@ class Handler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def log_message(self, fmt, *args):
-        log.info("%s %s", self.client_address[0], TOKEN_RE.sub(r"\1***", fmt % args))
+        log.info("%s %s", self.client_ip, TOKEN_RE.sub(r"\1***", fmt % args))
 
     def log_error(self, fmt, *args):
         if not fmt.startswith("Request timed out"):  # idle keep-alive connections, normal
@@ -2888,7 +3123,7 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def session(self):
-        return self.app.sessions.get(self.cookie_sid())
+        return self.app.live_session(self.cookie_sid())
 
     def make_cookie(self, sid):
         cookie = "%s=%s; HttpOnly; SameSite=Strict; Path=/" % (self.app.cookie_name, sid)
@@ -2901,30 +3136,31 @@ class Handler(BaseHTTPRequestHandler):
         by itself. A link opened from another site or app (chat, mail) is a cross-site navigation, and browsers
         do not send the SameSite=Strict cookie on a redirect of it, so a 302 would show the sign-in page again;
         the page's own navigation is same-site."""
-        ip = self.client_address[0]
+        ip = self.client_ip
         if self.app.logins.blocked(ip):
             return self.send_login(429, "limit")
-        role = self.app.check_token(token)
-        if role is None:
+        t = self.app.check_token(token)
+        if t is None:
             self.app.logins.failed(ip)
             log.info("%s failed login", ip)
             return self.send_login(401, "wrong")
         old = self.cookie_sid()
         if old:
-            self.app.sessions.delete(old)
-            self.app.hub.close_session(old)
-        sid = self.app.sessions.create(role)
-        log.info("%s signed in as %s", ip, role)
+            self.app.end_session(old)
+        role = t["role"]
+        sid = self.app.sessions.create(role, t["id"], t["company"])
+        log.info("%s signed in as %s (token %d%s)", ip, role, t["id"],
+                 ", company %d" % t["company"] if t["company"] is not None else "")
         cookie = self.make_cookie(sid)
         if redirect_code is None:
             return self.send_bytes(200, utf8(LOGIN_BOUNCE), "text/html; charset=utf-8",
                                    headers=[("Set-Cookie", cookie)])
         self.redirect(redirect_code, cookie)
 
-    def read_body(self, allowed=True):
-        """Request body (bytes), or None after an error response. A body the bridge would not read
-        (GET) is refused, as are unclear lengths: left in the connection, its bytes would be taken for
-        the next request (behind a proxy that reuses connections, maybe of another user)."""
+    def read_body(self, allowed=True, limit=MAX_BODY):
+        """Request body (bytes) of at most `limit` bytes, or None after an error response. A body the bridge
+        would not read (GET) is refused, as are unclear lengths: left in the connection, its bytes would be taken
+        for the next request (behind a proxy that reuses connections, maybe of another user)."""
         lengths = self.headers.get_all("Content-Length") or []
         error = None
         if self.headers.get("Transfer-Encoding"):
@@ -2933,8 +3169,12 @@ class Handler(BaseHTTPRequestHandler):
             error = (400, "invalid Content-Length")
         else:
             length = int(lengths[0]) if lengths else 0
-            if length > MAX_BODY:
+            if length > limit:
                 error = (413, "request body too large")
+                # a body that is not read is still on its way: closing the connection then resets it (Windows), and
+                # the client loses the reply; a moderate one is read and dropped first
+                if length <= DRAIN_MAX:
+                    self.drain(length)
             elif length and not allowed:
                 error = (400, "a GET request has no body")
         if error:
@@ -2942,6 +3182,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(*error)
             return None
         return self.rfile.read(length) if length else b""
+
+    def drain(self, length):
+        """Read and drop up to `length` bytes of a refused body, for at most DRAIN_SECONDS."""
+        end = time.monotonic() + DRAIN_SECONDS
+        try:
+            while length > 0:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return
+                self.connection.settimeout(left)
+                data = self.rfile.read1(min(length, 65536))
+                if not data:
+                    return
+                length -= len(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                self.connection.settimeout(self.timeout)
+            except OSError:
+                pass
 
     def origin_ok(self, allow_null):
         origin = (self.headers.get("Origin") or "").strip().lower()
@@ -2993,6 +3254,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_login(200)
         if path == "/login.css":
             return self.send_bytes(200, utf8(LOGIN_CSS), "text/css; charset=utf-8")
+        if path == "/login.js":
+            return self.send_bytes(200, utf8(LOGIN_JS), "text/javascript; charset=utf-8")
         if path == "/favicon.ico":
             return self.send_text(404, "not found")
         if path.startswith(("/api/", "/tiles/", "/pak3d/")) and not self.same_origin():
@@ -3004,6 +3267,8 @@ class Handler(BaseHTTPRequestHandler):
             name = path[5:]
             if not (self.app.sessions.allow_3d(sess, name) if name in VIEW3D_RATES else self.app.sessions.allow(sess)):
                 return self.send_err(429, "rate limit", [("Retry-After", "1")])
+            if name.startswith("team/"):
+                return self.team_get(sess, name[5:], query)
             if name == "session":
                 return self.api_session(sess)
             if name == "events":
@@ -3024,10 +3289,10 @@ class Handler(BaseHTTPRequestHandler):
     def post(self):
         if not self.check_host():
             return
-        body = self.read_body()
+        path, _ = self.split_target()
+        body = self.read_body(limit=TEAM_MAX_BODY if path.startswith("/api/team/") else MAX_BODY)
         if body is None:
             return
-        path, _ = self.split_target()
         if path == "/login":
             # the login form is posted with Referrer-Policy no-referrer, so browsers send Origin: null; other
             # sites can send that too (failed attempts block the address for a minute): Sec-Fetch-Site tells
@@ -3053,29 +3318,42 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_err(403, "cross-site request")
         name = path[5:]
         if name == "logout":
-            self.app.sessions.delete(sess.sid)
-            self.app.hub.close_session(sess.sid)
+            self.app.end_session(sess.sid)
             cookie = "%s=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" % self.app.cookie_name
             return self.send_json(200, {"ok": True}, [("Set-Cookie", cookie)])
-        if name not in ROLE_ACTIONS[sess.role]:
+        team = name.startswith("team/")
+        if team:
+            # the team checks role and company itself (before the generic role actions)
+            if self.app.team_api is None:
+                return self.send_err(404, "the AI team is switched off")
+            if not self.app.team_api.allowed(sess):
+                return self.send_err(403, "the AI team is only available to players of a company")
+        elif name in NEVER_PROXIED or name not in ROLE_ACTIONS[sess.role]:
             return self.send_err(403, "command not allowed")
-        if name not in self.app.role_actions(sess.role):
+        elif name not in self.app.role_actions(sess.role):
             return self.send_err(403, "the game allows no %s (read-only remote control)" % name)
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
             return self.send_err(415, "Content-Type must be application/json")
         try:
-            args = json.loads(body.decode("utf-8")) if body.strip() else {}
-        except (ValueError, UnicodeDecodeError):
+            # NaN and Infinity are not JSON: refused (stored or echoed they would break the JSON of later replies)
+            args = json.loads(body.decode("utf-8"), parse_constant=_no_constant) if body.strip() else {}
+        except (ValueError, UnicodeDecodeError, RecursionError):  # RecursionError: [[[[... nested too deep
             return self.send_err(400, "invalid JSON")
         if not isinstance(args, dict):
             return self.send_err(400, "the body must be a JSON object")
+        if team:
+            code, reply = self.app.team_api.post(sess, name[5:], args)
+            return self.send_json(code, reply)
         self.api_action(name, args)
 
     # -- API
 
     def api_session(self, sess):
         game = self.app.hub.game_state()
+        company = None
+        if sess.company is not None:
+            company = {"nr": sess.company, "name": self.app.hub.player_name(sess.company)}
         self.send_json(200, {
             "role": sess.role,
             "allowed": {"read": list(READ_COMMANDS) + list(BRIDGE_READS) + list(VIEW3D_READS),
@@ -3084,10 +3362,29 @@ class Handler(BaseHTTPRequestHandler):
             "bridge": {"version": VERSION, "game_port": self.app.game_port},
             # supported: the game has the 3D export (null: not known yet); pak3d: /pak3d/ serves a directory
             "view3d": {"supported": self.app.poller.caps.get("3d"), "pak3d": self.app.pak3d is not None},
+            # the company of a player or admin token (name from the game, null while unknown); team: the session
+            # may use the AI team (/api/team/state tells whether the agents can work now)
+            "company": company,
+            "team": self.app.team_api is not None and self.app.team_api.allowed(sess),
         })
 
+    def team_get(self, sess, name, query):
+        """GET /api/team/<name>: the team's reads and its event stream (team.api.TeamAPI)."""
+        if self.app.team_api is None:
+            return self.send_err(404, "the AI team is switched off")
+        if name == "events":
+            return self.team_stream(sess)
+        if len(query) > 4096:
+            return self.send_err(400, "query too long")
+        args = check_args(urllib.parse.parse_qsl(query, keep_blank_values=True))
+        if isinstance(args, str):
+            return self.send_err(400, args)
+        code, reply = self.app.team_api.get(sess, name, args)
+        self.send_json(code, reply)
+
     def api_read(self, name, query):
-        if name not in READ_COMMANDS and name not in BRIDGE_READS and name not in VIEW3D_READS:
+        if name in NEVER_PROXIED or (name not in READ_COMMANDS and name not in BRIDGE_READS
+                                     and name not in VIEW3D_READS):
             return self.send_err(403, "command not allowed")
         if len(query) > 4096:
             return self.send_err(400, "query too long")
@@ -3199,14 +3496,7 @@ class Handler(BaseHTTPRequestHandler):
         client, eid, replay, snapshot = self.app.hub.subscribe(sess.sid, last_id)
         if client is None:
             return self.send_err(503, "too many event streams", [("Retry-After", "5")])
-        clean_end = False
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
             hello = json_dumps({"role": sess.role, "bridge_version": VERSION})
             # on a resume hello keeps the client's position, so a drop before the replay loses nothing
             hello_id = last_id if replay is not None else eid
@@ -3215,7 +3505,32 @@ class Handler(BaseHTTPRequestHandler):
                 first.extend(replay)
             else:
                 first.append(utf8("id: %d\nevent: snapshot\ndata: %s\n\n" % (eid, json_dumps(snapshot))))
-            self.write_chunk(b"".join(first))
+        except Exception:
+            self.app.hub.unsubscribe(client)
+            raise
+        self.pump(sess, client, b"".join(first), self.app.hub.unsubscribe)
+
+    def team_stream(self, sess):
+        """GET /api/team/events: the team events of the session's company (own ring, Last-Event-ID replay)."""
+        last_id = as_int((self.headers.get("Last-Event-ID") or "").strip())
+        client, first = self.app.team_api.open_stream(sess, last_id)
+        if client is None:
+            code, reply = first
+            return self.send_json(code, reply, [("Retry-After", "5")] if code == 503 else ())
+        self.pump(sess, client, first, self.app.team_events.unsubscribe)
+
+    def pump(self, sess, client, first, unsubscribe):
+        """Write an event stream: the first chunk, then what the client's queue gets, heartbeats while quiet; ends
+        when the client is closed (logout, replaced or revoked session, shutdown) or the session expired."""
+        clean_end = False
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.write_chunk(first)
             last_write = time.monotonic()
             check_at = last_write + SESSION_CHECK
             hb = self.app.heartbeat
@@ -3225,9 +3540,9 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 now = time.monotonic()
                 if now >= check_at:
-                    # also while events flow: an evicted or expired session ends its streams; the check
-                    # counts as activity of the session
-                    if self.app.sessions.get(sess.sid) is None:
+                    # also while events flow: an evicted, expired or revoked session ends its streams; the
+                    # check counts as activity of the session
+                    if self.app.live_session(sess.sid) is None:
                         clean_end = True
                         break
                     check_at = now + SESSION_CHECK
@@ -3257,7 +3572,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionError, TimeoutError, OSError):
             pass
         finally:
-            self.app.hub.unsubscribe(client)
+            unsubscribe(client)
             self.close_connection = True
             if clean_end:
                 try:
@@ -3370,37 +3685,158 @@ class Handler(BaseHTTPRequestHandler):
             left -= len(data)
 
 
+def parse_ip(text):
+    """An IP address (text without zone) -> ipaddress object, an IPv4-mapped IPv6 address as IPv4; None if not."""
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+def parse_trusted_proxy(text):
+    """--trusted-proxy ADDR or ADDR/BITS -> ipaddress network; ValueError with a message for anything else (names,
+    a network of every address)."""
+    text = (text or "").strip()
+    net = None
+    if re.fullmatch(r"[0-9A-Fa-f:.]{2,45}(/\d{1,3})?", text):
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            net = None
+    if net is None:
+        raise ValueError("--trusted-proxy takes an IP address or a network such as 10.0.0.0/8, not %r" % text)
+    if net.prefixlen == 0:
+        raise ValueError("--trusted-proxy %s would trust every address (any client could choose its own)" % text)
+    if net.version == 6 and net.prefixlen >= 96 and net.network_address.ipv4_mapped:
+        net = ipaddress.ip_network("%s/%d" % (net.network_address.ipv4_mapped, net.prefixlen - 96))
+    return net
+
+
+def forwarded_ip(entry):
+    """One X-Forwarded-For entry -> ipaddress object or None: 1.2.3.4, 1.2.3.4:5678, 2001:db8::1, [2001:db8::1],
+    [2001:db8::1]:443 (no names, no "unknown", no zone ids)."""
+    t = entry.strip()
+    if t.startswith("["):
+        end = t.find("]")
+        if end < 0 or not re.fullmatch(r"(:\d{1,5})?", t[end + 1:]):
+            return None
+        t = t[1:end]
+    elif t.count(":") == 1:
+        t = t.partition(":")[0]  # IPv4 with a port
+    if not re.fullmatch(r"[0-9A-Fa-f:.]{2,45}", t):
+        return None
+    return parse_ip(t)
+
+
+def is_loopback(address):
+    ip = parse_ip(address) if isinstance(address, str) else address
+    return ip is not None and ip.is_loopback
+
+
+class ConnectionLimits:
+    """Open connections, one thread each: at most MAX_CONNECTIONS, and at most max_per_ip of one address other than
+    the loopback (a tunnel there carries all users), so a client that never finishes its requests cannot take every
+    thread. Direct connections are counted when they are accepted (Server.verify_request), before any header.
+
+    A trusted proxy (--trusted-proxy) carries the requests of all its users, so its connections are not counted by
+    its own address. Instead each of its requests counts, from its headers until its answer is sent (an event stream:
+    while it is open), for the client it names in X-Forwarded-For (Handler.parse_request); its idle connections
+    count for nobody. The client is the right-most entry that is not a trusted proxy itself: every proxy appends the
+    address it got the request from, the entries further left come from the client and may be anything."""
+
+    def __init__(self, trusted=(), max_per_ip=MAX_CONNECTIONS_PER_IP, max_total=MAX_CONNECTIONS):
+        self.trusted_nets = tuple(trusted)
+        self.max_per_ip = max_per_ip
+        self.max_total = max_total
+        self.lock = threading.Lock()
+        self.conns = {}      # accepted socket -> peer address (text)
+        self.forwarded = {}  # socket of a trusted proxy -> client address of the request it carries now
+
+    def trusted(self, address):
+        if not self.trusted_nets:
+            return False
+        ip = parse_ip(address) if isinstance(address, str) else address
+        return ip is not None and any(ip.version == n.version and ip in n for n in self.trusted_nets)
+
+    def client(self, peer, forwarded):
+        """The client address of a request from `peer` with these X-Forwarded-For header lines (text): the peer
+        itself unless it is a trusted proxy; then the right-most entry that is not a trusted proxy (all trusted: the
+        left-most of them; up to MAX_FORWARDED entries, from the right, up to the first invalid one), the proxy's
+        own address when there is no valid entry."""
+        ip = parse_ip(peer)
+        if ip is None or not self.trusted(ip):
+            return peer
+        entries = []
+        for line in forwarded:
+            entries.extend(line.split(","))
+        found = None
+        for entry in reversed(entries[-MAX_FORWARDED:]):
+            addr = forwarded_ip(entry)
+            if addr is None:
+                break
+            found = addr
+            if not self.trusted(addr):
+                break
+        return str(found if found is not None else ip)
+
+    def accept(self, sock, peer):
+        """A new connection: False to close it at once."""
+        with self.lock:
+            if len(self.conns) >= self.max_total:
+                return False
+            if not is_loopback(peer) and not self.trusted(peer) and \
+                    sum(1 for a in self.conns.values() if a == peer) >= self.max_per_ip:
+                return False
+            self.conns[sock] = peer
+        return True
+
+    def enter(self, sock, client):
+        """A request of a trusted proxy for `client` begins: False when that client has max_per_ip open already."""
+        with self.lock:
+            if not is_loopback(client) and \
+                    sum(1 for a in self.forwarded.values() if a == client) >= self.max_per_ip:
+                return False
+            self.forwarded[sock] = client
+        return True
+
+    def leave(self, sock):
+        with self.lock:
+            self.forwarded.pop(sock, None)
+
+    def close(self, sock):
+        with self.lock:
+            self.conns.pop(sock, None)
+            self.forwarded.pop(sock, None)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
     allow_reuse_address = os.name != "nt"  # on Windows SO_REUSEADDR lets others take the port
     request_queue_size = 64
 
-    def __init__(self, address, app):
+    def __init__(self, address, app, trusted_proxies=(), max_per_ip=MAX_CONNECTIONS_PER_IP):
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
         self.app = app
-        self.conn_lock = threading.Lock()
-        self.conns = {}  # accepted socket -> address; every one has a thread until it is closed
+        self.limits = ConnectionLimits(trusted_proxies, max_per_ip)
         super().__init__(address, Handler)
 
+    @property
+    def conns(self):
+        """The accepted connections (socket -> peer address), see ConnectionLimits."""
+        return self.limits.conns
+
     def verify_request(self, request, client_address):
-        """Refuse (close at once) connections over MAX_CONNECTIONS, or over MAX_CONNECTIONS_PER_IP from one
-        address that is not the loopback (a proxy or tunnel there carries all users): every connection
-        holds a thread, and a client that never finishes its request would keep it for long."""
-        ip = client_address[0]
-        with self.conn_lock:
-            if len(self.conns) >= MAX_CONNECTIONS:
-                return False
-            if not (ip.startswith(("127.", "::ffff:127.")) or ip == "::1") and \
-                    sum(1 for a in self.conns.values() if a == ip) >= MAX_CONNECTIONS_PER_IP:
-                return False
-            self.conns[request] = ip
-        return True
+        """Refuse (close at once) connections over the limits of ConnectionLimits: every connection holds a thread,
+        and a client that never finishes its request would keep it for long."""
+        return self.limits.accept(request, client_address[0])
 
     def shutdown_request(self, request):
-        with self.conn_lock:
-            self.conns.pop(request, None)
+        self.limits.close(request)
         super().shutdown_request(request)
 
     def server_bind(self):
@@ -3416,23 +3852,128 @@ class Server(ThreadingHTTPServer):
 
 # --- start ---------------------------------------------------------------------------------
 
-def load_tokens(enable_admin):
-    tokens = []
-    roles = ["viewer", "player"] + (["admin"] if enable_admin else [])
-    for role in roles:
-        env = "SIMUTRANS_DASHBOARD_TOKEN_" + role.upper()
-        token = os.environ.get(env, "").strip()
-        if token:
-            if len(token) < 16 or not re.fullmatch(r"[A-Za-z0-9_\-.~]+", token):
-                raise SystemExit("%s must have at least 16 characters (letters, digits, - _ . ~)" % env)
-        else:
-            token = secrets.token_urlsafe(16)
-        tokens.append((role, token))
-    if not enable_admin and os.environ.get("SIMUTRANS_DASHBOARD_TOKEN_ADMIN"):
+def prepare_tokens(db, enable_admin, environ):
+    """Fill an empty token table: the tokens of the environment (SIMUTRANS_DASHBOARD_TOKEN_<ROLE>, checked as
+    always) and a random one for each role without; player and admin are bound to the company
+    SIMUTRANS_DASHBOARD_PLAYER_COMPANY (default 0). Returns [(role, token)] to print as access links: those
+    stored now, nothing when the database held tokens already (then the environment tokens are ignored). An
+    in-memory database is empty at every start, so it takes the environment tokens every time (the old way)."""
+    try:
+        given = team_db.env_tokens(environ, enable_admin)
+        company = team_db.env_player_company(environ)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    if not enable_admin and environ.get(team_db.ENV_PREFIX + "ADMIN"):
         log.warning("SIMUTRANS_DASHBOARD_TOKEN_ADMIN is ignored without --enable-admin")
-    if len({t for _, t in tokens}) != len(tokens):
-        raise SystemExit("the dashboard tokens of the roles must differ")
-    return tokens
+    if db.token_count():
+        if given:
+            log.warning("env tokens ignored, the database holds the tokens (%s)", db.path)
+        return []
+    roles = ["viewer", "player"] + (["admin"] if enable_admin else [])
+    have = dict(given)
+    pairs = [(role, have.get(role) or secrets.token_urlsafe(24)) for role in roles]
+    if db.import_tokens_if_empty(pairs, company) is None:
+        return []  # another bridge on the same database was faster
+    if not db.memory:
+        log.info("stored %d access tokens in the database %s (player and admin of company %d)", len(pairs), db.path,
+                 company)
+    return pairs
+
+
+def load_env_file(path, environ, warnings=None):
+    """Settings from a KEY=VALUE file (lines; # comments; optional quotes; an optional "export "). Only keys not
+    set in the environment already are taken. Values are never logged or shown (the file holds secrets such as
+    DEEPSEEK_API_KEY). Returns the number of keys taken; warnings (a list) gets a warning when other users may read
+    the file (POSIX)."""
+    try:
+        f = open(path, encoding="utf-8-sig")
+    except OSError as e:
+        raise SystemExit("cannot read --env-file %s: %s" % (path, e.strerror or e))
+    taken = 0
+    with f:
+        if os.name != "nt" and warnings is not None:
+            try:
+                if os.fstat(f.fileno()).st_mode & 0o077:
+                    warnings.append("--env-file %s can be read by other users (chmod 600 it: it holds secrets)" % path)
+            except OSError:
+                pass
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, sep, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if not sep or not ENV_NAME.match(key):
+                # the line itself is not shown: it may hold a secret
+                raise SystemExit("--env-file %s: line %d is not KEY=VALUE" % (path, lineno))
+            if value[:1] in ("\"", "'") and value.find(value[0], 1) > 0 and \
+                    (value[value.find(value[0], 1) + 1:].strip() or "#").startswith("#"):
+                value = value[1:value.find(value[0], 1)]  # "quoted" or 'quoted', maybe with a comment after it
+            elif " #" in value:
+                value = value.split(" #", 1)[0].rstrip()  # a comment after an unquoted value
+            if key not in environ:
+                environ[key] = value
+                taken += 1
+    return taken
+
+
+def token_cli(argv):
+    """simutrans_dashboard.py token add|list|revoke: the access tokens in the database (a file; the CLI may run while
+    the bridge does, a revoked token's sessions end within seconds)."""
+    p = argparse.ArgumentParser(prog="simutrans_dashboard.py token",
+                                description="Manage the access tokens of the dashboard, kept (as hashes) in its "
+                                            "database.")
+    sub = p.add_subparsers(dest="action", metavar="add|list|revoke")
+    sub.required = True
+    db_help = "the database file (default: $SIMUTRANS_DASHBOARD_DB)"
+    a = sub.add_parser("add", help="create a token and print it (once: only its hash is kept)")
+    a.add_argument("--role", required=True, choices=team_db.ROLES)
+    a.add_argument("--company", type=int, help="company of a player or admin token (0..14, not 1 = public service)")
+    a.add_argument("--label", help="a name for the token (who uses it)")
+    a.add_argument("--db", metavar="FILE", help=db_help)
+    ls = sub.add_parser("list", help="list the tokens (never their values)")
+    ls.add_argument("--db", metavar="FILE", help=db_help)
+    r = sub.add_parser("revoke", help="revoke a token: its sessions end")
+    r.add_argument("id", type=int, help="the id from token list")
+    r.add_argument("--db", metavar="FILE", help=db_help)
+    args = p.parse_args(argv)
+    path = args.db or os.environ.get("SIMUTRANS_DASHBOARD_DB")
+    if not path or path == ":memory:":
+        p.error("the token commands need a database file: --db FILE or $SIMUTRANS_DASHBOARD_DB")
+    if args.action != "add" and not os.path.isfile(path):
+        raise SystemExit("no database at %s" % path)
+    try:
+        db = team_db.TeamDB(path)
+    except Exception as e:
+        raise SystemExit("cannot open the database %s: %s" % (path, e))
+    try:
+        if args.action == "add":
+            if args.role == "viewer" and args.company is not None:
+                p.error("a viewer token has no company")
+            try:
+                tid, token = db.add_token(args.role, args.company, args.label)
+            except ValueError as e:
+                p.error(str(e))
+            print("token %d: %s%s%s" % (tid, args.role, "" if args.company is None else ", company %d" % args.company,
+                                        ", label %s" % args.label.strip() if args.label and args.label.strip() else ""))
+            print(token)
+        elif args.action == "list":
+            rows = [("id", "role", "company", "label", "created", "revoked")]
+            for t in db.list_tokens():
+                rows.append((str(t["id"]), t["role"], "-" if t["company"] is None else str(t["company"]),
+                             t["label"] or "-", t["created"], t["revoked"] or "-"))
+            widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+            for row in rows:
+                print("  ".join(v.ljust(w) for v, w in zip(row, widths)).rstrip())
+        else:
+            if not db.revoke_token(args.id):
+                raise SystemExit("no active token with id %d" % args.id)
+            print("token %d revoked" % args.id)
+    finally:
+        db.close()
+    return 0
 
 
 def parse_args(argv=None):
@@ -3447,29 +3988,138 @@ def parse_args(argv=None):
                    help="address to listen on (default 127.0.0.1; see README before exposing it)")
     p.add_argument("--allowed-host", action="append", default=[], metavar="NAME",
                    help="additional Host name the dashboard answers to, e.g. a tunnel hostname (repeatable)")
+    p.add_argument("--trusted-proxy", action="append", default=[], metavar="ADDR[/BITS]",
+                   help="IP address or network of a reverse proxy in front of the bridge (repeatable): for its "
+                        "requests the client address (connection limit, login limit, log) is the one it appends to "
+                        "X-Forwarded-For; default none (X-Forwarded-For is ignored)")
+    p.add_argument("--max-conn-per-ip", type=int, default=MAX_CONNECTIONS_PER_IP, metavar="N",
+                   help="open connections of one client address at once, the loopback excepted (default %d)"
+                        % MAX_CONNECTIONS_PER_IP)
     p.add_argument("--enable-admin", action="store_true",
-                   help="also create an admin token (adds the cash command)")
+                   help="also create an admin token and accept the admin tokens of the database (adds the cash "
+                        "command)")
     p.add_argument("--no-events", action="store_true",
                    help="do not subscribe the events of the game (protocol 2), only poll")
     p.add_argument("--pak3d", metavar="DIR", default=os.environ.get("SIMUTRANS_DASHBOARD_PAK3D") or None,
                    help="directory of a pak 3D (models and textures of the 3D view) served under /pak3d/ "
                         "(default: $SIMUTRANS_DASHBOARD_PAK3D, else none)")
+    p.add_argument("--db", metavar="FILE",
+                   help="SQLite database of the access tokens and of the AI team's history (default: "
+                        "$SIMUTRANS_DASHBOARD_DB; without one both are kept in memory and the tokens come from the "
+                        "environment at every start). Tokens: '%(prog)s token add|list|revoke'")
+    p.add_argument("--env-file", metavar="FILE",
+                   help="read settings (KEY=VALUE lines, e.g. DEEPSEEK_API_KEY) from a file; the environment wins")
+    p.add_argument("--no-team", action="store_true", help="do not offer the AI team (no /api/team/* routes)")
+    # settings of the AI team, kept in the database (they stay until changed again)
+    p.add_argument("--team-limit", metavar="USD",
+                   help="daily cost limit of the AI team for all companies together, in USD (stored in the "
+                        "database; default 0.50)")
+    p.add_argument("--team-company-limit", metavar="USD",
+                   help="daily cost limit of the AI team per company, in USD, or 'off' (stored in the database)")
+    p.add_argument("--team-model", metavar="AGENT=MODEL", action="append", default=[],
+                   help="language model of an agent, e.g. analyst=deepseek-flash; 'AGENT=' returns to the default "
+                        "(stored in the database; repeatable)")
+    p.add_argument("--team-offpeak-factor", metavar="F",
+                   help="price factor outside DeepSeek's peak hours for the cost counter, e.g. 0.5, or 'off' "
+                        "(default off: the peak prices are counted always; stored in the database)")
     p.add_argument("--verbose", action="store_true", help="log every request")
     # hidden: short intervals and heartbeat for automated tests
     p.add_argument("--test-fast", action="store_true", help=argparse.SUPPRESS)
+    # hidden: POST /api/team/test_publish puts an event into the caller's own team stream (automated tests)
+    p.add_argument("--test-team", action="store_true", help=argparse.SUPPRESS)
+    # hidden: the limit of chat messages per token as BURST,SECONDS (automated tests of the limit with --test-fast)
+    p.add_argument("--test-send-limit", metavar="BURST,SECONDS", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if args.test_send_limit is not None:
+        try:
+            burst, every = (float(v) for v in args.test_send_limit.split(","))
+            if burst < 1 or every <= 0:
+                raise ValueError
+        except ValueError:
+            p.error("--test-send-limit takes BURST,SECONDS, e.g. 10,3")
+        args.test_send_limit = (burst, every)
     for name in args.allowed_host:
         if not re.fullmatch(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.\-]+)(:\d+)?", name):
             p.error("--allowed-host takes a host name with an optional port, not %r" % name)
+    try:
+        args.trusted_proxy = tuple(parse_trusted_proxy(text) for text in args.trusted_proxy)
+    except ValueError as e:
+        p.error(str(e))
+    if not 1 <= args.max_conn_per_ip <= MAX_CONNECTIONS:
+        p.error("--max-conn-per-ip takes a number from 1 to %d" % MAX_CONNECTIONS)
     return args
 
 
+def team_settings(db, args):
+    """Store the AI team settings given on the command line (--team-limit, --team-company-limit, --team-model,
+    --team-offpeak-factor) in the database. ValueError with a message for a bad value."""
+    def usd(text, name, allow_off):
+        if allow_off and text.strip().lower() in ("off", "none", ""):
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            value = -1.0
+        if not 0 <= value <= 1000:
+            raise ValueError("%s takes an amount of USD from 0 to 1000%s" % (name, " or 'off'" if allow_off else ""))
+        return "%g" % value
+    if args.team_limit is not None:
+        db.set_setting("daily_limit_usd", usd(args.team_limit, "--team-limit", False))
+    if args.team_company_limit is not None:
+        db.set_setting("company_limit_usd", usd(args.team_company_limit, "--team-company-limit", True))
+    for item in args.team_model:
+        agent, sep, model = item.partition("=")
+        agent, model = agent.strip(), model.strip()
+        if not sep or not team_roles.is_agent(agent):
+            raise ValueError("--team-model takes AGENT=MODEL with an agent of: %s" % ", ".join(team_roles.AGENT_IDS))
+        if model and not team_roles.MODEL_NAME.match(model):
+            raise ValueError("--team-model: invalid model name %r" % model)
+        db.set_setting("model_" + agent, model or None)
+    if args.team_offpeak_factor is not None:
+        text = args.team_offpeak_factor.strip().lower()
+        if text in ("off", "none", "", "1"):
+            db.set_setting("offpeak_factor", None)
+        else:
+            try:
+                factor = float(text)
+            except ValueError:
+                factor = 0.0
+            if not 0 < factor < 1:
+                raise ValueError("--team-offpeak-factor takes a number between 0 and 1, or 'off'")
+            db.set_setting("offpeak_factor", "%g" % factor)
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "token":
+        return token_cli(argv[1:])
     args = parse_args(argv)
+    env_warnings = []
+    taken = load_env_file(args.env_file, os.environ, env_warnings) if args.env_file else None
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(errors="backslashreplace")  # game texts may not fit the console code page
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
-    tokens = load_tokens(args.enable_admin)
+    if taken is not None:
+        log.info("took %d settings from %s", taken, args.env_file)
+    for text in env_warnings:
+        log.warning("%s", text)
+    db_path = args.db or os.environ.get("SIMUTRANS_DASHBOARD_DB") or None
+    try:
+        db = team_db.TeamDB(db_path)
+    except Exception as e:
+        raise SystemExit("cannot open the database %s: %s" % (db_path, e))
+    if db.memory:
+        log.warning("no database: the tokens come from the environment at every start and team history is not kept; "
+                    "pass --db")
+    try:
+        team_settings(db, args)
+    except ValueError as e:
+        db.close()
+        raise SystemExit(str(e))
+    interrupted = db.interrupt_runs()
+    if interrupted:
+        log.info("%d team runs of the last start were interrupted", interrupted)
+    tokens = prepare_tokens(db, args.enable_admin, os.environ)
     intervals, min_gap, heartbeat = dict(INTERVALS), dict(MIN_GAP), HEARTBEAT
     event_intervals, event_ms, arrivals_gap = dict(EVENT_INTERVALS), EVENT_INTERVAL_MS, ARRIVALS_GAP
     if args.test_fast:
@@ -3483,15 +4133,20 @@ def main(argv=None):
         # e.g. a volume that is not mounted: the dashboard works without models (the 3D view draws stand-ins)
         log.warning("--pak3d %s is not a directory, /pak3d/ answers 404", pak3d)
         pak3d = None
-    app = App(args.port, args.game_port, args.bind, args.allowed_host, tokens, intervals, min_gap,
+    app = App(args.port, args.game_port, args.bind, args.allowed_host, db, intervals, min_gap,
               heartbeat, args.verbose, event_intervals, not args.no_events, event_ms, arrivals_gap,
               1.0 if args.test_fast else ROUTE_REFRESH, 1.0 if args.test_fast else FACTORY_STATUS_TTL, pak3d,
-              8 if args.test_fast else QUEUE_3D, 4 if args.test_fast else QUEUE_VEH)
+              8 if args.test_fast else QUEUE_3D, 4 if args.test_fast else QUEUE_VEH, enable_admin=args.enable_admin,
+              team=not args.no_team, test_team=args.test_team, test_fast=args.test_fast,
+              send_limit=args.test_send_limit)
     if not os.path.isfile(os.path.join(WEB_DIR, "index.html")):
         log.warning("%s has no index.html", WEB_DIR)
     try:
-        server = Server((args.bind, args.port), app)
+        server = Server((args.bind, args.port), app, args.trusted_proxy, args.max_conn_per_ip)
     except OSError as e:
+        if app.runtime:
+            app.runtime.shutdown()
+        db.close()
         raise SystemExit("cannot listen on %s:%d: %s" % (args.bind, args.port, e))
 
     def stop(signum, frame):
@@ -3505,6 +4160,7 @@ def main(argv=None):
         app.subscriber.start()
     app.worker_3d.start()
     app.worker_veh.start()
+    app.worker_team.start()
     if args.bind in ("127.0.0.1", "0.0.0.0", "::", "localhost"):
         host = "127.0.0.1"
     else:
@@ -3513,26 +4169,37 @@ def main(argv=None):
         VERSION, host, args.port, args.game_port, ", pak 3D %s" % pak3d if pak3d else ""))
     for role, token in tokens:
         print("  %-6s http://%s:%d/?token=%s" % (role, host, args.port, token))
+    if not tokens:
+        print("  access tokens: in the database %s (simutrans_dashboard.py token add|list|revoke --db %s)"
+              % (db.path, db.path))
     if args.bind not in ("127.0.0.1", "::1", "localhost"):
         print("  warning: listening on %s; use TLS and an access proxy outside your LAN (see README)" % args.bind)
+    if args.trusted_proxy:
+        log.info("client addresses from X-Forwarded-For of the trusted proxies %s (at most %d connections per "
+                 "client)", ", ".join(str(n) for n in args.trusted_proxy), args.max_conn_per_ip)
     sys.stdout.flush()
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         log.info("stopping")
     finally:
+        if app.runtime:
+            app.runtime.shutdown()  # first: its runs still use the team connection and the database
         app.poller.stop()
         if app.subscriber:
             app.subscriber.stop()
         app.worker_3d.stop()
         app.worker_veh.stop()
+        app.worker_team.stop()
         app.hub.close()
+        app.team_events.close()
         end = time.monotonic() + 1.0  # let the event streams send their last chunk
-        while app.hub.stream_count() and time.monotonic() < end:
+        while (app.hub.stream_count() or app.team_events.stream_count()) and time.monotonic() < end:
             time.sleep(0.02)
         server.server_close()
         app.req_conn.close()
+        db.close()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -13,6 +13,8 @@ import { LinesView } from "/js/views/lines.js";
 import { WorldView } from "/js/views/world.js";
 import { View3DTab, view3dSupported } from "/js/views/view3d.js";
 import { DetailPanel } from "/js/views/detailpanel.js";
+import { TeamView } from "/js/team/view.js";
+import { isTeam, totalPending } from "/js/team/state.js";
 import "/js/panel.js";
 
 const TABS = [
@@ -23,6 +25,7 @@ const TABS = [
 	["convoys", "tab_convoys", "bus"],
 	["lines", "tab_lines", "lines"],
 	["world", "tab_world", "globe"],
+	["team", "tab_team", "team"], // players of a company only (S.session.team)
 ];
 
 // --- theme -----------------------------------------------------------------------------------
@@ -49,12 +52,14 @@ if (window.matchMedia) {
 // --- components ------------------------------------------------------------------------------
 
 function Tabs() {
-	useTopics(["ui", "lang", "session", "game"]);
-	const tabs = TABS.filter(([id]) => id !== "view3d" || view3dSupported());
+	useTopics(["ui", "lang", "session", "game", "team"]);
+	const tabs = TABS.filter(([id]) => (id !== "view3d" || view3dSupported()) && (id !== "team" || isTeam()));
+	const pending = isTeam() ? totalPending() : 0;
 	return html`<nav class="tabs" role="tablist" aria-label=${t("app_title")}>
 		${tabs.map(([id, label, icon]) => html`<button type="button" role="tab" aria-selected=${S.ui.tab === id}
-			class=${"tab" + (S.ui.tab === id ? " on" : "")} onClick=${() => setUi({ tab: id })}>
-			<${Icon} name=${icon} size=${20} /><span>${t(label)}</span>
+			class=${"tab tab-" + id + (S.ui.tab === id ? " on" : "")} onClick=${() => setUi({ tab: id })}>
+			<span class="tab-icon"><${Icon} name=${icon} size=${20} />${id === "team" && pending ? html`<span class="tab-badge"
+				title=${t("team_q_pending_n", pending)}>${pending}</span>` : null}</span><span>${t(label)}</span>
 		</button>`)}
 	</nav>`;
 }
@@ -85,7 +90,7 @@ function Banner() {
 }
 
 function App() {
-	useTopics(["ui", "lang"]);
+	useTopics(["ui", "lang", "session"]);
 	const tab = S.ui.tab;
 	document.title = t("app_title");
 	return html`<${StatusBar} />
@@ -99,6 +104,7 @@ function App() {
 				<section class="view" hidden=${tab !== "convoys"}><${ConvoysView} visible=${tab === "convoys"} /></section>
 				<section class="view" hidden=${tab !== "lines"}><${LinesView} visible=${tab === "lines"} /></section>
 				<section class="view" hidden=${tab !== "world"}><${WorldView} visible=${tab === "world"} /></section>
+				<section class="view" hidden=${tab !== "team"}>${isTeam() ? html`<${TeamView} visible=${tab === "team"} />` : null}</section>
 			</main>
 			<${DetailPanel} />
 		</div>

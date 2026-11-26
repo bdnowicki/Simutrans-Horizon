@@ -1,4 +1,5 @@
-// Simutrans-Horizon dashboard: the live map (Leaflet, CRS.Simple, top-down, 1 unit = 1 map tile, y down).
+// Simutrans-Horizon dashboard: the live map (Leaflet, CRS.Simple, top-down, 1 unit = 1 map tile, y down). It also
+// draws the plan of a project of the AI team (setPlan) and takes the map picks of its questions (startPick).
 // Artistic License, see LICENSE.txt.
 import { S, subscribe, setUi, emit, perf, toast, stationIndex, cityIndex } from "/js/store.js";
 import { Terrain, createTerrainLayer } from "/js/terrain.js";
@@ -64,6 +65,13 @@ class MapController {
 		this.pulseReq = 0;
 		this.pulseLast = 0;
 		this.lastCenter = null; // Leaflet LatLng of the map centre while it was last visible
+		this.plan = null; // preview of a project of the AI team drawn over the map: {id, title, preview}
+		this.planDrawn = 0; // items of the plan drawn in the last frame (tests)
+		this.planColors = null;
+		// pick on the map for a question of the AI team: {spec: {mode: "tile"|"area"|"ab"|"object", kind}, points,
+		// hover, miss, done(value), cancel()}
+		this.pickState = null;
+		this.pickKey = null;
 	}
 
 	mount(el) {
@@ -99,8 +107,12 @@ class MapController {
 		this.pulseLayer = createOverlay((ctx, v) => this.drawPulses(ctx, v), { pane: "features" }).addTo(map);
 		this.convoys = createOverlay((ctx, v) => this.drawConvoys(ctx, v), { pane: "convoys" }).addTo(map);
 		this.labels = createOverlay((ctx, v) => this.drawLabels(ctx, v), { pane: "labels" }).addTo(map);
+		// the plan of a project and the marks of a map pick: above the convoys, below the names
+		map.createPane("plan").style.zIndex = 425;
+		this.planLayer = createOverlay((ctx, v) => this.drawPlan(ctx, v), { pane: "plan" }).addTo(map);
 		map.setView([-512, 512], -1);
 		map.on("click", (e) => this.onClick(e));
+		map.on("mousemove", (e) => this.onPickMove(e));
 		// the centre while the map is shown (a hidden map has no size; the 3D view starts here)
 		map.on("moveend", () => {
 			const s = map.getSize();
@@ -358,6 +370,7 @@ class MapController {
 		}
 		this.features.redraw();
 		this.labels.redraw();
+		this.planLayer.redraw();
 	}
 
 	redrawConvoys() {
@@ -388,6 +401,9 @@ class MapController {
 			this.route = null;
 			this.convoyLeg = null;
 			this.clearMarker();
+			if (this.plan && this.plan.worldKey && this.plan.worldKey !== S.worldKey) {
+				this.setPlan(null); // positions of another world
+			}
 			const bounds = L.latLngBounds([[-w.size_y, 0], [0, w.size_x]]);
 			const sizeKey = w.size_x + "x" + w.size_y;
 			if (sizeKey !== this.sizeKey) {
@@ -440,6 +456,9 @@ class MapController {
 	}
 
 	onUi(patch) {
+		if ("tab" in patch && S.ui.tab !== "map" && this.pickState) {
+			this.cancelPick(false); // another tab was chosen while picking
+		}
 		if ("highlightLine" in patch) {
 			this.loadRoute(S.ui.highlightLine);
 		}
@@ -509,6 +528,397 @@ class MapController {
 	setConvoyLeg(leg) {
 		this.convoyLeg = leg;
 		this.redrawStatic();
+	}
+
+	// --- plan of a project and map picks of the AI team --------------------------------------------------------
+
+	/** Draws the preview of a project ({id, title, preview: {bbox, items}}) over the map; null removes it. */
+	setPlan(plan) {
+		this.plan = plan && plan.preview ? Object.assign({ worldKey: S.worldKey }, plan) : null;
+		this.planDrawn = 0;
+		if (this.map) {
+			this.planLayer.redraw();
+		}
+		emit("plan");
+	}
+
+	/** Fits the map to the box of the plan. */
+	fitPlan() {
+		const b = this.plan && this.plan.preview && this.plan.preview.bbox;
+		if (Array.isArray(b) && b.length === 4 && b.every((n) => typeof n === "number")) {
+			this.fitBox(Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.max(b[0], b[2]), Math.max(b[1], b[3]), 4);
+			return;
+		}
+		const pts = [];
+		for (const it of (this.plan && this.plan.preview && this.plan.preview.items) || []) {
+			for (const p of Array.isArray(it.tiles) ? it.tiles : []) {
+				if (Array.isArray(p) && typeof p[0] === "number") {
+					pts.push({ x: p[0], y: p[1] });
+				}
+			}
+		}
+		this.fitPoints(pts, 4);
+	}
+
+	planInfo() {
+		const items = this.plan && this.plan.preview && Array.isArray(this.plan.preview.items) ? this.plan.preview.items.length : 0;
+		return { id: this.plan ? this.plan.id : null, items, drawn: this.planDrawn };
+	}
+
+	/** Colours of the plan (CSS tokens --plan-*, per theme). */
+	planPalette() {
+		const key = isDark() ? "dark" : "light";
+		if (!this.planColors || this.planColors.key !== key) {
+			const cs = getComputedStyle(document.documentElement);
+			const get = (n, f) => cs.getPropertyValue(n).trim() || f;
+			this.planColors = {
+				key, way: get("--plan-way", "#1c7ed6"), bridge: get("--plan-bridge", "#7048e8"),
+				tunnel: get("--plan-tunnel", "#495057"), wayobj: get("--plan-wayobj", "#0c8599"),
+				station: get("--plan-station", "#e8590c"), depot: get("--plan-depot", "#2b8a3e"),
+				roadsign: get("--plan-sign", "#f59f00"), remove: get("--plan-remove", "#e03131"),
+				line: get("--plan-line", "#ae3ec9"), convoy: get("--plan-convoy", "#1098ad"),
+				casing: get("--plan-casing", "#ffffff"), pick: get("--plan-pick", "#f03e3e"),
+			};
+		}
+		return this.planColors;
+	}
+
+	/**
+	 * Starts a pick on the map: spec {mode: "tile" | "area" | "ab" | "object", kind: "line" | "station" | "convoy" |
+	 * "factory"}; done(value) gets {x, y}, {x1, y1, x2, y2}, {a: {x, y}, b: {x, y}} or the object ({kind, id} or
+	 * {kind: "factory", x, y}). Escape or cancelPick() ends it (cancel() is called).
+	 */
+	startPick(spec, done, cancel) {
+		this.cancelPick(false);
+		this.pickState = { spec: Object.assign({}, spec), points: [], hover: null, miss: false, done, cancel };
+		if (!this.pickKey) {
+			this.pickKey = (e) => {
+				if (this.pickState && e.key === "Escape") {
+					e.preventDefault();
+					e.stopPropagation();
+					this.cancelPick(true);
+				}
+			};
+			document.addEventListener("keydown", this.pickKey, true);
+		}
+		if (spec.mode === "object") {
+			const layer = { station: "stations", factory: "factories", convoy: "convoys", line: "convoys" }[spec.kind];
+			if (layer && !S.ui.layers[layer]) {
+				setUi({ layers: Object.assign({}, S.ui.layers, { [layer]: true }) });
+			}
+		}
+		if (this.map) {
+			this.planLayer.redraw();
+		}
+		emit("pick");
+	}
+
+	cancelPick(notify = true) {
+		const p = this.pickState;
+		if (!p) {
+			return;
+		}
+		this.pickState = null;
+		if (this.map) {
+			this.planLayer.redraw();
+		}
+		emit("pick");
+		if (notify && p.cancel) {
+			p.cancel();
+		}
+	}
+
+	finishPick(value) {
+		const p = this.pickState;
+		this.pickState = null;
+		if (this.map) {
+			this.planLayer.redraw();
+		}
+		emit("pick");
+		if (p && p.done) {
+			p.done(value);
+		}
+	}
+
+	pickInfo() {
+		const p = this.pickState;
+		return p ? { mode: p.spec.mode, kind: p.spec.kind || null, points: p.points.slice(), miss: p.miss } : null;
+	}
+
+	/** The map square under a Leaflet LatLng ({x, y}), or null outside the world. */
+	tileAt(latlng) {
+		const x = Math.floor(latlng.lng), y = Math.floor(-latlng.lat);
+		const w = S.poll && S.poll.world;
+		return w && x >= 0 && y >= 0 && x < w.size_x && y < w.size_y ? { x, y } : null;
+	}
+
+	onPickMove(e) {
+		const p = this.pickState;
+		if (!p || p.spec.mode === "object") {
+			return;
+		}
+		const tile = this.tileAt(e.latlng);
+		if (!tile !== !p.hover || (tile && (tile.x !== p.hover.x || tile.y !== p.hover.y))) {
+			p.hover = tile;
+			this.planLayer.redraw();
+		}
+	}
+
+	onPickClick(e) {
+		const p = this.pickState, spec = p.spec;
+		if (spec.mode === "object") {
+			const hit = this.pickKind(e.containerPoint, e.originalEvent && e.originalEvent.pointerType === "touch", spec.kind);
+			if (hit) {
+				this.finishPick(hit);
+			} else {
+				p.miss = true;
+				emit("pick");
+			}
+			return;
+		}
+		const tile = this.tileAt(e.latlng);
+		if (!tile) {
+			return;
+		}
+		if (spec.mode === "tile") {
+			this.finishPick(tile);
+		} else if (!p.points.length) {
+			p.points.push(tile);
+			p.hover = tile;
+			this.planLayer.redraw();
+			emit("pick");
+		} else if (spec.mode === "area") {
+			const a = p.points[0];
+			this.finishPick({ x1: Math.min(a.x, tile.x), y1: Math.min(a.y, tile.y), x2: Math.max(a.x, tile.x), y2: Math.max(a.y, tile.y) });
+		} else {
+			this.finishPick({ a: p.points[0], b: tile });
+		}
+	}
+
+	/** The nearest object of one kind at a container point: {kind, id} or {kind: "factory", x, y}, or null. */
+	pickKind(cp, touch, kind) {
+		const lp = this.map.containerPointToLayerPoint(cp);
+		const v = this.convoys.view();
+		const slack = touch ? 16 : 10;
+		let best = null, bestD = Infinity;
+		const consider = (obj, x, y, radius) => {
+			const [px, py] = v.toPx(x, y);
+			const d = Math.hypot(px - lp.x, py - lp.y);
+			if (d <= radius + slack && d < bestD) {
+				bestD = d;
+				best = obj;
+			}
+		};
+		if (kind === "station") {
+			const sz = stationSize(v.zoom, v.s) / 2;
+			for (const st of (S.stations && S.stations.stations) || []) {
+				if (st.pos) {
+					consider({ kind, id: st.id }, st.pos.x, st.pos.y, sz);
+				}
+			}
+		} else if (kind === "factory") {
+			for (const f of (S.factories && S.factories.factories) || []) {
+				if (f.pos) {
+					consider({ kind, x: f.pos.x, y: f.pos.y }, f.pos.x, f.pos.y, 7);
+				}
+			}
+		} else if (kind === "convoy" || kind === "line") {
+			const P = S.positions, i = P.idx;
+			if (i.x !== undefined) {
+				const r = convoyRadius(v.zoom);
+				for (const row of P.rows.values()) {
+					if (kind === "convoy") {
+						consider({ kind, id: row[0] }, row[i.x], row[i.y], r);
+					} else if (row[i.line]) {
+						consider({ kind, id: row[i.line] }, row[i.x], row[i.y], r);
+					}
+				}
+			}
+		}
+		return best;
+	}
+
+	/** The plan of a project and the marks of a running pick. */
+	drawPlan(ctx, v) {
+		const c = this.planPalette();
+		const sq = (x, y, grow = 0) => {
+			const [x1, y1] = v.toPx(x - 0.5, y - 0.5);
+			const [x2, y2] = v.toPx(x + 0.5, y + 0.5);
+			return [x1 - grow, y1 - grow, x2 - x1 + 2 * grow, y2 - y1 + 2 * grow];
+		};
+		ctx.save();
+		ctx.lineJoin = "round";
+		ctx.lineCap = "round";
+		let n = 0;
+		const items = this.plan && this.plan.preview && Array.isArray(this.plan.preview.items) ? this.plan.preview.items : [];
+		const w = Math.max(3, Math.min(10, v.s * 0.45));
+		const box = Math.max(8, Math.min(26, v.s * 0.9));
+		for (const it of items) {
+			const pts = (Array.isArray(it && it.tiles) ? it.tiles : [])
+				.filter((p) => Array.isArray(p) && typeof p[0] === "number" && typeof p[1] === "number").map((p) => [p[0], p[1]]);
+			if (!pts.length) {
+				continue;
+			}
+			const kind = it.kind;
+			const col = c[kind] || c.way;
+			ctx.setLineDash([]);
+			ctx.globalAlpha = 1;
+			if (kind === "way" || kind === "bridge" || kind === "tunnel" || kind === "wayobj") {
+				const lw = kind === "wayobj" ? w * 0.55 : w;
+				if (pts.length === 1) {
+					const [x, y, bw, bh] = sq(pts[0][0], pts[0][1]);
+					ctx.fillStyle = col;
+					ctx.globalAlpha = 0.75;
+					ctx.fillRect(x, y, bw, bh);
+				} else {
+					ctx.strokeStyle = c.casing;
+					ctx.lineWidth = lw + (kind === "bridge" ? 6 : 3);
+					ctx.globalAlpha = 0.85;
+					this.strokePath(ctx, v, pts);
+					ctx.globalAlpha = 1;
+					ctx.strokeStyle = col;
+					ctx.lineWidth = lw;
+					if (kind === "tunnel") {
+						ctx.setLineDash([lw * 1.6, lw * 1.2]);
+					} else if (kind === "wayobj") {
+						ctx.setLineDash([1, lw * 1.6]);
+					}
+					this.strokePath(ctx, v, pts);
+				}
+			} else if (kind === "station" || kind === "depot") {
+				for (const [x, y] of pts) {
+					const [px, py] = v.toPx(x, y);
+					ctx.fillStyle = c.casing;
+					ctx.fillRect(px - box / 2 - 2, py - box / 2 - 2, box + 4, box + 4);
+					if (kind === "station") {
+						ctx.fillStyle = col;
+						ctx.fillRect(px - box / 2, py - box / 2, box, box);
+					} else {
+						ctx.strokeStyle = col;
+						ctx.lineWidth = Math.max(2, box / 5);
+						ctx.strokeRect(px - box / 2 + ctx.lineWidth / 2, py - box / 2 + ctx.lineWidth / 2, box - ctx.lineWidth, box - ctx.lineWidth);
+						ctx.fillStyle = col;
+						ctx.fillRect(px - box / 6, py - box / 6, box / 3, box / 3);
+					}
+				}
+			} else if (kind === "remove") {
+				const r = box / 2;
+				for (const [x, y] of pts) {
+					const [px, py] = v.toPx(x, y);
+					for (const [lw, s] of [[Math.max(3, r / 2.2) + 3, c.casing], [Math.max(3, r / 2.2), col]]) {
+						ctx.strokeStyle = s;
+						ctx.lineWidth = lw;
+						ctx.beginPath();
+						ctx.moveTo(px - r, py - r);
+						ctx.lineTo(px + r, py + r);
+						ctx.moveTo(px + r, py - r);
+						ctx.lineTo(px - r, py + r);
+						ctx.stroke();
+					}
+				}
+			} else if (kind === "line") {
+				if (pts.length > 1) {
+					ctx.strokeStyle = c.casing;
+					ctx.lineWidth = w * 0.7 + 3;
+					ctx.globalAlpha = 0.8;
+					ctx.setLineDash([w * 2, w * 1.3]);
+					this.strokePath(ctx, v, pts);
+					ctx.globalAlpha = 1;
+					ctx.strokeStyle = col;
+					ctx.lineWidth = w * 0.7;
+					this.strokePath(ctx, v, pts);
+					ctx.setLineDash([]);
+				}
+				const r = Math.max(6, Math.min(11, v.s * 0.4));
+				ctx.font = `700 ${Math.round(r * 1.1)}px system-ui, sans-serif`;
+				ctx.textBaseline = "middle";
+				pts.forEach(([x, y], k) => {
+					const [px, py] = v.toPx(x, y);
+					ctx.beginPath();
+					ctx.arc(px, py, r, 0, 6.2832);
+					ctx.fillStyle = col;
+					ctx.fill();
+					ctx.lineWidth = 2;
+					ctx.strokeStyle = c.casing;
+					ctx.stroke();
+					if (v.zoom >= 0) {
+						const s = String(k + 1);
+						ctx.fillStyle = "#fff";
+						ctx.fillText(s, px - ctx.measureText(s).width / 2, py + 0.5);
+					}
+				});
+			} else {
+				// roadsign, convoy (at its depot) and anything else: a dot
+				const r = kind === "convoy" ? Math.max(5, box / 2.6) : Math.max(3.5, box / 3.5);
+				for (const [x, y] of pts) {
+					const [px, py] = v.toPx(x, y);
+					ctx.beginPath();
+					ctx.arc(px, py, r, 0, 6.2832);
+					ctx.fillStyle = col;
+					ctx.fill();
+					ctx.lineWidth = 2;
+					ctx.strokeStyle = c.casing;
+					ctx.stroke();
+				}
+			}
+			n++;
+		}
+		this.planDrawn = n;
+
+		// a running pick: the chosen point, the area or the A-B line to the square under the pointer
+		const p = this.pickState;
+		if (p && p.spec.mode !== "object") {
+			ctx.setLineDash([]);
+			ctx.globalAlpha = 1;
+			const a = p.points[0], hv = p.hover;
+			if (p.spec.mode === "area" && a && hv) {
+				const [x1, y1] = v.toPx(Math.min(a.x, hv.x) - 0.5, Math.min(a.y, hv.y) - 0.5);
+				const [x2, y2] = v.toPx(Math.max(a.x, hv.x) + 0.5, Math.max(a.y, hv.y) + 0.5);
+				ctx.fillStyle = c.pick;
+				ctx.globalAlpha = 0.15;
+				ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+				ctx.globalAlpha = 1;
+				ctx.setLineDash([7, 5]);
+				ctx.lineWidth = 2;
+				ctx.strokeStyle = c.pick;
+				ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+				ctx.setLineDash([]);
+			} else if (p.spec.mode === "ab" && a && hv && (hv.x !== a.x || hv.y !== a.y)) {
+				ctx.setLineDash([8, 6]);
+				ctx.lineWidth = 2.5;
+				ctx.strokeStyle = c.pick;
+				this.strokePath(ctx, v, [[a.x, a.y], [hv.x, hv.y]]);
+				ctx.setLineDash([]);
+			}
+			const mark = (t, text) => {
+				const [x, y, bw, bh] = sq(t.x, t.y, 1);
+				ctx.lineWidth = 3;
+				ctx.strokeStyle = c.casing;
+				ctx.strokeRect(x, y, bw, bh);
+				ctx.lineWidth = 2;
+				ctx.strokeStyle = c.pick;
+				ctx.strokeRect(x, y, bw, bh);
+				if (text) {
+					const [px, py] = v.toPx(t.x, t.y);
+					const r = 9;
+					ctx.beginPath();
+					ctx.arc(px, py - Math.max(bh / 2, 6) - r, r, 0, 6.2832);
+					ctx.fillStyle = c.pick;
+					ctx.fill();
+					ctx.font = "700 11px system-ui, sans-serif";
+					ctx.textBaseline = "middle";
+					ctx.fillStyle = "#fff";
+					ctx.fillText(text, px - ctx.measureText(text).width / 2, py - Math.max(bh / 2, 6) - r + 0.5);
+				}
+			};
+			if (a) {
+				mark(a, p.spec.mode === "ab" ? "A" : null);
+			}
+			if (hv && (!a || hv.x !== a.x || hv.y !== a.y)) {
+				mark(hv, p.spec.mode === "ab" ? (a ? "B" : "A") : null);
+			}
+		}
+		ctx.restore();
 	}
 
 	strokePath(ctx, v, pts) {
@@ -1131,6 +1541,10 @@ class MapController {
 	// --- picking ---------------------------------------------------------------------------
 
 	onClick(e) {
+		if (this.pickState) {
+			this.onPickClick(e); // a question of the AI team asks for a place or an object
+			return;
+		}
 		const hit = this.pick(e.containerPoint, e.originalEvent && e.originalEvent.pointerType === "touch");
 		if (hit) {
 			setUi({ selection: hit });

@@ -33,9 +33,14 @@ const P = {
 	follow: "M3 7h12v10H3zM15 10.5l6-3.5v10l-6-3.5",
 	tag: "M4 4h8l8 8-8 8-8-8zM8.5 8.5h.01",
 	sliders: "M4 7h10M18 7h2M4 17h4M12 17h8M14 5v4M8 15v4",
+	team: "M3 5h12v8H8l-4 3v-3H3zM18 9h3v8h-1v3l-4-3h-5v-2",
+	help: "M12 3a9 9 0 100 18 9 9 0 100-18M9.5 9.5a2.5 2.5 0 015 0c0 2-2.5 2-2.5 4M12 17h.01",
+	plan: "M4 4h16v16H4zM4 9h16M9 9v11M13 13h4M13 16h3",
+	send: "M4 12l16-8-6 16-3-7zM11 13l9-9",
+	stop: "M7 7h10v10H7z",
 };
 
-const FILLED = new Set(["pause", "play", "ff"]);
+const FILLED = new Set(["pause", "play", "ff", "stop"]);
 
 export function Icon({ name, size = 18, title }) {
 	return html`<svg class="icon" width=${size} height=${size} viewBox="0 0 24 24" aria-hidden=${title ? undefined : "true"}

@@ -4,8 +4,9 @@
 // from the convoy panel and the info card). With a pak 3D, a toolbar button opens the "Model authors" page (its
 // LICENSES.md); a pak that cannot be used shows its error once. The toolbar switches the names of cities and stations
 // and opens the quality panel (profile, shadows, detail distance, trees, names, day and night, city cars); a change of
-// the profile or the trees builds the view anew (the camera stays). Texts of the game and of the pak are only ever
-// text nodes. Artistic License, see LICENSE.txt.
+// the profile or the trees builds the view anew (the camera stays). A planned project of the AI team (S.ui.preview3d)
+// is drawn as ghosts (scene3d/ghosts.js) in every view built. Texts of the game and of the pak are only ever text
+// nodes. Artistic License, see LICENSE.txt.
 import { html, useRef, useEffect, useState } from "/vendor/htm/standalone.module.js";
 import { S, setUi, subscribe, useTopics, convoyIndex, convoyLive } from "/js/store.js";
 import { closePanel } from "/js/panel.js";
@@ -236,6 +237,25 @@ function Hint() {
 	return S.ui.selection ? null : html`<p class="v3d-hint muted small">${t("v3d_hint")}</p>`;
 }
 
+/** The planned project shown as ghosts: its name, look at it, remove the ghosts. */
+function GhostBadge({ view }) {
+	useTopics(["ui", "lang"]);
+	const p = S.ui.preview3d;
+	if (!p) {
+		return null;
+	}
+	const b = p.preview && p.preview.bbox;
+	const center = Array.isArray(b) && b.length === 4 ? { x: Math.round((b[0] + b[2]) / 2), y: Math.round((b[1] + b[3]) / 2) } : null;
+	return html`<div class="v3d-ghosts" role="status">
+		<span class="plan-swatch"></span>
+		<span class="plan-title">${t("plan_in_3d", p.title || "#" + p.id)}</span>
+		${center ? html`<button type="button" class="icon-btn" title=${t("fit_plan")} aria-label=${t("fit_plan")}
+			onClick=${() => view.lookAt(center.x + 0.5, center.y + 0.5)}><${Icon} name="locate" size=${16} /></button>` : null}
+		<button type="button" class="icon-btn plan-clear" title=${t("plan_clear")} aria-label=${t("plan_clear")}
+			onClick=${() => setUi({ preview3d: null })}><${Icon} name="close" size=${16} /></button>
+	</div>`;
+}
+
 export function View3DTab({ visible }) {
 	const box = useRef(null);
 	const [view, setView] = useState(null);
@@ -255,6 +275,14 @@ export function View3DTab({ visible }) {
 			setUi({ follow3d: null });
 		}
 	}, [view, req]);
+	// a place to look at (the plan of a project shown in 3D)
+	const look = S.ui.look3d;
+	useEffect(() => {
+		if (view && look) {
+			view.lookAt(look.x + 0.5, look.y + 0.5);
+			setUi({ look3d: null });
+		}
+	}, [view, look]);
 	useEffect(() => {
 		if (!allowed) {
 			return undefined;
@@ -262,7 +290,7 @@ export function View3DTab({ visible }) {
 		let dead = false, v = null;
 		setSt(null);
 		setFatal(null);
-		import("/js/scene3d/view.js").then(async (m) => {
+		Promise.all([import("/js/scene3d/view.js"), import("/js/scene3d/ghosts.js")]).then(async ([m, g]) => {
 			// the view in a task of its own, not in the one that evaluated three.js (shorter tasks on slow phones)
 			await new Promise((r) => setTimeout(r, 0));
 			if (dead) {
@@ -275,6 +303,10 @@ export function View3DTab({ visible }) {
 				setFatal(e instanceof m.NoWebGL2Error ? "nowebgl" : String(e.message || e));
 				return;
 			}
+			// the ghosts of a planned project (S.ui.preview3d) in every view built
+			const ghosts = new g.GhostLayer(v);
+			v.addLayer(ghosts);
+			v.hooks.ghosts = () => ghosts.info();
 			setView(v);
 		}).catch((e) => {
 			if (!dead) {
@@ -321,6 +353,7 @@ export function View3DTab({ visible }) {
 			}} />` : null}
 		${view && !msg && authors && st && st.pak ? html`<${Authors} view=${view} pak=${st.pak} onClose=${() => setAuthors(false)} />` : null}
 		${view && !msg && st && st.follow ? html`<${FollowBadge} view=${view} follow=${st.follow} />` : null}
+		${view && !msg ? html`<${GhostBadge} view=${view} />` : null}
 		${!msg && visible ? html`<${StatusLine} st=${st} />` : null}
 		${view && !msg ? html`<${Hint} />` : null}
 		${view && !msg && visible ? html`<${InfoCard} onLocate=${(x, y) => view.lookAt(x + 0.5, y + 0.5)} />` : null}

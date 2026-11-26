@@ -220,6 +220,48 @@ function TerrainStatus() {
 	return html`<div class="map-status">${t("map_loading", st.loaded, st.loaded + st.pending)}</div>`;
 }
 
+const PICK_HINTS = { tile: "pick_hint_tile", area: "pick_hint_area", ab: "pick_hint_ab" };
+
+/** What a running map pick of the AI team asks for, with a button to cancel it (Escape cancels too). */
+function PickHint() {
+	useTopics(["pick", "lang"]);
+	const p = mapCtl.pickInfo();
+	if (!p) {
+		return null;
+	}
+	let text;
+	if (p.mode === "object") {
+		text = t(p.miss ? "pick_hint_miss" : "pick_hint_object", t("pick_kind_" + p.kind));
+	} else if (p.mode === "area" && p.points.length) {
+		text = t("pick_hint_area2");
+	} else if (p.mode === "ab" && p.points.length) {
+		text = t("pick_hint_b");
+	} else {
+		text = t(PICK_HINTS[p.mode] || "pick_hint_tile");
+	}
+	return html`<div class="map-pill pick-hint" role="status">
+		<span>${text}</span>
+		<button type="button" class="btn small" onClick=${() => mapCtl.cancelPick(true)}>${t("pick_cancel")}</button>
+	</div>`;
+}
+
+/** The plan of a project drawn on the map: its name, fit and remove. */
+function PlanBadge() {
+	useTopics(["plan", "lang"]);
+	const plan = mapCtl.plan;
+	if (!plan) {
+		return null;
+	}
+	return html`<div class="map-pill plan-badge" role="status">
+		<span class="plan-swatch"></span>
+		<span class="plan-title">${t("plan_on_map", plan.title || "#" + plan.id)}</span>
+		<button type="button" class="icon-btn" title=${t("fit_plan")} aria-label=${t("fit_plan")} onClick=${() => mapCtl.fitPlan()}>
+			<${Icon} name="fit" size=${16} /></button>
+		<button type="button" class="icon-btn plan-clear" title=${t("plan_clear")} aria-label=${t("plan_clear")}
+			onClick=${() => mapCtl.setPlan(null)}><${Icon} name="close" size=${16} /></button>
+	</div>`;
+}
+
 export function MapView({ visible }) {
 	const box = useRef(null);
 	useEffect(() => {
@@ -239,6 +281,7 @@ export function MapView({ visible }) {
 		<div class="map" ref=${box}></div>
 		<${Controls} />
 		<${TerrainStatus} />
+		<div class="map-top"><${PickHint} /><${PlanBadge} /></div>
 		<${InfoCard} />
 	</div>`;
 }

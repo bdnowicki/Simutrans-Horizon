@@ -1,6 +1,6 @@
 // Simutrans-Horizon dashboard: client state, event application and change notification.
 // Artistic License, see LICENSE.txt.
-import { useEffect, useReducer } from "/vendor/htm/standalone.module.js";
+import { useEffect, useReducer, useRef } from "/vendor/htm/standalone.module.js";
 import { gameSeconds } from "/js/format.js";
 import { setPalette } from "/js/colors.js";
 
@@ -68,6 +68,7 @@ window.__dashPerf = perf;
 // --- change notification -------------------------------------------------------------------
 
 const listeners = new Map();
+const versions = new Map(); // topic -> number of emits so far
 
 export function subscribe(topics, fn) {
 	for (const t of topics) {
@@ -86,6 +87,7 @@ export function subscribe(topics, fn) {
 }
 
 export function emit(topic, arg) {
+	versions.set(topic, (versions.get(topic) || 0) + 1);
 	const set = listeners.get(topic);
 	if (set) {
 		for (const fn of Array.from(set)) {
@@ -101,7 +103,17 @@ export function emit(topic, arg) {
 /** Re-render the calling component when one of the topics changes. */
 export function useTopics(topics) {
 	const [, force] = useReducer((x) => x + 1, 0);
-	useEffect(() => subscribe(topics, () => force()), [topics.join(",")]);
+	const seen = useRef(null);
+	seen.current = topics.map((t) => versions.get(t) || 0); // what this render saw
+	useEffect(() => {
+		const off = subscribe(topics, () => force());
+		// effects run after the paint: a change between the render and the subscription (e.g. a deep link applied
+		// when the session arrives) would be missed, so render again
+		if (topics.some((t, i) => (versions.get(t) || 0) !== seen.current[i])) {
+			force();
+		}
+		return off;
+	}, [topics.join(",")]);
 }
 
 export function setUi(patch) {

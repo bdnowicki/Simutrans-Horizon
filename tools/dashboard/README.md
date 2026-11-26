@@ -30,6 +30,11 @@ world tab the world statistics, the goods and tables of all cities and factories
 drive, which the bridge merges over time ([line routes](#get-apiline_routeid)); the supply chains between
 the factories can be drawn on the map in the colours of their goods.
 
+Players of a company also get the Team tab: eight AI specialists (DeepSeek language models) that answer
+questions about the company, ask back where a decision is the player's, and prepare changes of the game
+as projects that run only after a player approved them ([AI team](#ai-team)). The access tokens and the
+team's history are kept in a SQLite database (`--db`).
+
 ## Start
 
 ```
@@ -45,22 +50,58 @@ Simutrans dashboard 0.1.0 on http://127.0.0.1:13380/ (game port 13360)
   player http://127.0.0.1:13380/?token=...
 ```
 
+With a database that holds tokens already it prints `access tokens: in the database <file> ...` instead (see
+[Tokens](#tokens)).
+
 | Option | Meaning |
 |---|---|
 | `--game-port N` | remote control port of the game (default `$SIMUTRANS_REMOTE_PORT` or 13360) |
 | `--port N` | HTTP port (default 13380) |
 | `--bind ADDR` | address to listen on (default 127.0.0.1); read [Deployment](#deployment) first |
 | `--allowed-host NAME` | further Host name to answer to, e.g. a tunnel hostname, with or without port (repeatable) |
-| `--enable-admin` | also create an admin token (adds `cash`) |
+| `--trusted-proxy ADDR[/BITS]` | IP address or network of a reverse proxy in front of the bridge (repeatable, default none): for its requests the client address of the connection limit, the login limit and the log is taken from `X-Forwarded-For`, see [Security](#security) |
+| `--max-conn-per-ip N` | open connections of one client address at once, the loopback excepted (default 32, 1–256) |
+| `--enable-admin` | also create an admin token and accept the admin tokens of the database (adds `cash`) |
 | `--no-events` | do not subscribe the events of the game, only poll (as with games without protocol 2) |
 | `--pak3d DIR` | directory of a pak 3D (models, textures, manifest of the 3D view) served under [`/pak3d/`](#static-files); default `$SIMUTRANS_DASHBOARD_PAK3D` (for Docker), else none. A path that is not a directory is logged and ignored |
+| `--db FILE` | SQLite database of the access tokens and the AI team's history (default `$SIMUTRANS_DASHBOARD_DB`; without one both live in memory: new tokens and an empty history at every start) |
+| `--env-file FILE` | read `KEY=VALUE` lines (`#` comments, optional quotes and `export`) into the environment, e.g. `DEEPSEEK_API_KEY` from the repository's `.env`; variables already set win; values are never logged |
+| `--no-team` | no AI team: no Team tab, `/api/team/*` answers 404 |
+| `--team-limit USD` | daily cost limit of the AI team, all companies together (default 0.50) |
+| `--team-company-limit USD` | daily cost limit per company, or `off` (default off) |
+| `--team-model AGENT=MODEL` | language model of an agent, e.g. `analyst=deepseek-flash`; `AGENT=` returns to the default (repeatable) |
+| `--team-offpeak-factor F` | price factor of the cost counter outside DeepSeek's peak hours, e.g. 0.5, or `off` (default off: peak prices always) |
 | `--verbose` | log every request (by default only failed ones) |
 
-Tokens are new random values (`secrets.token_urlsafe(16)`) at every start, unless set in the
-environment: `SIMUTRANS_DASHBOARD_TOKEN_VIEWER`, `SIMUTRANS_DASHBOARD_TOKEN_PLAYER`,
-`SIMUTRANS_DASHBOARD_TOKEN_ADMIN` (at least 16 characters of `A-Z a-z 0-9 - _ . ~`, all different;
-the admin token only with `--enable-admin`). Ctrl+C stops the bridge. The game may start, stop or
-load other worlds while the bridge runs; the bridge reconnects (1 to 10 s backoff).
+The `--team-*` settings are stored in the database and stay until they are given again. Ctrl+C stops the
+bridge. The game may start, stop or load other worlds while the bridge runs; the bridge reconnects (1 to
+10 s backoff).
+
+### Tokens
+
+The tokens are kept in the database as SHA-256 hashes, each with a role, a label and, for player and
+admin tokens, a company number (0–14, not 1 = the public service). When the database has no token yet
+(the first start; without `--db` every start, as the in-memory database is empty), the bridge stores the
+tokens of the environment, `SIMUTRANS_DASHBOARD_TOKEN_VIEWER`, `SIMUTRANS_DASHBOARD_TOKEN_PLAYER` and
+`SIMUTRANS_DASHBOARD_TOKEN_ADMIN` (at least 16 characters of `A-Z a-z 0-9 - _ . ~`, all different; the
+admin token only with `--enable-admin`), and a new random one (`secrets.token_urlsafe(24)`) for each role
+without, and prints them as links. Player and admin are then bound to the company
+`SIMUTRANS_DASHBOARD_PLAYER_COMPANY` (default 0). From then on the database holds the tokens: tokens in the
+environment are ignored (with a warning), and the token commands manage them, also while the bridge runs:
+
+```
+python tools/dashboard/simutrans_dashboard.py token add --role player --company 0 --label Alice --db FILE
+python tools/dashboard/simutrans_dashboard.py token list --db FILE
+python tools/dashboard/simutrans_dashboard.py token revoke 3 --db FILE
+```
+
+`token add` prints `token <id>: player, company 0, label Alice` and the new token on a line of its own,
+once (only its hash is kept); player and admin tokens need `--company`, viewer tokens take none. `token
+list` shows id, role, company, label, created and revoked, never a token or its hash. `token revoke ID`
+ends the sessions and event streams of the token within about 2 seconds. Without `--db` the commands use
+`$SIMUTRANS_DASHBOARD_DB`; they need a database file. The token is the whole authorization: a player token
+of company N may use the AI team for company N (spend its money through approved projects), without the
+company's password.
 
 ## Roles
 
@@ -76,9 +117,14 @@ or only `pause` and `fast_forward` with `-remote_control_time`: the bridge then 
 all clients (see the commands `pause` and `fast_forward` in [tools/mcp](../mcp/README.md)).
 
 Never available, whatever the role: `eval`, `screenshot`, `click`, `move`, `drag`, `wheel`,
-`key`, `text`, `unlock_game`, `remove_password`, `tool_visibility`, `windows` and every command
-not listed above. `tool` always acts as the active player of the game (`player`/`unowned` are
+`key`, `text`, `unlock_game`, `remove_password`, `tool_visibility`, `windows`, the agent commands of the
+game (`agent_tool`, `depot_op`, `line_op`, `convoy_op`, `plan_way`, `estimate`, `depot`: only the bridge's
+AI team uses them, on a game connection of its own and always for the company of the session) and every
+command not listed above. `tool` always acts as the active player of the game (`player`/`unowned` are
 refused) and refuses `tool_lock_game`, `tool_generate_script` and the scripted tools.
+
+Player and admin tokens are bound to a company; their sessions also have the Team tab and the
+`/api/team/*` routes ([AI team](#ai-team)). Viewers neither see the team nor cause any cost.
 
 ## Sign in and sessions
 
@@ -91,8 +137,12 @@ refused) and refuses `tool_lock_game`, `tool_generate_script` and the scripted t
 * `GET /` without a valid session shows a login page (built into the bridge, styled by
   `/login.css`) whose form posts `token` to `POST /login` (`application/x-www-form-urlencoded`,
   answer `303 Location: /` + cookie). A wrong token gives the login page with status 401.
-* After 5 failed logins within a minute from one IP address, logins from it (also with a right
-  token) get 429 until those failures are a minute old.
+* After 5 failed logins within a minute from one client address, logins from it (also with a right
+  token) get 429 until those failures are a minute old. The client address is the TCP peer, or behind a
+  trusted proxy (`--trusted-proxy`) the address that proxy names in `X-Forwarded-For`.
+* A token link (`/?token=T#team/coordinator`) keeps its `#hash`: the page it answers goes on to `/` with
+  the hash (`/login.js`), and the sign-in form posts to `/login#hash`, so deep links such as the Team tab
+  survive the sign-in.
 * Sign-ins that the browser marks as made by another site get 403 and count as no failure:
   `GET /?token=` with `Sec-Fetch-Dest` other than `document` (an `<img>` or `<iframe>` of another
   page), `POST /login` with `Sec-Fetch-Site` other than `same-origin`/`none`. So other pages can
@@ -104,6 +154,8 @@ refused) and refuses `tool_lock_game`, `tool_generate_script` and the scripted t
   in again and again with the viewer token signs out no player or admin).
 * `POST /api/logout` (with the headers of an action, see below, body may be empty) ends the session
   and its event streams at once: `{"ok":true}` and an expiring cookie.
+* A revoked token (`token revoke`) ends its sessions and their event streams within about 2 seconds
+  (the bridge asks the database again at most every 2 s; a database error counts as revoked).
 * Requests from the same computer are not trusted more than others (proxies).
 
 ## HTTP API
@@ -121,12 +173,13 @@ see [Compression](#compression).
 | 401 | not signed in |
 | 403 | command not allowed for the role, or a check of an action request failed, or a `GET` of `/api/` or `/tiles/` that the browser marks as made by another site (`Sec-Fetch-Site` other than `same-origin`/`none`; other clients send no such header) |
 | 404 | no such page/file, map tile or 3D chunk outside of the map, the game has no map export, or `/pak3d/` without `--pak3d` |
-| 411 / 413 / 415 | chunked body / body over 16 KB / wrong Content-Type of an action |
+| 409 | a team action on a question, run or project in another state (see [AI team](#http-api-of-the-team)) |
+| 411 / 413 / 415 | chunked body / body over 16 KB (32 KB for `/api/team/*`) / wrong Content-Type of an action |
 | 421 | the Host header is not one of the dashboard's names |
-| 429 | rate limit (`Retry-After: 1`): 30 requests/s per session with bursts up to 60 (`scene3d` and `vehicles3d` have buckets of their own, see [3D view](#3d-view)), or more than 2 large requests at once, or the map exports of the browsers used up their share of the game's time (see below), or too many failed logins |
+| 429 | rate limit (`Retry-After: 1`): 30 requests/s per session with bursts up to 60 (`scene3d` and `vehicles3d` have buckets of their own, see [3D view](#3d-view)), or more than 2 large requests at once, or the map exports of the browsers used up their share of the game's time (see below), or too many failed logins; chat messages of a token to the team (10 at once, then one per 3 s, reason `rate_limit`), more than 16 team event streams of a token; behind a trusted proxy: the client has `--max-conn-per-ip` requests open already (`Retry-After: 5`) |
 | 501 | the game has no 3D export: `{"ok":false,"error":"unsupported","detail":"..."}` |
 | 502 | the game is not reachable |
-| 503 | the game connection is busy for over 30 s, 64 event streams are open, too many 3D requests wait for their game connection or the game did not answer one within 30 s (`Retry-After: 1`), or the game is not ready (no world) |
+| 503 | the game connection is busy for over 30 s, 64 event streams are open, too many 3D requests wait for their game connection or the game did not answer one within 30 s (`Retry-After: 1`), or the game is not ready (no world); a team action while the team is not available (`reason`, see [AI team](#http-api-of-the-team)) |
 
 ### GET /api/session
 
@@ -135,10 +188,14 @@ see [Compression](#compression).
  "allowed":{"read":["ping","status",...],"action":["view","zoom","pause","fast_forward","tool"]},
  "game":{"connected":true,"missing":[],"events":true},
  "bridge":{"version":"0.1.0","game_port":13360},
- "view3d":{"supported":true,"pak3d":false}}
+ "view3d":{"supported":true,"pak3d":false},
+ "company":{"nr":0,"name":"Company"},
+ "team":true}
 ```
 
-`game.missing`: see [Older engines](#older-engines). `game.events`: the event connection is
+`company`: the company of a player or admin token (`name` from the game, `null` while unknown; `company`
+is `null` for viewers). `team`: the session may use the [AI team](#ai-team) (whether the agents can work
+right now says `GET /api/team/state`). `game.missing`: see [Older engines](#older-engines). `game.events`: the event connection is
 subscribed (false while it is not, e.g. with `--no-events` or a game without protocol 2).
 `view3d.supported`: the game has the 3D export (`false`: hide the 3D tab, its requests answer 501;
 `null`: not known yet, e.g. the game is not connected); the same news reaches the event stream as
@@ -1033,6 +1090,189 @@ triangles), render 6.3 / 7.6 ms (Intel Arc, p50 / p95), the three models loaded 
   needs a newer game, and cities without ids (engines before them) open no panel (a row selects the
   city on the map).
 
+## AI team
+
+The Team tab (Polish "Zespół") gives the players of a company eight AI specialists. They read the game
+through the bridge, answer in the language of the player's last message (Polish by default), ask back
+when a decision belongs to the player, and prepare changes as projects that only run after a player of
+the company approved them. The team works only on request: no background runs, no reports of its own, no
+cost while nobody asks. It needs
+
+* a game that accepts the agent commands ([tools/mcp](../mcp/README.md), "Agent commands"): a full
+  `-remote_control` (single player) or `-remote_control_readonly <port> -remote_control_agent` (a
+  dedicated server);
+* `DEEPSEEK_API_KEY` in the environment (or in the `--env-file`), optionally `DEEPSEEK_BASE_URL` (default
+  `https://api.deepseek.com`); the key never leaves the bridge (not logged, not sent to browsers);
+* a database (`--db`) to keep the chats, tasks, questions, projects and costs; without one they are lost
+  when the bridge stops;
+* a player (or admin) token: the company of the token is the company the agents work for.
+
+Without the agent commands or the key the tab shows why the team is unavailable; `--no-team` hides it.
+
+### The specialists
+
+| Agent (id) | Default model | Area |
+|---|---|---|
+| Coordinator (`coordinator`) | `deepseek-v4-pro` | the entry point for work that needs several specialists: hands the parts to them as tasks, collects and merges the results |
+| Analyst (`analyst`) | `deepseek-v4-pro` | trends, bottlenecks, 2–3 scenarios with costs and profit; reads only |
+| Accountant (`accountant`) | `deepseek-flash` | costs, losses and savings of lines and vehicles; reads only |
+| Designer (`designer`) | `deepseek-v4-pro` | designs infrastructure projects (ways with bridges and tunnels, stations, depots, signs, way objects, removals of own objects) with a 2D and 3D preview |
+| Engineer (`engineer`) | `deepseek-flash` | the same infrastructure operations: builds and removes |
+| Logistician (`logistician`) | `deepseek-flash` | new lines, schedules, supply chains, convoys for new lines |
+| Dispatcher (`dispatcher`) | `deepseek-flash` | traffic: vehicles added to or withdrawn from lines, loading and waiting times, jams |
+| Fleet manager (`fleet_manager`) | `deepseek-flash` | buys, replaces and sells vehicles: old and obsolete fleet, the best models of the year |
+
+Every agent has its own chat; the chats, tasks, questions and projects are shared by all player tokens of
+the company and invisible to other companies. Specialists hand work to each other only through the
+coordinator (as tasks on the board). The agents read the game through tools of the bridge that aggregate
+(top lists, sums, filters, at most about 8000 characters per result; details only of the company's own
+lines and convoys) and get the names that players typed (companies, lines, stations, messages) only as
+quoted data, never as instructions.
+
+### Chat, questions and the board
+
+* **Chat**: messages up to 4000 characters (Enter sends, Shift+Enter starts a new line); the answer is
+  streamed while it is written, with the tools used as chips; Stop cancels the run. Older messages load
+  in pages of 50.
+* **Questions**: an agent may ask up to 4 questions at once: a choice of 2–4 options (single or several,
+  the recommended one first, "Other" with an own text), a text, a number (minimum and maximum), a square,
+  an area or two points A and B picked on the 2D map, or a line, station, convoy or factory picked from a
+  list or on the map. The run waits without a time limit and without cost, also across restarts of the
+  bridge; any player of the company may answer (the card shows who did) or dismiss the question (the
+  agent then ends or suggests another way). Writing a new message to an agent that waits for an answer
+  dismisses its question.
+* **Task board**: the coordinator's tasks by state (open, in progress, waiting, done, cancelled), the
+  questions waiting for an answer and the projects by state. Deep links: `#team`, `#team/<agent id>`,
+  `#team/board`, `#team/project/<id>`.
+* The head of the tab shows today's AI cost of all companies against the daily limit and the share of the
+  company.
+
+### Projects and the money rules
+
+Agents never change the game themselves. An agent with operations of its own proposes a project: a
+title, a rationale and up to 40 operations of these types (each a JSON object with `type`; positions are
+`[x, y]` or `[x, y, z]`; `ref` names a new line or convoy for later operations):
+
+| Agent | Operations |
+|---|---|
+| designer, engineer | `build_way` (`from`, `to`, `way`, `bridge`?, `tunnel`?, `straight`?), `build_station` (`at`, `building`, `rotation`?), `build_depot` (`at`, `building`), `build_roadsign` (`at`, `sign`), `build_wayobj` (`from`, `to`, `wayobj`), `remove` (`at`, `kind`?), `remove_way` (`from`, `to`, `waytype`) |
+| logistician | `create_line` (`ref`, `waytype`, `stops` [{`at`, `load`?, `wait`?}], `name`?), `set_line_schedule` (`line`, `stops`), `delete_line` (`line`), `buy_convoy` (`depot`, `vehicles`, `count`?, `line`?, `start`?, `ref`?), `assign_line` (`convoy`, `line`) |
+| dispatcher | `buy_convoy`, `assign_line`, `withdraw` (`convoy`, `on`?), `set_line_schedule` (only loads and waiting times; the stops stay) |
+| fleet manager | `buy_convoy`, `replace_convoy` (`convoy`, `vehicles`, `depot`?), `sell` (`convoy`), `withdraw` |
+
+The bridge checks the project (the role's operation types, the owners of every object used, names of
+objects available now) and estimates it with the game: the way builder's dry run (`plan_way`) for routes
+and their price, the price lists (`estimate`) for buildings and vehicles, removals at an upper bound. The
+project card shows the operations as sentences with their cost, the total, the cash now and after, the
+maintenance per month and warnings; "Show on map" draws the plan over the 2D map (ways, bridges, tunnels,
+stations, depots, signs, removals, the stops of new lines) and "Show in 3D" as semi-transparent ghosts in
+the 3D view. "Build it" (after a confirmation with the cost and the cash afterwards) approves the whole
+project; "Reject" takes an optional reason that the agent reads. A project is approved once (a second
+approval, also by another player at the same moment, gets 409).
+
+The bridge, not the language model, then carries the project out operation by operation with the agent
+commands of the game, as the company of the token, and checks each one by reading the game again (in a
+network game up to 20 s per operation). Rules in code:
+
+* A project does not start when the company's cash minus the estimate would be below 0.
+* It stops at the first operation that fails; the later ones are skipped. Done operations are not undone.
+* It stops when the money spent (from the company's finances) exceeds the estimate by more than 20 %.
+* The report (done, failed or skipped per operation, its cost, the actual cost against the estimate, why
+  it stopped) appears on the card and as a note in the author's chat; the author may propose a
+  correction, which needs a new approval.
+
+### Costs and limits
+
+* Every model call is counted with DeepSeek's prices per million tokens (`deepseek-flash` 0.006 cache hit,
+  0.30 cache miss, 1.20 output; `deepseek-v4-pro` 0.044, 1.32, 3.96 USD; peak prices always, unless
+  `--team-offpeak-factor`). Measured on the NYC map with `deepseek-flash`: 0.004–0.012 USD per request
+  (37 model calls for 7 requests, 0.047 USD); the pro models cost about 4.4 times as much per token.
+* Daily limit (UTC day): `--team-limit` for all companies together (default 0.50 USD) and optionally
+  `--team-company-limit` per company. At the limit the agents refuse new work until midnight UTC
+  (reason `over_limit`); the check runs before every model call.
+* A run makes at most 25 tool calls; delegation is at most 3 levels deep; per company at most 2 agents
+  work at once (4 on the bridge, one run per agent), further requests wait in a queue.
+* `--team-model AGENT=MODEL` changes the model of an agent (`deepseek-flash`, `deepseek-v4-pro`).
+
+### What the agents can and cannot do
+
+They change the game only through the agent commands of the game ([tools/mcp](../mcp/README.md), "Agent
+commands"), always for the company of the token: the building and removal tools of an allow-list, depots
+(buy, start, sell vehicles), lines (create, schedule, delete, withdraw, rename) and convoys (line,
+schedule, sell, to a depot, withdraw). On a dedicated server the remote control stays read only
+otherwise, and its tools reach every client like the clicks of a player. The agents cannot act for the
+public player, use depots, lines or convoys of other companies, remove or change what does not belong to
+the company (city roads, factories, other companies' ways and stops), break the rules of a scenario, move
+money, change passwords or lock the game, pause or speed up the game, change settings, or do anything
+without a project approved by a player of the company.
+
+### Local use
+
+Single player: start the game with `-remote_control`, put `DEEPSEEK_API_KEY=...` into a file such as the
+repository's `.env` (git-excluded) and start the bridge with a database:
+
+```
+python tools/dashboard/simutrans_dashboard.py --db <user directory>/dashboard/agents.sqlite --env-file .env
+```
+
+The first start prints the links; the player token works for company 0 (the first company, usually the
+human player of a single player game; another one with `SIMUTRANS_DASHBOARD_PLAYER_COMPANY` before the first
+start or `token add --company N` later).
+
+### HTTP API of the team
+
+Only for sessions of a player or admin token with a company (viewers: 403); with `--no-team` 404. `GET`
+requests like the other reads, `POST` requests like actions (cookie, `Content-Type: application/json`,
+`X-Dashboard: 1`, `Origin`), with bodies up to 32 KB. Errors are `{"ok":false,"error":"<text>"}`, with
+`"reason"` where a reason applies. Everything read or changed belongs to the session's company; ids of
+another company answer 404.
+
+| Request | Reply / effect |
+|---|---|
+| `GET /api/team/state` | `{"company":{"nr","name"},"enabled":bool,"reason"?,"agents":[{"id","model","busy","pending_questions","unread","run","run_state"}],"usage":{"today_usd","limit_usd","company_usd","company_limit_usd","resets_at"}}`; `reason`: `no_engine_agent_mode`, `no_api_key`, `runtime_unavailable`, `over_limit`; `run`/`run_state`: the agent's active run (queued, running or waiting) or `null` |
+| `GET /api/team/chat?agent=ID[&before=MSG][&limit=N]` | `{"agent","messages":[...],"more":bool}`: up to N (default 50, at most 100) messages before message `before`, oldest first; `more`: older ones exist |
+| `GET /api/team/tasks[?state=S]` | `{"tasks":[{"id","from_agent","to_agent","title","body","state","result","run_id","created","updated"}]}` |
+| `GET /api/team/questions[?state=S]` | `{"questions":[{"id","agent","run_id","payload","state","answer","answered_by","answered_by_label","created","answered"}]}` |
+| `GET /api/team/projects[?state=S]` | `{"projects":[{"id","agent","title","rationale","ops","estimate","state","approved_by","approved_by_label","report","created","updated"}]}` |
+| `GET /api/team/projects?id=N` | `{"project":{...,"preview"}}` |
+| `GET /api/team/events` | the team's event stream, see below |
+| `POST /api/team/send` `{"agent","text"}` | `{"message_id","run_id"}`; 503 (with `reason`) while the team is unavailable, 429 `rate_limit` |
+| `POST /api/team/cancel` `{"run_id"}` | `{"run_id","accepted":true}`; 409 when the run is no longer active |
+| `POST /api/team/answer` `{"question_id","answer"}` or `{"question_id","dismiss":true}` | `{"question_id","accepted":true}`; 400 for an answer that does not fit the question, 409 when it is answered already |
+| `POST /api/team/approve` `{"project_id"}` | `{"project_id","accepted":true}`; only a proposed project (409 otherwise) |
+| `POST /api/team/reject` `{"project_id","reason"?}` | `{"project_id","accepted":true}`; a draft or proposed project |
+
+Messages: `{"id","role":"user|assistant|tool|system_note","content","author":{"token_id","label"}|null,
+"created","tools"?:[{"name","summary"}],"question_id"?,"project_id"?,"task_id"?,"from"?}`: tool calls and
+results summarised, the model's reasoning never sent; `author` `null` on a task message of an agent
+(`from`). Question `payload`: `{"tool_call_id","questions":[{"id","type":"choice|text|number|map|object",
+"header","text","options"?:[{"label","description"}],"multi"?,"allow_other"?,"min"?,"max"?,
+"mode"?:"tile|area|ab","kind"?:"line|station|convoy|factory"}]}`; `answer`: `{"<question id>": value}` with
+the label (a list of labels with `multi`) or `{"other":"<text>"}`, the text, the number, `{"x","y"}` /
+`{"x1","y1","x2","y2"}` / `{"a":{"x","y"},"b":{"x","y"}}`, `{"kind","id"}` (a factory `{"kind":"factory","x","y"}`).
+Project `estimate`: `{"total","cash","cash_after","maintenance_month","items":[{"op","label","cost"}],
+"warnings","income"?}`; `preview`: `{"bbox":[x1,y1,x2,y2]|null,"items":[{"op","kind","waytype","tiles":[[x,y,z],...],
+"label"}]}`; `report`: `{"ops":[{"op","type","state":"done|failed|skipped","error"?,"cost"?,"result"?}],
+"actual_cost","estimate","income","cost_source","started"?,"finished","stopped"?}`. States: runs `queued
+running waiting done failed cancelled interrupted`, tasks `open working waiting done cancelled`, questions
+`pending answered dismissed`, projects `draft proposed approved running done failed rejected`.
+
+`GET /api/team/events` is a Server-Sent Events stream of the session's company only (its own ring of the
+last 500 events per company, `Last-Event-ID` resumes as with `/api/events`; at most 16 streams per token,
+counted in the 64 streams of the bridge). It starts with `hello` `{"company","resync"}` (`resync` true: load
+state, chats, tasks, questions and projects again). Events:
+
+| Event | data |
+|---|---|
+| `team_delta` | `{"agent","run","text"}`: the next piece of the answer being written (append) |
+| `team_tool` | `{"agent","run","name","summary"}`: a tool call of a run |
+| `team_run` | `{"run","agent","state","phase"?:"thinking|writing|tool","error"?,"reason"?}` |
+| `team_message` | `{"agent","message"}`: a new chat message (as in `chat`) |
+| `team_question` | `{"question"}`: a new, answered or dismissed question |
+| `team_task` | `{"task"}` |
+| `team_project` | `{"project"}` (without `preview`): proposed, approved, after every operation, finished, rejected |
+| `team_usage` | `{"usage"}` (as in `state`) after every model call |
+
 ## Static files
 
 | Path | File in `web/` | Cache |
@@ -1102,8 +1342,27 @@ setting `element.style.*` from JavaScript is fine; images may also be `data:` an
 * Request framing is strict: a `GET` with a body, chunked bodies (`POST`: 411) and missing, repeated
   or odd `Content-Length` values are refused and the connection closed, so no bytes are left over to
   be read as another request behind a proxy that reuses connections.
-* At most 256 connections at once, and 32 from one address other than the loopback (a proxy or
-  tunnel there carries all users); further ones are closed at once. Every connection holds a thread.
+* At most 256 connections at once, and 32 (`--max-conn-per-ip`) from one address other than the loopback
+  (a tunnel there carries all users); further ones are closed at once. Every connection holds a thread.
+* Behind a reverse proxy every user arrives from the proxy's address. `--trusted-proxy ADDR[/BITS]`
+  (repeatable) names such proxies: their connections are not counted by the proxy's address; instead each
+  of their requests counts, from its headers until its answer is sent (an event stream while it is open),
+  for the client address, and more than `--max-conn-per-ip` at once get 429 (`Retry-After: 5`); the idle
+  connections a proxy keeps for reuse count for nobody. The client address (also of the login limit and
+  the log) is the right-most `X-Forwarded-For` entry that is not itself a trusted proxy: each proxy appends
+  the address it got the request from, the entries further left come from the client and may be
+  anything. Without a valid entry it is the proxy's own address. `X-Forwarded-For` from other peers is
+  ignored. Behind a CDN in front of the proxy (e.g. Cloudflare) the right-most entry is the CDN's edge
+  address; to count the real visitors, trust the CDN's published address ranges as well (or let the proxy
+  replace the address, e.g. Apache `mod_remoteip`).
+* The AI team: only sessions of player or admin tokens with a company reach `/api/team/*` and its event
+  stream; every database query is filtered by that company, and the team's events go to its streams only.
+  The engine's agent commands are never proxied from a browser; the team sends them on its own game
+  connection with `player=<company of the session>`. The language model has no tool that changes the game:
+  it can only propose projects, which deterministic code carries out after a player's approval, within the
+  money rules. Texts typed by players (names, messages) reach the model only inside tool results, as
+  data. The API key is read from the environment and never logged or sent to a browser. The database keeps
+  token hashes only (the file and a new directory get mode 0600/0700 on POSIX systems).
 * The 3D requests are checked before the game is asked (integer arguments, region sizes, chunks inside
   the map), run on game connections of their own with bounded queues (503 beyond) and per-session rate
   limits, so a viewer cannot slow down the poller or other browsers with them.
@@ -1120,15 +1379,18 @@ setting `element.style.*` from JavaScript is fine; images may also be `data:` an
   (or set it to an allowed name), must not buffer or compress `/api/events` (Apache:
   `ProxyPass ... flushpackets=on`, nginx honours `X-Accel-Buffering: no`) and should allow idle
   connections of at least 30 s (heartbeat 25 s). Behind a proxy all clients share the proxy's
-  address, so the login limit counts their failures together.
+  address, so the login limit and the connection limit count them together, unless the bridge trusts
+  the proxy (`--trusted-proxy <proxy address>`, see [Security](#security)).
 * **Limits that stay:** anyone who can reach the port can hold up to 256 connections (32 per
   address) open without signing in, which blocks others until they time out (60 s without data), so
   do not open the port beyond the LAN. A token holder can use the game connection fully: a viewer can
   keep the map exports at their limit (a quarter of the game's time, single requests stall the game
   for up to about 0.25 s; other browsers then get 429 for them) and sign in again and again (other
-  viewers' sessions go first); the player token has the building rights of the active player.
-  Tokens from the environment must be random. A `/?token=` link stays in the browser history (use
-  the login form on shared computers), and cookies are per host name, not per port: other web
+  viewers' sessions go first); the player token has the building rights of the active player and,
+  with the AI team, may spend the money of its company through projects it approves.
+  Tokens from the environment must be random. A `/?token=` link stays in the browser history and in the
+  access logs of proxies on the way (use the sign-in form for player tokens and on shared computers), and
+  cookies are per host name, not per port: other web
   servers on the same host name (e.g. another program on 127.0.0.1) get the session cookie when the
   browser visits them. The game's remote control port has no
   authentication of its own: every program on this computer can use it, including `eval`. For a
@@ -1188,3 +1450,29 @@ change every month. With `--old` only the lists answer (cities without ids, fact
 `--month-seconds` sets the length of a game month
 (default 20 s), `--size WxH` the world size (default 256x256; the statistics modes of the fake
 minimap change their colours every month).
+
+For the AI team the fake engine also imitates the remote control modes and the agent commands:
+`--read-only` (`-remote_control_readonly`), `--time` and `--agent` (with `--read-only`:
+`-remote_control_time`, `-remote_control_agent`), `--players N` (companies 2..N-1 with cash and a road
+depot each), `--net` (changing agent commands answer `{"pending":true}` and take effect a moment later,
+`--net-delay S`), `--net-client` with `--locked N` (companies protected on this client),
+`--forbid-tool NAME` (a scenario refusal) and `--agent-cost-factor F` (real costs F times the prices, for
+the 20 % rule). The agent commands build, buy and sell in the fake world (ways appear on the map and in the
+3D export, costs are booked into `finance`); `fake_agent_state` returns what they did.
+`dev/fake_llm.py --port 13389 [--script FILE] [--log FILE] [--key KEY]` is an OpenAI-compatible fake of the
+DeepSeek API (streaming, usage, scripted replies with reasoning and tool calls, error codes; it enforces
+DeepSeek's rules for thinking mode); start the bridge with `DEEPSEEK_BASE_URL=http://127.0.0.1:13389` and any
+`DEEPSEEK_API_KEY` to use it.
+
+Tests (standard library, from the repository root; they use the ports 13383–13399 only, never 13360 or
+13380, and temporary directories):
+
+```
+python -m unittest discover -s tools/dashboard/tests -v     # database, token commands, team routes and runtime,
+                                                            # projects and executor, security, reverse proxy options
+python tools/dashboard/tests/e2e_team.py --shots <dir>      # the Team tab in headless Edge (Playwright for Python)
+```
+
+The unittest suite runs the bridge, the fake engine and the fake language model as separate processes (a few
+minutes). `e2e_team.py` seeds a team database, drives the Team tab in light and dark, desktop and phone
+layouts, and saves screenshots; it is not part of the discovery.

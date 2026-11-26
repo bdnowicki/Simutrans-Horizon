@@ -53,8 +53,33 @@ at the dock (a 2 x 1 Harbour on the river squares 88-89 of row 104, the ship on 
 squares 127-128 x 127-128, over the corner of four chunks. City cars and pedestrians (extras=1) move along the roads.
 `tile` names the station of a square.
 
+Remote control modes like the game's: --read-only (-remote_control_readonly: actions refused with "read-only remote
+control"), --time (-remote_control_time: pause and fast forward also when read-only), --agent
+(-remote_control_agent). HELLO reports read_only, time_control and agent (agent = not read-only, or --agent).
+
+Engine agent commands (tools/dashboard checkpoint contract E) with a SIMULATED effect, for tests of the team runtime:
+agent_tool (allow-list of infrastructure tools; player checks; removal refused for objects the company does not own;
+built objects recorded, ways drawn into the map), depot_op (convoys appear in a depot, new convoy ids), line_op
+(lines created, changed, deleted, renamed; they show up in `lines`), convoy_op, plan_way (dry run: a straight or
+L-shaped path with bridges over the river and a cost), estimate (prices of the descs, also the agent-only depots
+FakeRoadDepot and FakeTrainDepot) and the read `depot`. Money comes off the company's cash. --players N adds human
+companies 2..N-1 (player 0 Human, 1 Public). --net imitates a network game: changing agent commands answer
+{"pending": true} and take effect about 0.5 s later (failures then vanish silently, as in the game); --net-client
+also refuses the companies given with --locked N (repeatable; shown as locked in `players`) like a client that does
+not know their password. --forbid-tool NAME imitates a scenario that forbids a tool. What the agent commands spend
+is booked into `finance` (construction, new_vehicles of the running month; the synthetic purchases and construction
+of a month are lumps that do not grow while it runs), `tile` lists the ways, signs, way objects, bridges and depots
+of a square, `convoy` the real vehicles, home depot, withdraw flag and value of convoys bought by agents, `line` the
+minimum loads of schedules set by agents, plan_way the "param" that builds its route, and estimate "available" (and
+"waytype" of vehicles) like the game. "Old bus" is an obsolete vehicle known to the agent commands only (not in
+desc_list). --agent-cost-factor F makes agent commands really cost F times the prices that estimate and plan_way
+tell (tests of the executor's 20 % overrun stop); --net-delay S sets the delay of pending changes. Test-only command:
+  fake_agent_state       what the agent commands built and changed (objects, depots, log, cash, pending changes)
+
   python tools/dashboard/dev/fake_engine.py [--port 13399] [--old] [--no-events] [--no-map] [--no-3d]
-         [--convoys 60] [--size 256x256] [--markup] [--delay-3d S]
+         [--convoys 60] [--size 256x256] [--markup] [--delay-3d S] [--read-only] [--time] [--agent]
+         [--players N] [--net] [--net-client] [--locked N] [--forbid-tool NAME] [--agent-cost-factor F]
+         [--net-delay S]
 
 --old imitates an engine without poll, positions, messages since=, paging, events, the map export and
 the 3D export (limit=0 then returns nothing, like the engine before phase 0b). --no-events imitates an
@@ -67,6 +92,7 @@ take that many seconds more (tests of the queues and of the single flight of the
 import argparse
 import base64
 import json
+import queue
 import random
 import socketserver
 import struct
@@ -372,6 +398,40 @@ def date_obj(months):
 
 VEH_INDEX = {d["name"]: d["i"] for d in fake_descs()[0]["vehicles"]}
 
+# -- engine agent mode (contract E): command kinds, allow-list, prices of the descs (money = the unit of cash)
+ACTION_COMMANDS = ("view", "zoom", "tool", "cash")      # refused by a read-only remote control
+TIME_COMMANDS = ("pause", "fast_forward")               # ... unless it has time control
+AGENT_COMMANDS = ("agent_tool", "depot_op", "line_op", "convoy_op", "plan_way", "estimate")
+PLAYER_UNOWNED = 15
+# tool names of agent_tool: script name -> (engine name, general tool number); everything else is refused
+AGENT_TOOLS = {"tool_build_way": ("TOOL_BUILD_WAY", 14), "tool_build_bridge": ("TOOL_BUILD_BRIDGE", 15),
+               "tool_build_tunnel": ("TOOL_BUILD_TUNNEL", 16), "tool_remove_way": ("TOOL_WAYREMOVER", 17),
+               "tool_build_wayobj": ("TOOL_BUILD_WAYOBJ", 18), "tool_build_station": ("TOOL_BUILD_STATION", 19),
+               "tool_build_roadsign": ("TOOL_BUILD_ROADSIGN", 20), "tool_build_depot": ("TOOL_BUILD_DEPOT", 21),
+               "tool_remove_wayobj": ("TOOL_REMOVE_WAYOBJ", 33), "tool_remover": ("TOOL_REMOVER", 1)}
+REMOVAL_TOOLS = ("tool_remover", "tool_remove_way", "tool_remove_wayobj")
+# name -> (waytype, price per tile/unit, maintenance per month)
+WAY_PRICES = {"fake_road": ("road", 500, 15), "fake_track": ("track", 1200, 30), "powerline": ("powerline", 300, 5)}
+BRIDGE_PRICES = {"fake_bridge": ("road", 5000, 60)}
+TUNNEL_PRICES = {"fake_tunnel": ("road", 8000, 80)}
+WAYOBJ_PRICES = {"fake_catenary": ("track", 800, 10)}
+SIGN_PRICES = {"fake_oneway": ("road", 300, 2), "fake_signal": ("track", 1500, 8)}
+STATION_PRICES = {"FakeStop": ("road", 3000, 40), "Harbour": ("water", 6000, 80)}
+DEPOT_PRICES = {"FakeRoadDepot": ("road", 6000, 50), "FakeTrainDepot": ("track", 12000, 90)}
+# vehicle -> (price, running cost per km, fixed cost per month)
+VEHICLE_PRICES = {"Fake airliner": (900000, 9.0, 3000), "Fake bus": (25000, 1.2, 40), "Fake coach": (40000, 0.8, 30),
+                  "Fake loco": (120000, 4.0, 200), "Mail trailer": (8000, 0.2, 10), "Steamer": (150000, 3.0, 150)}
+VEHICLE_DESCS = {d["name"]: d for d in fake_descs()[0]["vehicles"]}
+# an agent-only obsolete vehicle (not in desc_list, whose catalogue hash the 3D tests compare): "not available" tests
+VEHICLE_DESCS["Old bus"] = {"name": "Old bus", "waytype": "road", "length": 8, "freight": "Passagiere",
+                            "capacity": 30, "power": 90, "speed": 50, "intro": 1850, "retire": 1900}
+VEHICLE_PRICES["Old bus"] = (15000, 1.5, 30)
+SELL_FACTOR = 0.8   # share of the price a sold vehicle brings
+# line types (simline_t) and the waytypes of their vehicles
+LINE_TYPES = {1: "road", 2: "rail", 3: "water", 4: "air", 5: "monorail", 6: "tram", 7: "maglev", 8: "narrowgauge"}
+LINE_WAYTYPE = {1: "road", 2: "track", 3: "water", 4: "air", 5: "monorail", 6: "tram", 7: "maglev", 8: "narrowgauge"}
+NET_DELAY = 0.5     # --net: seconds until a pending change takes effect
+
 
 class World:
     def __init__(self, opts):
@@ -409,7 +469,7 @@ class World:
         self.ticks = 1000 * self.gen
         self.ticks_per_month = int(self.opts.month_seconds * 2000)
         self.start_months = 1950 * 12 + self.gen
-        self.cash = [1000000.0, 50000.0]
+        self.cash = [1000000.0, 50000.0] + [500000.0] * (len(PLAYER_NAMES) - 2)
         self.arrivals_pending = []
         self.lines = [{"id": base + i, "name": "Line %d" % (base + i) + MARK, "owner": i % 2, "type": "bus"}
                       for i in range(1, 9)]
@@ -433,6 +493,24 @@ class World:
         for k in range(3):
             self._add_message("World %d message %d" % (self.gen, k) + MARK, 0)
         self.new_map()
+        self.new_agent_state(base)
+
+    def new_agent_state(self, base):
+        """what the engine agent commands work on: depots (a road and a track depot of player 0, a road depot of every
+        further human company), objects built by agents (by square), the log of applied changes, id counters"""
+        self.depots = [{"pos": [104, 96, 0], "owner": 0, "waytype": "road", "name": "FakeRoadDepot", "convoys": [],
+                        "stored": []},
+                       {"pos": [60, 100, 0], "owner": 0, "waytype": "track", "name": "FakeTrainDepot", "convoys": [],
+                        "stored": []}]
+        for p in range(2, len(PLAYER_NAMES)):
+            self.depots.append({"pos": [20 + 10 * p, 200, 0], "owner": p, "waytype": "road", "name": "FakeRoadDepot",
+                                "convoys": [], "stored": []})
+        self.objects = {}       # (x, y) -> [{"kind", "name", "owner"}] built by agent commands
+        self.booked = {}        # (player, month) -> [construction, new_vehicles] of agent commands (finance)
+        self.agent_log = []     # applied changes (also failed pending ones), newest last
+        self.next_convoy = base + self.opts.convoys + 1
+        self.next_line = base + 50
+        self.next_station = base + 50
 
     def new_map(self):
         """synthetic minimap colours (height bands, a river, a road grid) and the change tracking"""
@@ -580,6 +658,11 @@ class Engine:
         self.deliver_lock = threading.Lock()
         self.next_id = 1
         self.calls = {}  # 3D command -> number of requests (fake_stats)
+        # --net: changes of agent commands wait here (due time, effect, what) and are applied in order
+        self.net_queue = queue.Queue()
+        self.pending_done = 0
+        if opts.net:
+            threading.Thread(target=self.net_worker, name="net", daemon=True).start()
 
     # -- events
 
@@ -755,7 +838,7 @@ class Engine:
                 "player": {"nr": 0, "name": PLAYER_NAMES[0], "cash": round(w.cash[0], 2)},
                 "msg_seq": len(w.messages),
                 "counts": {"convoys": len(w.convoys), "lines": len(w.lines), "halts": len(w.stations),
-                           "factories": len(FACTORIES), "cities": len(CITIES), "players": 2},
+                           "factories": len(FACTORIES), "cities": len(CITIES), "players": len(PLAYER_NAMES)},
                 "rev": {"objects": sum(c["id"] for c in w.convoys) & 0xffffffff, "schedules": w.schedule_counter,
                         "map": 0 if self.opts.no_map else w.map_gen},
                 "world": {"gen": w.gen, "size_x": SIZE, "size_y": SIZE_Y, "rotation": 0}}
@@ -796,11 +879,11 @@ class Engine:
     def cmd_players(self, a):
         w = self.w
         return {"active_player": 0, "players": [
-            {"nr": i, "name": PLAYER_NAMES[i], "type": ["human", "public"][i], "active": True,
-             "locked": False, "cash": round(w.cash[i], 2), "net_wealth": round(w.cash[i], 2),
+            {"nr": i, "name": PLAYER_NAMES[i], "type": "public" if i == 1 else "human", "active": True,
+             "locked": i in self.opts.locked, "cash": round(w.cash[i], 2), "net_wealth": round(w.cash[i], 2),
              "lines": sum(1 for l in w.lines if l["owner"] == i),
              "convoys": sum(1 for c in w.convoys if c["owner"] == i),
-             "stations": sum(1 for s in w.stations if s["owner"] == i)} for i in range(2)]}
+             "stations": sum(1 for s in w.stations if s["owner"] == i)} for i in range(len(PLAYER_NAMES))]}
 
     def owner_filter(self, items, a):
         if "owner" in a:
@@ -814,7 +897,8 @@ class Engine:
             items.append({"id": c["id"], "name": c["name"], "owner": c["owner"],
                           "pos": {"x": c["x"], "y": c["y"], "z": c["z"]}, "state": STATES[c["state"]],
                           "line": c["line"], "speed_kmh": 50 if c["state"] == 6 else 0, "max_speed_kmh": 80,
-                          "vehicles": 2, "loading_level": c["load"], "next_stop": None,
+                          "vehicles": len(c["vehicles"]) if "vehicles" in c else 2, "loading_level": c["load"],
+                          "next_stop": None,
                           "profit_this_year": 100.0 + c["id"] % 7 * 10, "profit_last_month": -5.0 + c["id"] % 3})
         out, reply = self.paged(items, a, ("id", "name", "owner", "pos", "state", "line"),
                                 lambda it: dict(it, line={"id": it["line"], "name": "Line %d" % it["line"]}))
@@ -1212,7 +1296,7 @@ class Engine:
     def cmd_finance(self, a):
         w = self.w
         nr = int(a.get("player", "0") or 0)
-        if nr not in (0, 1):
+        if not 0 <= nr < len(PLAYER_NAMES):
             raise ValueError("no player with this number")
         tt_list = ["all", "road", "rail"]
         tt = a.get("tt", "all") or "all"
@@ -1232,8 +1316,18 @@ class Engine:
             run = round(-self.wave(seed + 2, m, 350000, 50000) * f, 2)
             mnt = round(-self.wave(seed + 3, m, 220000, 4000) * f, 2)
             op = round(rev + run + mnt, 2)
-            nv = round(-500000.0 * f, 2) if m % 5 == 0 else 0.0
-            con = round(-80000.0 * f, 2) if m % 7 == 0 else 0.0
+            # purchases and construction are lumps, not spread over the month (so they do not drift while a month
+            # runs), plus what the agent commands of the player spent in these months (the executor measures it)
+            lump = scale * n_months
+            nv = -500000.0 * lump if m % 5 == 0 else 0.0
+            con = -80000.0 * lump if m % 7 == 0 else 0.0
+            if tt == "all":
+                for k in range(m, m + n_months):
+                    booked = w.booked.get((nr, k))
+                    if booked:
+                        con += booked[0]
+                        nv += booked[1]
+            nv, con = round(nv, 2), round(con, 2)
             cash = round(w.cash[nr] - (w.months - m) * 9000.0, 2)
             assets = round(self.wave(seed + 4, m, 2.0e7, 1.0e6) * scale, 2)
             return [tr, int(tr * 0.55), rev, run, mnt, 0, op, nv, con, round(op + nv + con, 2), cash, assets,
@@ -1257,11 +1351,15 @@ class Engine:
         line = self.find(w.lines, a, "line")
         conv = [c for c in w.convoys if c["line"] == line["id"]]
         reply = {"line": {"id": line["id"], "name": line["name"], "owner": line["owner"], "type": line["type"],
-                          "convoys": len(conv), "withdraw": False, "this_month": self.line_month(line, 0),
+                          "convoys": len(conv), "withdraw": bool(line.get("withdraw")),
+                          "this_month": self.line_month(line, 0),
                           "last_month": self.line_month(line, 1)},
                  "goods": ["Passengers", "Mail"], "convoys": [c["id"] for c in conv], "capacity": 60 * len(conv),
                  "load": sum(c["load"] * 60 // 100 for c in conv),
                  "schedule": [self.stop_entry(st, True) for st in line["stops"]]}
+        if "loads" in line:  # lines of agent commands: the minimum loads of their schedule entries
+            for e, load in zip(reply["schedule"], line["loads"]):
+                e["wait_for_load"] = 0 if e["halt"] is None else load
         if a.get("history") == "1":
             reply["history"] = {"columns": ["free_capacity", "transported", "revenue", "operation", "toll", "profit",
                                             "convoys", "distance", "max_speed"], "rows": self.line_history(line)}
@@ -1287,6 +1385,19 @@ class Engine:
                      "value": 2000.25, "capacity": 20, "load": 5, "goods": "Mail", "unit": "bags",
                      "speed_kmh": 80, "power_kw": 0, "weight_t": 5, "running_cost_per_km": 0.2,
                      "fixed_cost_per_month": 0, "retired": True}]
+        if "vehicles" in c:
+            # a convoy of agent commands: its real vehicles, home depot, withdraw flag and resale value
+            vehicles = [{"name": n, "built": {"year": w.months // 12, "month": 1}, "age_months": 0,
+                         "value": VEHICLE_PRICES[n][0] * SELL_FACTOR, "capacity": VEHICLE_DESCS[n]["capacity"],
+                         "load": 0, "goods": "Passengers", "unit": "", "speed_kmh": VEHICLE_DESCS[n]["speed"],
+                         "power_kw": VEHICLE_DESCS[n]["power"], "weight_t": 10,
+                         "running_cost_per_km": VEHICLE_PRICES[n][1], "fixed_cost_per_month": VEHICLE_PRICES[n][2],
+                         "retired": False} for n in c["vehicles"]]
+            home = c.get("home")
+            item.update(withdraw=bool(c.get("withdraw")), value=sum(v["value"] for v in vehicles),
+                        home_depot={"x": home[0], "y": home[1], "z": home[2]} if home else None)
+            if not c["line"]:
+                item.pop("line", None)  # like the game: no line, no key
         stops = line["stops"] if line else []
         reply = {"convoy": item, "vehicles": vehicles,
                  "schedule": {"current": leg[2] if leg else 0, "entries": [self.stop_entry(st, False) for st in stops]},
@@ -1420,7 +1531,7 @@ class Engine:
     def cmd_palette(self, a):
         return {"source": "builtin", "colors": fake_palette(),
                 "players": [{"nr": i, "name": PLAYER_NAMES[i], "color1": i * 8, "color2": 24 + i * 8,
-                             "minimap_color": i * 8 + 3} for i in range(2)],
+                             "minimap_color": i * 8 + 3} for i in range(len(PLAYER_NAMES))],
                 "height_colors": HEIGHT_COLORS, "severity_colors": SEVERITY_COLORS,
                 "maximumheight": 32, "minimumheight": -10, "groundwater": 0, "rotation": 0}
 
@@ -1743,11 +1854,28 @@ class Engine:
         if "x" not in a or "y" not in a:
             raise ValueError("missing tile coordinates x,y")
         x, y = int(a["x"]), int(a["y"])
-        g = {"pos": {"x": x, "y": y, "z": 0}, "type": "Boden", "objects": []}
+        if not (0 <= x < SIZE and 0 <= y < SIZE_Y):
+            raise ValueError("tile coordinates outside of the map")
+        g = {"pos": {"x": x, "y": y, "z": 0}, "type": "Boden", "surface": True, "objects": []}
         st = next((s for s in self.w.stations if s["pos"]["x"] == x and s["pos"]["y"] == y), None)
         if st:
             g["halt"] = st["name"]
             g["objects"].append({"type": "building", "name": "FakeStop", "owner": st["owner"]})
+        # ways (the synthetic roads and those of agent commands), what agents built on them, depots: the object
+        # types of the game's tile read
+        for _, owner, name in self.ways_at(x, y):
+            g["objects"].append({"type": "way", "name": name, "owner": owner})
+        kinds = {"bridge": "bridge", "tunnel": "tunnel", "wayobj": "wayobj"}
+        for o in self.w.objects.get((x, y), ()):
+            if o["kind"] in kinds:
+                g["objects"].append({"type": kinds[o["kind"]], "name": o["name"], "owner": o["owner"]})
+            elif o["kind"] == "sign":
+                g["objects"].append({"type": "signal" if SIGN_PRICES[o["name"]][0] == "track" else "roadsign",
+                                     "name": o["name"], "owner": o["owner"]})
+        for d in self.w.depots:
+            if (d["pos"][0], d["pos"][1]) == (x, y):
+                g["objects"].append({"type": "road_depot" if d["waytype"] == "road" else "rail_depot",
+                                     "name": d["name"], "owner": d["owner"]})
         return {"grounds": [g]}
 
     def cmd_pause(self, a):
@@ -1833,6 +1961,636 @@ class Engine:
             s.drop = drop
         return {"subscribers": len(subs)}
 
+    # -- engine agent mode (contract E), simulated: checks like the engine, effects on the fake world
+
+    def agent_player(self, a):
+        """player=N of an agent command, checked like the engine (public player, unknown players, locked companies
+        on a network client)"""
+        if "player" not in a or a["player"] == "":
+            raise ValueError("player=N is required")
+        try:
+            nr = int(a["player"])
+        except ValueError:
+            raise ValueError("player=N is required") from None
+        if nr == 1:
+            raise ValueError("agents cannot act as the public player")
+        if not 0 <= nr < min(len(PLAYER_NAMES), PLAYER_UNOWNED):
+            raise ValueError("no such player")
+        if self.opts.net_client and nr in self.opts.locked:
+            raise ValueError("player %d is protected by a password on this client" % nr)
+        return nr
+
+    def pos_arg(self, a, kx="x", ky="y"):
+        if kx not in a or ky not in a:
+            raise ValueError("missing tile coordinates %s,%s" % (kx, ky))
+        try:
+            x, y = int(a[kx]), int(a[ky])
+        except ValueError:
+            raise ValueError("%s,%s must be numbers" % (kx, ky)) from None
+        if not (0 <= x < SIZE and 0 <= y < SIZE_Y):
+            raise ValueError("position %d,%d is outside of the map" % (x, y))
+        return x, y
+
+    def agent_done(self, effect, what):
+        """single player: run the change now -> {"result": null, ...extras}; network game (--net): the change
+        takes effect NET_DELAY s later -> {"pending": true} (a failure then vanishes, as in the game)"""
+        w = self.w
+        if self.opts.net:
+            self.net_queue.put((time.monotonic() + self.opts.net_delay, effect, what))
+            return {"pending": True}
+        extras = effect() or {}
+        w.agent_log.append({"what": what, "ok": True})
+        return dict({"result": None}, **extras)
+
+    def net_worker(self):
+        """applies the pending changes of --net in order, each NET_DELAY s after its command"""
+        while True:
+            due, effect, what = self.net_queue.get()
+            time.sleep(max(0.0, due - time.monotonic()))
+            with self.w.lock:
+                try:
+                    effect()
+                    self.w.agent_log.append({"what": what, "ok": True})
+                except (ValueError, KeyError, IndexError) as e:
+                    self.w.agent_log.append({"what": what, "ok": False, "error": str(e)})
+                self.pending_done += 1
+            self.process_events()
+
+    def pay(self, nr, cost, column="construction"):
+        """an agent command spends money: --agent-cost-factor times the price (tests of the executor's overrun
+        stop), booked into the finance column of the running month like the game books it"""
+        w = self.w
+        cost = cost * self.opts.agent_cost_factor
+        if cost > w.cash[nr]:
+            raise ValueError("Insufficient funds: %.2f needed" % cost)
+        w.cash[nr] -= cost
+        self.book(nr, -cost, column)
+
+    def earn(self, nr, amount):
+        """a sale of vehicles: cash and the new_vehicles column of the running month"""
+        self.w.cash[nr] += amount
+        self.book(nr, amount, "new_vehicles")
+
+    def book(self, nr, amount, column):
+        entry = self.w.booked.setdefault((nr, self.w.months), [0.0, 0.0])
+        entry[0 if column == "construction" else 1] += amount
+
+    def ways_at(self, x, y):
+        """[(waytype, owner, name)] of the ways on a square: the synthetic roads and those built by agents"""
+        w = self.w
+        out = [(WAY_PRICES.get(o["name"], ("road",))[0], o["owner"], o["name"])
+               for o in w.objects.get((x, y), ()) if o["kind"] == "way"]
+        if not out and w.terrain[y * SIZE + x] == COL_ROAD:
+            out.append(("road", w.owned[y * SIZE + x] - 1, "fake_road"))
+        return out
+
+    def objects_at(self, x, y):
+        """[(kind, name, owner)] of everything on a square that a remover would take (owner -1 = nobody)"""
+        w = self.w
+        out = [(o["kind"], o["name"], o["owner"]) for o in w.objects.get((x, y), ()) if o["kind"] != "way"]
+        out += [("way", name, owner) for _, owner, name in self.ways_at(x, y)]
+        for st in w.stations:
+            if (st["pos"]["x"], st["pos"]["y"]) == (x, y) and not any(k == "station" for k, _, _ in out):
+                out.append(("station", st["name"], st["owner"]))
+        for d in w.depots:
+            if (d["pos"][0], d["pos"][1]) == (x, y) and not any(k == "depot" for k, _, _ in out):
+                out.append(("depot", d["name"], d["owner"]))
+        for f in FACTORIES:
+            if f[2] <= x <= f[2] + 1 and f[3] <= y <= f[3] + 1:
+                out.append(("factory", f[0], -1))
+        for c in CITIES:
+            if c[1] <= x <= c[1] + 1 and c[2] <= y <= c[2] + 1:
+                out.append(("townhall", c[0], 1))
+        return out
+
+    def route(self, x, y, x2, y2, straight=False):
+        """the squares of a way from (x, y) to (x2, y2): first along x, then along y (or a straight line only)"""
+        if straight and x != x2 and y != y2:
+            return None
+        tiles = []
+        sx = 1 if x2 >= x else -1
+        for xx in range(x, x2 + sx, sx):
+            tiles.append((xx, y))
+        sy = 1 if y2 >= y else -1
+        for yy in range(y + sy, y2 + sy, sy) if y2 != y else ():
+            tiles.append((x2, yy))
+        return tiles
+
+    def mark(self, x, y, road, owner):
+        """a square of the synthetic map becomes (or stops being) a road of an owner: a map change"""
+        w = self.w
+        w.map_gen += 1
+        i = y * SIZE + x
+        if road:
+            w.terrain[i], w.owned[i] = COL_ROAD, owner + 1
+        else:
+            w.terrain[i], w.owned[i] = HEIGHT_COLORS[5 + (x // 24 + y // 32) % 30], 0
+        w.cell_gen[(y // MAP_CELL) * w.cells[0] + x // MAP_CELL] = w.map_gen
+
+    def add_object(self, x, y, kind, name, owner):
+        self.w.objects.setdefault((x, y), []).append({"kind": kind, "name": name, "owner": owner})
+
+    def cmd_agent_tool(self, a):
+        w = self.w
+        nr = self.agent_player(a)
+        given = a.get("tool", "")
+        name = given.strip().lower()
+        for script, (engine, number) in AGENT_TOOLS.items():
+            # engine name or id with the general tool flag (0x1000), as the game's parse_work_tool takes them
+            if name in (engine.lower(), str(number | 0x1000), hex(number | 0x1000)):
+                name = script
+        if name not in AGENT_TOOLS:
+            raise ValueError("tool '%s' is not allowed for agents" % given)
+        if name in self.opts.forbid_tool:
+            raise ValueError("scenario: %s is not allowed in this scenario" % name)
+        x, y = self.pos_arg(a)
+        two = "x2" in a or "y2" in a
+        x2, y2 = self.pos_arg(a, "x2", "y2") if two else (x, y)
+        param = a.get("param", "")
+        if name in REMOVAL_TOOLS:
+            if name == "tool_remover":
+                tiles = [(x, y)]
+            else:
+                tiles = self.route(x, y, x2, y2)
+            doomed = []
+            for tx, ty in tiles:
+                objs = self.objects_at(tx, ty)
+                if name == "tool_remove_wayobj":
+                    objs = [o for o in objs if o[0] == "wayobj"]
+                elif name == "tool_remove_way":
+                    # the way goes, and everything that stands on it
+                    if not any(o[0] == "way" for o in objs):
+                        continue
+                for kind, oname, owner in objs:
+                    if owner != nr:
+                        who = "nobody" if owner < 0 else "player %d%s" % (owner, " (public)" if owner == 1 else "")
+                        raise ValueError("cannot remove %s %s at %d,%d: it belongs to %s" % (kind, oname, tx, ty, who))
+                    doomed.append((tx, ty, kind))
+            if not doomed:
+                raise ValueError("nothing to remove at %d,%d" % (x, y))
+
+            def remove():
+                for tx, ty, kind in doomed:
+                    if kind == "way":
+                        self.mark(tx, ty, False, -1)
+                    if kind == "station":
+                        w.stations = [s for s in w.stations if (s["pos"]["x"], s["pos"]["y"]) != (tx, ty)]
+                    if kind == "depot":
+                        w.depots = [d for d in w.depots if (d["pos"][0], d["pos"][1]) != (tx, ty)]
+                    left = [o for o in w.objects.get((tx, ty), ()) if o["kind"] != kind]
+                    if left:
+                        w.objects[(tx, ty)] = left
+                    else:
+                        w.objects.pop((tx, ty), None)
+                self.pay(nr, 10.0 * len(doomed))
+            return self.agent_done(remove, {"tool": name, "player": nr, "removed": [list(d) for d in doomed]})
+        if name == "tool_build_way":
+            # <way>[,[a][k][s][t][,<max length>,<bridge>[,<tunnel>]]] like the game's way tool (plan_way's "param")
+            fields = param.split(",")
+            way = fields[0]
+            bridge = fields[3] if len(fields) > 3 and fields[3] else None
+            if way not in WAY_PRICES:
+                raise ValueError("unknown way '%s'" % way)
+            if bridge is not None and bridge not in BRIDGE_PRICES:
+                raise ValueError("unknown bridge '%s'" % bridge)
+            tiles = self.route(x, y, x2, y2)
+            waytype, price, _ = WAY_PRICES[way]
+
+            def build():
+                new = [(tx, ty) for tx, ty in tiles if not any(wt == waytype for wt, _, _ in self.ways_at(tx, ty))]
+                # with a bridge, water squares are bridged at the bridge's price (as plan_way counts them)
+                wet = [t for t in new if bridge is not None and self.is_water(*t)]
+                self.pay(nr, price * (len(new) - len(wet)) + (BRIDGE_PRICES[bridge][1] * len(wet) if wet else 0))
+                for tx, ty in new:
+                    self.add_object(tx, ty, "way", way, nr)
+                    if (tx, ty) in wet:
+                        self.add_object(tx, ty, "bridge", bridge, nr)
+                    if waytype == "road":
+                        self.mark(tx, ty, True, nr)
+                return {}
+            return self.agent_done(build, {"tool": name, "player": nr, "from": [x, y], "to": [x2, y2], "way": way})
+        if name in ("tool_build_bridge", "tool_build_tunnel"):
+            table, kind = (BRIDGE_PRICES, "bridge") if name == "tool_build_bridge" else (TUNNEL_PRICES, "tunnel")
+            if param not in table:
+                raise ValueError("unknown %s '%s'" % (kind, param))
+            tiles = self.route(x, y, x2, y2, straight=True)
+            if tiles is None:
+                raise ValueError("a %s must be straight" % kind)
+
+            def build():
+                self.pay(nr, table[param][1] * len(tiles))
+                for tx, ty in tiles:
+                    self.add_object(tx, ty, kind, param, nr)
+                return {}
+            return self.agent_done(build, {"tool": name, "player": nr, "from": [x, y], "to": [x2, y2], kind: param})
+        if name == "tool_build_wayobj":
+            if param not in WAYOBJ_PRICES:
+                raise ValueError("unknown way object '%s'" % param)
+            waytype, price, _ = WAYOBJ_PRICES[param]
+            tiles = self.route(x, y, x2, y2)
+            for tx, ty in tiles:
+                if not any(wt == waytype for wt, _, _ in self.ways_at(tx, ty)):
+                    raise ValueError("%s needs a %s way at %d,%d" % (param, waytype, tx, ty))
+
+            def build():
+                self.pay(nr, price * len(tiles))
+                for tx, ty in tiles:
+                    self.add_object(tx, ty, "wayobj", param, nr)
+                return {}
+            return self.agent_done(build, {"tool": name, "player": nr, "from": [x, y], "to": [x2, y2], "wayobj": param})
+        # one square: station, sign, depot
+        table = {"tool_build_station": STATION_PRICES, "tool_build_roadsign": SIGN_PRICES,
+                 "tool_build_depot": DEPOT_PRICES}[name]
+        kind = {"tool_build_station": "station", "tool_build_roadsign": "sign", "tool_build_depot": "depot"}[name]
+        if kind == "station" and "," in param and param.rsplit(",", 1)[1].isdigit():
+            param = param.rsplit(",", 1)[0]  # <name>,<rotation>
+        if param not in table:
+            raise ValueError("unknown %s '%s'" % (kind, param))
+        waytype, price, _ = table[param]
+        if waytype != "water" and not any(wt == waytype for wt, _, _ in self.ways_at(x, y)):
+            raise ValueError("%s needs a %s way at %d,%d" % (param, waytype, x, y))
+        if kind in ("station", "depot") and any(k in ("station", "depot") for k, _, _ in self.objects_at(x, y)):
+            raise ValueError("there is a stop or depot at %d,%d already" % (x, y))
+
+        def build():
+            self.pay(nr, price)
+            self.add_object(x, y, kind, param, nr)
+            if kind == "station":
+                w.stations.append({"id": w.next_station, "name": "Stop %d" % w.next_station, "owner": nr,
+                                   "pos": {"x": x, "y": y, "z": 0}})
+                w.next_station += 1
+            elif kind == "depot":
+                w.depots.append({"pos": [x, y, 0], "owner": nr, "waytype": waytype, "name": param, "convoys": [],
+                                 "stored": []})
+            return {}
+        return self.agent_done(build, {"tool": name, "player": nr, "at": [x, y], kind: param})
+
+    def find_depot(self, a, nr):
+        x, y = self.pos_arg(a)
+        for d in self.w.depots:
+            if (d["pos"][0], d["pos"][1]) == (x, y):
+                if d["owner"] != nr:
+                    raise ValueError("the depot at %d,%d belongs to player %d" % (x, y, d["owner"]))
+                return d
+        raise ValueError("no depot at %d,%d" % (x, y))
+
+    def find_convoy(self, cid, nr):
+        for c in self.w.convoys:
+            if c["id"] == cid:
+                if c["owner"] != nr:
+                    raise ValueError("convoy %d belongs to player %d" % (cid, c["owner"]))
+                return c
+        raise ValueError("no convoy %d" % cid)
+
+    def find_line(self, lid, nr):
+        for ln in self.w.lines:
+            if ln["id"] == lid:
+                if ln["owner"] != nr:
+                    raise ValueError("line %d belongs to player %d" % (lid, ln["owner"]))
+                return ln
+        raise ValueError("no line %d" % lid)
+
+    @staticmethod
+    def id_arg(a, key, default=None):
+        if key not in a or a[key] == "":
+            if default is None:
+                raise ValueError("%s= is required" % key)
+            return default
+        try:
+            return int(a[key])
+        except ValueError:
+            raise ValueError("%s must be a number" % key) from None
+
+    def convoy_waytype(self, c):
+        names = c.get("vehicles") or ["Fake bus"]
+        return VEHICLE_DESCS[names[0]]["waytype"]
+
+    def depot_reply(self, d):
+        w = self.w
+        convoys = []
+        for cid in d["convoys"]:
+            c = next((c for c in w.convoys if c["id"] == cid), None)
+            if c is not None:
+                convoys.append({"id": c["id"], "name": c["name"], "vehicles": list(c.get("vehicles") or []),
+                                "line": c["line"] or None})
+        return {"pos": list(d["pos"]), "owner": d["owner"], "waytype": d["waytype"], "convoys": convoys,
+                "stored": list(d["stored"])}
+
+    def cmd_depot(self, a):
+        x, y = self.pos_arg(a)
+        for d in self.w.depots:
+            if (d["pos"][0], d["pos"][1]) == (x, y):
+                return self.depot_reply(d)
+        raise ValueError("no depot at %d,%d" % (x, y))
+
+    def cmd_depot_op(self, a):
+        w = self.w
+        nr = self.agent_player(a)
+        d = self.find_depot(a, nr)
+        op = a.get("op", "")
+        if op not in ("a", "i", "b", "d", "v", "s"):
+            raise ValueError("op must be a, i, b, d, v or s")
+        cid = self.id_arg(a, "convoy", 0)
+        if cid and cid not in d["convoys"]:
+            raise ValueError("convoy %d is not in this depot" % cid)
+        c = self.find_convoy(cid, nr) if cid else None
+        vehicle = a.get("vehicle", "")
+        if op in ("a", "i", "s"):
+            if vehicle not in VEHICLE_DESCS:
+                raise ValueError("unknown vehicle '%s'" % vehicle)
+            desc = VEHICLE_DESCS[vehicle]
+            if op != "s" and desc["waytype"] != d["waytype"]:
+                raise ValueError("vehicle %s (%s) does not fit this %s depot" % (vehicle, desc["waytype"], d["waytype"]))
+            year = w.months // 12
+            if op != "s" and not desc["intro"] <= year < desc["retire"]:
+                raise ValueError("vehicle %s is not available in %d" % (vehicle, year))
+            if op == "s" and vehicle not in d["stored"]:
+                raise ValueError("no stored %s in this depot" % vehicle)
+        if op in ("b", "d", "v") and c is None:
+            raise ValueError("op %s needs convoy=<id> of a convoy in this depot" % op)
+        if op == "b" and not (c["line"] or c.get("schedule")):
+            raise ValueError("convoy %d has no schedule" % cid)
+
+        def change():
+            if op in ("a", "i"):
+                self.pay(nr, VEHICLE_PRICES[vehicle][0], "new_vehicles")
+                if c is None:
+                    cv = {"id": w.next_convoy, "name": "(%d) %s" % (w.next_convoy, vehicle), "owner": nr, "line": 0,
+                          "x": d["pos"][0], "y": d["pos"][1], "z": 0, "dx": 1, "state": 0, "load": 0,
+                          "vehicles": [vehicle], "depot": list(d["pos"]), "withdraw": False, "schedule": None,
+                          "home": list(d["pos"])}
+                    w.next_convoy += 1
+                    w.convoys.append(cv)
+                    d["convoys"].append(cv["id"])
+                    return {"convoy": cv["id"]}
+                if c["id"] not in [x["id"] for x in w.convoys]:
+                    raise ValueError("convoy %d is gone" % cid)
+                c.setdefault("vehicles", [])
+                if op == "a":
+                    c["vehicles"].append(vehicle)
+                else:
+                    c["vehicles"].insert(0, vehicle)
+                return {}
+            if op == "s":
+                d["stored"].remove(vehicle)
+                self.earn(nr, VEHICLE_PRICES[vehicle][0] * SELL_FACTOR)
+                return {}
+            if c["id"] not in d["convoys"]:
+                raise ValueError("convoy %d is not in this depot any more" % cid)
+            if op == "b":
+                d["convoys"].remove(c["id"])
+                c.update(state=6, depot=None)
+                return {}
+            d["convoys"].remove(c["id"])
+            w.convoys = [x for x in w.convoys if x["id"] != c["id"]]
+            names = c.get("vehicles") or ["Fake bus", "Mail trailer"]
+            if op == "d":
+                d["stored"].extend(names)
+            else:
+                self.earn(nr, sum(VEHICLE_PRICES[n][0] for n in names) * SELL_FACTOR)
+            return {}
+        return self.agent_done(change, {"cmd": "depot_op", "op": op, "player": nr, "depot": list(d["pos"]),
+                                        "convoy": cid, "vehicle": vehicle or None})
+
+    def parse_schedule(self, text, linetype, nr, loads=None):
+        """engine schedule text <cur>|<type>|<x>,<y>,<z>,<min_load>,<wait>|...| -> (cur, stops) for a line or convoy
+        of the line type; stops are the station dicts (or waypoints) of the fake world; loads (a list) gets the
+        minimum load of every entry"""
+        if loads is None:
+            loads = []
+        parts = (text or "").split("|")
+        if len(parts) < 3:
+            raise ValueError("invalid schedule: <cur>|<type>|<x>,<y>,<z>,<min_load>,<wait>|...|")
+        try:
+            cur, stype = int(parts[0]), int(parts[1])
+        except ValueError:
+            raise ValueError("invalid schedule: <cur>|<type>| must be numbers") from None
+        if stype != linetype:
+            raise ValueError("schedule type %d does not match the line type %d" % (stype, linetype))
+        stops, entries = [], [p for p in parts[2:] if p.strip()]
+        if not entries:
+            raise ValueError("the schedule has no entries")
+        for e in entries:
+            f = e.split(",")
+            try:
+                x, y = int(f[0]), int(f[1])
+                min_load, wait = (int(f[3]) if len(f) > 3 else 0), (int(f[4]) if len(f) > 4 else 0)
+            except (ValueError, IndexError):
+                raise ValueError("invalid schedule entry '%s'" % e) from None
+            if not (0 <= x < SIZE and 0 <= y < SIZE_Y) or not 0 <= min_load <= 100 or wait < 0:
+                raise ValueError("invalid schedule entry '%s'" % e)
+            st = next((s for s in self.w.stations if (s["pos"]["x"], s["pos"]["y"]) == (x, y)), None)
+            if st is not None:
+                if st["owner"] not in (nr, 1):
+                    raise ValueError("the stop at %d,%d belongs to player %d" % (x, y, st["owner"]))
+                stops.append(st)
+            elif self.ways_at(x, y) or any((d["pos"][0], d["pos"][1]) == (x, y) for d in self.w.depots):
+                stops.append({"waypoint": True, "pos": {"x": x, "y": y, "z": 0}})
+            else:
+                raise ValueError("no stop or way at %d,%d" % (x, y))
+            loads.append(min_load)
+        if not 0 <= cur < len(stops):
+            raise ValueError("schedule: current entry %d does not exist" % cur)
+        return cur, stops
+
+    def cmd_line_op(self, a):
+        w = self.w
+        nr = self.agent_player(a)
+        op = a.get("op", "")
+        if op in ("t", "u"):
+            raise ValueError("line_op op=%s is not offered to agents" % op)
+        if op == "c":
+            wt = a.get("waytype", "")
+            names = {v: k for k, v in LINE_TYPES.items()}
+            linetype = int(wt) if wt.isdigit() else names.get(wt)
+            if linetype not in LINE_TYPES:
+                raise ValueError("waytype must be 1..8 or road, rail, water, air, monorail, tram, maglev, narrowgauge")
+            loads = []
+            cur, stops = self.parse_schedule(a.get("schedule"), linetype, nr, loads)
+
+            def create():
+                lid = w.next_line
+                w.next_line += 1
+                w.lines.append({"id": lid, "name": "Line %d" % lid, "owner": nr, "type": LINE_TYPES[linetype],
+                                "linetype": linetype, "stops": stops, "loads": loads, "withdraw": False})
+                return {"line": lid}
+            return self.agent_done(create, {"cmd": "line_op", "op": "c", "player": nr})
+        if op not in ("g", "d", "w", "r"):
+            raise ValueError("op must be c, g, d, w or r")
+        ln = self.find_line(self.id_arg(a, "line"), nr)
+        if op == "g":
+            loads = []
+            cur, stops = self.parse_schedule(a.get("schedule"), ln.get("linetype", 1), nr, loads)
+            change = lambda: ln.update(stops=stops, loads=loads) or {}  # noqa: E731
+        elif op == "d":
+            def change():
+                w.lines = [x for x in w.lines if x is not ln]
+                for c in w.convoys:
+                    if c["line"] == ln["id"]:
+                        c["line"] = 0
+                return {}
+        elif op == "w":
+            if a.get("withdraw") not in ("0", "1"):
+                raise ValueError("withdraw must be 0 or 1")
+            value = a["withdraw"] == "1"
+
+            def change():
+                ln["withdraw"] = value
+                for c in w.convoys:
+                    if c["line"] == ln["id"]:
+                        c["withdraw"] = value
+                return {}
+        else:
+            name = (a.get("name") or "").strip()
+            if not name or len(name) > 255:
+                raise ValueError("name must be 1-255 characters")
+            change = lambda: ln.update(name=name) or {}  # noqa: E731
+        return self.agent_done(change, {"cmd": "line_op", "op": op, "player": nr, "line": ln["id"]})
+
+    def cmd_convoy_op(self, a):
+        w = self.w
+        nr = self.agent_player(a)
+        c = self.find_convoy(self.id_arg(a, "convoy"), nr)
+        op = a.get("op", "")
+        waytype = self.convoy_waytype(c)
+        linetype = next((k for k, v in LINE_WAYTYPE.items() if v == waytype), 1)
+        if op == "l":
+            ln = self.find_line(self.id_arg(a, "line"), nr)
+            if ln.get("linetype", 1) != linetype:
+                raise ValueError("line %d is of another type than convoy %d" % (ln["id"], c["id"]))
+            change = lambda: c.update(line=ln["id"], schedule=None) or {}  # noqa: E731
+        elif op == "g":
+            cur, stops = self.parse_schedule(a.get("schedule"), linetype, nr)
+            change = lambda: c.update(line=0, schedule=[s["pos"] for s in stops]) or {}  # noqa: E731
+        elif op == "x":
+            def change():
+                w.convoys = [x for x in w.convoys if x["id"] != c["id"]]
+                for d in w.depots:
+                    if c["id"] in d["convoys"]:
+                        d["convoys"].remove(c["id"])
+                names = c.get("vehicles") or ["Fake bus", "Mail trailer"]
+                self.earn(nr, sum(VEHICLE_PRICES[n][0] for n in names) * SELL_FACTOR)
+                return {}
+        elif op == "d":
+            depot = next((d for d in w.depots if d["owner"] == nr and d["waytype"] == waytype), None)
+            if depot is None:
+                raise ValueError("no %s depot of player %d for convoy %d" % (waytype, nr, c["id"]))
+
+            def change():
+                if c["id"] not in depot["convoys"]:
+                    depot["convoys"].append(c["id"])
+                c.update(state=0, x=depot["pos"][0], y=depot["pos"][1], depot=list(depot["pos"]))
+                return {}
+        elif op == "w":
+            if a.get("withdraw") not in ("0", "1"):
+                raise ValueError("withdraw must be 0 or 1")
+            value = a["withdraw"] == "1"
+            # like the engine: nothing is sent when the convoy has the value already (also in network games), and
+            # a convoy standing in a depot is not withdrawn
+            if bool(c.get("withdraw")) == value:
+                return {"result": None, "changed": False}
+            if value and any(c["id"] in d["convoys"] for d in w.depots):
+                raise ValueError("convoy %d is standing in a depot: the engine does not withdraw it there (sell it "
+                                 "with op=x)" % c["id"])
+            change = lambda: c.update(withdraw=value) or {}  # noqa: E731
+        else:
+            raise ValueError("op must be l, g, x, d or w")
+        return self.agent_done(change, {"cmd": "convoy_op", "op": op, "player": nr, "convoy": c["id"]})
+
+    def cmd_plan_way(self, a):
+        """dry run of a way: never changes the fake world, never pending"""
+        self.agent_player(a)
+        way = a.get("way", "")
+        if way not in WAY_PRICES:
+            raise ValueError("unknown way '%s'" % way)
+        bridge, tunnel = a.get("bridge"), a.get("tunnel")
+        if bridge is not None and bridge not in BRIDGE_PRICES:
+            raise ValueError("unknown bridge '%s'" % bridge)
+        if tunnel is not None and tunnel not in TUNNEL_PRICES:
+            raise ValueError("unknown tunnel '%s'" % tunnel)
+        x, y = self.pos_arg(a)
+        x2, y2 = self.pos_arg(a, "x2", "y2")
+        tiles = self.route(x, y, x2, y2, straight=a.get("straight") == "1")
+        if tiles is None:
+            return {"ok": False, "reason": "no straight route between the squares",
+                    "error": "no straight route between the squares"}
+        waytype, price, _ = WAY_PRICES[way]
+        # the river: consecutive water squares are bridged (from the square before to the square after)
+        bridges, i = [], 0
+        while i < len(tiles):
+            if self.is_water(*tiles[i]):
+                j = i
+                while j + 1 < len(tiles) and self.is_water(*tiles[j + 1]):
+                    j += 1
+                if bridge is None or i == 0 or j == len(tiles) - 1:
+                    return {"ok": False, "reason": "no route: water at %d,%d needs a bridge" % tiles[i],
+                            "error": "no route: water at %d,%d needs a bridge" % tiles[i]}
+                bridges.append((i - 1, j + 1))
+                i = j + 1
+            i += 1
+        on_bridge = {k for s, e in bridges for k in range(s, e + 1)}
+        cost = 0
+        for k, (tx, ty) in enumerate(tiles):
+            if k in on_bridge:
+                cost += BRIDGE_PRICES[bridge][1]
+            elif not any(wt == waytype for wt, _, _ in self.ways_at(tx, ty)):
+                cost += price
+        # the param of agent_tool tool_build_way that builds the same route (as the game writes it)
+        param = way + "," + ("s" if a.get("straight") == "1" else "")
+        if bridge or tunnel:
+            param += ",0," + (bridge or "") + ("," + tunnel if tunnel else "")
+        return {"tiles": [[tx, ty, 0] for tx, ty in tiles], "length": len(tiles), "cost": float(cost),
+                "bridges": [[[tiles[s][0], tiles[s][1], 0], [tiles[e][0], tiles[e][1], 0]] for s, e in bridges],
+                "tunnels": [], "param": param}
+
+    def cmd_estimate(self, a):
+        kind, name = a.get("kind", ""), a.get("name", "")
+        tables = {"way": WAY_PRICES, "bridge": BRIDGE_PRICES, "tunnel": TUNNEL_PRICES, "wayobj": WAYOBJ_PRICES,
+                  "roadsign": SIGN_PRICES, "station": STATION_PRICES, "depot": DEPOT_PRICES}
+        if kind not in tables and kind != "vehicle":
+            raise ValueError("kind must be way, bridge, tunnel, wayobj, roadsign, station, depot or vehicle")
+        count, length = self.id_arg(a, "count", 1), self.id_arg(a, "length", 1)
+        if not 1 <= count <= 10000 or not 1 <= length <= 100000:
+            raise ValueError("count must be 1..10000 and length 1..100000")
+        sx = sy = 1
+        if a.get("size"):
+            try:
+                sx, sy = (int(v) for v in a["size"].lower().split("x"))
+            except ValueError:
+                raise ValueError("size must look like 2x3") from None
+            if not (1 <= sx <= 64 and 1 <= sy <= 64):
+                raise ValueError("size must look like 2x3")
+        if kind == "vehicle":
+            if name not in VEHICLE_DESCS:
+                raise ValueError("unknown vehicle '%s'" % name)
+            d, (price, running, fixed) = VEHICLE_DESCS[name], VEHICLE_PRICES[name]
+            year = self.w.months // 12
+            return {"kind": kind, "name": name, "price": float(price), "maintenance": float(fixed), "count": count,
+                    "total": float(price * count), "running_cost": running, "fixed_cost": float(fixed),
+                    "power": d["power"], "speed": d["speed"], "capacity": d["capacity"], "freight": d["freight"],
+                    "waytype": d["waytype"], "intro_year": d["intro"], "obsolete": year >= d["retire"],
+                    "available": d["intro"] <= year < d["retire"]}
+        if name not in tables[kind]:
+            raise ValueError("unknown %s '%s'" % (kind, name))
+        _, price, maintenance = tables[kind][name]
+        units = {"way": length, "wayobj": length, "bridge": length, "tunnel": length, "station": sx * sy}.get(kind, 1)
+        reply = {"kind": kind, "name": name, "price": float(price), "maintenance": float(maintenance), "count": count,
+                 "total": float(price * units * count), "available": True}
+        # like the game: linear objects tell the length, stations their size
+        if kind in ("way", "wayobj", "bridge", "tunnel"):
+            reply["length"] = length
+        if kind == "station":
+            reply["size"] = [sx, sy]
+        return reply
+
+    def cmd_fake_agent_state(self, a):
+        w = self.w
+        return {"objects": [{"x": x, "y": y, "kind": o["kind"], "name": o["name"], "owner": o["owner"]}
+                            for (x, y), objs in sorted(w.objects.items()) for o in objs],
+                "depots": [self.depot_reply(d) for d in w.depots], "log": w.agent_log[-200:],
+                "cash": [round(c, 2) for c in w.cash], "pending": self.net_queue.qsize(),
+                "applied": self.pending_done}
+
     def execute(self, line, conn=None):
         name, _, query = line.partition(" ")
         args = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
@@ -1842,8 +2600,21 @@ class Engine:
             reply["rid"] = rid
         fn = getattr(self, "cmd_" + name, None)
         if self.opts.old and name in ("poll", "positions", "finance", "line", "convoy", "line_route", "fake_legs",
-                                      "city", "factory", "supply_chain", "goods", "world_stats"):
+                                      "city", "factory", "supply_chain", "goods", "world_stats", "depot",
+                                      "fake_agent_state") + AGENT_COMMANDS:
             fn = None
+        if fn is not None:
+            # the kinds of the game: actions refused by a read-only remote control, time commands unless it has time
+            # control, agent commands unless it is a full remote control or has agent mode
+            o = self.opts
+            refused = None
+            if o.read_only and (name in ACTION_COMMANDS or (name in TIME_COMMANDS and not o.time)):
+                refused = "read-only remote control"
+            elif name in AGENT_COMMANDS and o.read_only and not o.agent:
+                refused = "agent commands need -remote_control_agent"
+            if refused:
+                reply.update(ok=False, error=refused)
+                return reply
         if (self.opts.old or self.opts.no_events) and name in ("subscribe", "unsubscribe"):
             fn = None
         if (self.opts.old or self.opts.no_map) and name in ("palette", "minimap", "map_changes", "labels", "fake_build", "fake_fail"):
@@ -1858,10 +2629,12 @@ class Engine:
         with self.w.lock:
             try:
                 if name in ("subscribe", "unsubscribe"):
-                    reply.update(fn(args, conn))
+                    result = fn(args, conn)
                 else:
-                    reply.update(fn(args))
-                reply["ok"] = True
+                    result = fn(args)
+                reply.update(result)
+                if "ok" not in result:  # plan_way answers {"ok": false, "reason"} for no route
+                    reply["ok"] = True
             except (ValueError, KeyError, IndexError) as e:
                 reply.update(ok=False, error=str(e).strip("'"))
         return reply
@@ -1882,7 +2655,15 @@ class Handler(socketserver.StreamRequestHandler):
         self.connection.settimeout(None)
         conn = Conn(self.wfile)
         conn.proto = int(hello[23:])
-        conn.send(b'{"ok":true,"protocol":%d,"read_only":false}\n' % conn.proto)
+        o = engine.opts
+        if o.old:
+            greeting = {"ok": True, "protocol": conn.proto, "read_only": False}
+        else:
+            # like the game: time control unless read-only without -remote_control_time; agent commands unless
+            # read-only without -remote_control_agent
+            greeting = {"ok": True, "protocol": conn.proto, "read_only": o.read_only,
+                        "time_control": not o.read_only or o.time, "agent": not o.read_only or o.agent}
+        conn.send((json.dumps(greeting, separators=(",", ":")) + "\n").encode("utf-8"))
         engine.add_conn(conn)
         try:
             for raw in self.rfile:
@@ -1922,7 +2703,32 @@ def main():
     p.add_argument("--step", type=float, default=0.25, help="seconds between simulation steps")
     p.add_argument("--delay", type=float, default=0.0, help="extra seconds per request")
     p.add_argument("--markup", action="store_true", help="put HTML with script into every name and message (XSS tests)")
+    p.add_argument("--read-only", action="store_true", help="imitate -remote_control_readonly")
+    p.add_argument("--time", action="store_true", help="imitate -remote_control_time (with --read-only)")
+    p.add_argument("--agent", action="store_true", help="imitate -remote_control_agent (with --read-only)")
+    p.add_argument("--players", type=int, default=2,
+                   help="number of players (default 2: 0 Human, 1 Public; more are human companies)")
+    p.add_argument("--net", action="store_true",
+                   help="imitate a network game: changing agent commands answer pending and act 0.5 s later")
+    p.add_argument("--net-client", action="store_true",
+                   help="imitate a network client (implies --net): --locked companies are refused")
+    p.add_argument("--locked", type=int, action="append", default=[], metavar="N",
+                   help="company N is protected by a password (repeatable)")
+    p.add_argument("--forbid-tool", action="append", default=[], metavar="NAME",
+                   help="a scenario forbids this tool (script name, e.g. tool_build_way) for agent_tool")
+    p.add_argument("--net-delay", type=float, default=NET_DELAY, metavar="S",
+                   help="--net: seconds until a pending change takes effect (default %.1f)" % NET_DELAY)
+    p.add_argument("--agent-cost-factor", type=float, default=1.0, metavar="F",
+                   help="agent commands really cost F times the prices that estimate and plan_way tell (tests of the "
+                        "executor's overrun stop)")
     opts = p.parse_args()
+    if not 2 <= opts.players <= PLAYER_UNOWNED:
+        p.error("--players takes 2..%d" % PLAYER_UNOWNED)
+    if opts.net_client:
+        opts.net = True
+    opts.locked = set(opts.locked)
+    opts.forbid_tool = set(t.lower() for t in opts.forbid_tool)
+    PLAYER_NAMES[2:] = ["Company %d" % i for i in range(2, opts.players)]
     global SIZE, SIZE_Y, MARK
     if opts.markup:
         MARK = " " + XSS
@@ -1947,9 +2753,14 @@ def main():
             engine.process_events()
             last = now
     threading.Thread(target=ticker, daemon=True).start()
-    print("fake engine on 127.0.0.1:%d%s%s" % (opts.port, " (old protocol)" if opts.old else
-                                               " (protocol 1 only)" if opts.no_events else "",
-                                               " (no 3D export)" if opts.no_3d else ""), flush=True)
+    print("fake engine on 127.0.0.1:%d%s%s%s%s" % (opts.port, " (old protocol)" if opts.old else
+                                                   " (protocol 1 only)" if opts.no_events else "",
+                                                   " (no 3D export)" if opts.no_3d else "",
+                                                   " (read-only%s%s)" % (", time" if opts.time else "",
+                                                                         ", agent" if opts.agent else "")
+                                                   if opts.read_only else "",
+                                                   " (network %s)" % ("client" if opts.net_client else "server")
+                                                   if opts.net else ""), flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
