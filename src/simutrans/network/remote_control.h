@@ -35,8 +35,9 @@
 
 struct message_node_t;
 
-/// open the listening socket, returns false on error; read_only allows only commands that read
-bool remote_control_init(int port, bool read_only = false);
+/// open the listening socket, returns false on error; read_only allows only commands that read,
+/// time_control allows pause and fast_forward too in a read-only remote control
+bool remote_control_init(int port, bool read_only = false, bool time_control = false);
 
 /// accept connections and execute pending requests, called from the main loops
 void remote_control_poll();

@@ -2,7 +2,7 @@
 /* This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: added the command line options -remote_control and -remote_control_readonly
+ * Simutrans-Horizon, 2026-11: added the command line options -remote_control, -remote_control_readonly and -remote_control_time
  */
 
 #if defined(_M_X64)  ||  defined(__x86_64__)
@@ -422,6 +422,8 @@ void print_help()
 		"                     (see tools/mcp/README.md), default port 13360\n"
 		" -remote_control_readonly [PORT] like -remote_control, but only commands\n"
 		"                     that do not change the game or the GUI are allowed\n"
+		" -remote_control_time with -remote_control_readonly: also pause and fast\n"
+		"                     forward (on a server for all clients)\n"
 		" -screensize WxH     set screensize to width W and height H\n"
 		" -server [PORT]      starts program as server (for network game)\n"
 		"                     without port specified uses 13353\n"
@@ -1702,7 +1704,7 @@ int simu_main(int argc, char** argv)
 		if(  port <= 0  ||  port > 65535  ) {
 			port = 13360;
 		}
-		if(  !remote_control_init(port, remote_control_readonly)  ) {
+		if(  !remote_control_init(port, remote_control_readonly, args.has_arg("-remote_control_time"))  ) {
 			dbg->error("simu_main()", "Could not start remote control on port %d", port);
 		}
 	}

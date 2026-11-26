@@ -117,6 +117,7 @@ class GameConnection:
         self.port = port
         self.sock = None
         self.file = None
+        self.hello = None  # handshake reply of the last connect (protocol, read_only, time_control)
         self.lock = threading.Lock()
 
     def close(self):
@@ -151,6 +152,7 @@ class GameConnection:
             raise GameError(f"handshake rejected: {reply}")
         self.sock = sock
         self.file = f
+        self.hello = reply
 
     def request(self, command, **args):
         params = {}

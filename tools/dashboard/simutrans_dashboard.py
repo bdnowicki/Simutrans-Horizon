@@ -87,6 +87,8 @@ ROLE_ACTIONS = {
     "player": ("view", "zoom", "pause", "fast_forward", "tool"),
     "admin": ("view", "zoom", "pause", "fast_forward", "tool", "cash"),
 }
+# the actions a read-only remote control accepts when the game allows time control (-remote_control_time)
+TIME_ACTIONS = ("pause", "fast_forward")
 # never reachable through the bridge, whatever the role (also refused as unknown commands)
 NEVER_PROXIED = frozenset(("eval", "screenshot", "click", "move", "drag", "wheel", "key", "text",
                            "unlock_game", "remove_password", "tool_visibility", "windows"))
@@ -2330,6 +2332,19 @@ class App:
                 role = r
         return role
 
+    def engine_actions(self):
+        """The actions the game accepts, from its handshake: None (all, or not known yet); a game started with
+        -remote_control_readonly accepts only pause and fast forward, and these only with -remote_control_time."""
+        hello = self.req_conn.hello or self.poller.conn.hello
+        if not hello or not hello.get("read_only"):
+            return None
+        return TIME_ACTIONS if hello.get("time_control") else ()
+
+    def role_actions(self, role):
+        """The actions a role may send now: its actions that the game accepts."""
+        accepted = self.engine_actions()
+        return [a for a in ROLE_ACTIONS[role] if accepted is None or a in accepted]
+
     def engine_request(self, command, params, heavy):
         """(HTTP status, reply dict) of a browser request through the request connection."""
         export = command in EXPORT_COMMANDS
@@ -3044,6 +3059,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"ok": True}, [("Set-Cookie", cookie)])
         if name not in ROLE_ACTIONS[sess.role]:
             return self.send_err(403, "command not allowed")
+        if name not in self.app.role_actions(sess.role):
+            return self.send_err(403, "the game allows no %s (read-only remote control)" % name)
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
             return self.send_err(415, "Content-Type must be application/json")
@@ -3062,7 +3079,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {
             "role": sess.role,
             "allowed": {"read": list(READ_COMMANDS) + list(BRIDGE_READS) + list(VIEW3D_READS),
-                        "action": list(ROLE_ACTIONS[sess.role])},
+                        "action": self.app.role_actions(sess.role)},
             "game": {"connected": game["connected"], "missing": game["missing"], "events": game["events"]},
             "bridge": {"version": VERSION, "game_port": self.app.game_port},
             # supported: the game has the 3D export (null: not known yet); pak3d: /pak3d/ serves a directory

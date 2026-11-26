@@ -16,6 +16,8 @@ DASHBOARD_PORT=${SIMUTRANS_DASHBOARD_PORT:-13380}
 DASHBOARD_HOSTS=${SIMUTRANS_DASHBOARD_HOSTS:-}
 INITIAL_SAVE=${SIMUTRANS_INITIAL_SAVE:-}
 DEBUG_LEVEL=${SIMUTRANS_DEBUG_LEVEL:-2}
+# 1: the player token of the dashboard pauses and speeds up the game for all clients
+TIME_CONTROL=${SIMUTRANS_TIME_CONTROL:-1}
 
 log() { echo "entrypoint: $*" >&2; }
 
@@ -44,6 +46,9 @@ fi
 
 args=(-server "$GAME_PORT" -set_basedir "$BASE_DIR/" -objects "$PAKSET/" -set_userdir "$USER_DIR/"
 	-nosound -nomidi -remote_control_readonly "$REMOTE_PORT" -debug "$DEBUG_LEVEL")
+if [ "$TIME_CONTROL" = 1 ]; then
+	args+=(-remote_control_time)
+fi
 if [ -f "$network" ]; then
 	log "continuing $(basename "$network")"
 elif [ -n "$INITIAL_SAVE" ] && [ -f "$USER_DIR/save/$INITIAL_SAVE" ]; then

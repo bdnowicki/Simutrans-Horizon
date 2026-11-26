@@ -6,8 +6,8 @@ the server never announces itself on the public server list.
 
 - `Dockerfile` builds the engine on Debian (CMake, backend `none`) and copies the dashboard.
   The image holds no pakset and no game.
-- `entrypoint.sh` starts the server (`-server 13353`, remote control `-remote_control_readonly 13360`
-  inside the container only) and the dashboard on port 13380. On `docker stop` the server saves the
+- `entrypoint.sh` starts the server (`-server 13353`, remote control `-remote_control_readonly 13360
+  -remote_control_time` inside the container only) and the dashboard on port 13380. On `docker stop` the server saves the
   game before it quits.
 - `simuconf.tab` is copied once into the user directory: `server_announce = 0`,
   `pause_server_no_clients = 0` (time runs on while nobody plays), `autosave = 1` (while nobody
@@ -92,8 +92,11 @@ with a password ask for it.
 ## Dashboard
 
 `http://<LAN IP>:13380/?token=<SIMUTRANS_DASHBOARD_TOKEN_VIEWER>` (read the token with
-`grep TOKEN_VIEWER .env` on the host). The remote control of the server is read only, so the
-player token can look but not act. The container log hides the tokens.
+`grep TOKEN_VIEWER .env` on the host). The remote control of the server is read only except for the
+time: with the player token the buttons Pause and Fast forward pause the game and run it at 4× speed for
+all clients (`-remote_control_time`; `SIMUTRANS_TIME_CONTROL=0` in `.env` switches this off, then the
+player token can only look). A client that joins resumes the game at normal speed, as Simutrans does.
+Building stays impossible from the dashboard. The container log hides the tokens.
 
 ## 3D models (optional)
 

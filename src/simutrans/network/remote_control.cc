@@ -992,6 +992,18 @@ static const char *cmd_ping(const args_t &, json_t &j)
 }
 
 
+/// time multiplier of "fast forward" in network games (16 = normal speed): the server and all clients run
+/// in lock step, so the game runs this much faster instead of as fast as possible
+static const sint32 NETWORK_FAST_FORWARD_MULTIPLIER = 4 * 16;
+
+/// fast forward on: in single player the fast forward mode, in network games a faster time multiplier
+static bool fast_forward_on()
+{
+	karte_t *welt = world();
+	return env_t::networkmode ? welt->get_time_multiplier() > 16 : welt->is_fast_forward();
+}
+
+
 static const char *cmd_status(const args_t &a, json_t &j)
 {
 	karte_t *welt = world();
@@ -1017,7 +1029,7 @@ static const char *cmd_status(const args_t &a, json_t &j)
 	write_date(j, "date", welt->get_current_month());
 	j.kv("ticks", (sint64)welt->get_ticks());
 	j.kv("paused", welt->is_paused());
-	j.kv("fast_forward", welt->is_fast_forward());
+	j.kv("fast_forward", fast_forward_on());
 	j.kv("time_multiplier", (int)welt->get_time_multiplier());
 	j.kv("rotation", (int)welt->get_settings().get_rotation());
 	j.kv("cities", (uint32)welt->get_cities().get_count());
@@ -1552,9 +1564,10 @@ static const char *cmd_messages(const args_t &a, json_t &j)
 
 static const char *cmd_pause(const args_t &a, json_t &j)
 {
-	if (env_t::networkmode) {
-		return "not available in network games";
+	if (env_t::networkmode  &&  !env_t::server) {
+		return "not available on a network client (the server controls the time)";
 	}
+	// on a server: it stops sending steps, so its clients wait (a client that joins resumes the game)
 	karte_t *welt = world();
 	welt->set_pause(arg_bool(a, "on", !welt->is_paused()));
 	j.kv("paused", welt->is_paused());
@@ -1564,10 +1577,33 @@ static const char *cmd_pause(const args_t &a, json_t &j)
 
 static const char *cmd_fast_forward(const args_t &a, json_t &j)
 {
-	if (env_t::networkmode) {
-		return "not available in network games";
-	}
 	karte_t *welt = world();
+	if (env_t::networkmode) {
+		if (!env_t::server) {
+			return "not available on a network client (the server controls the time)";
+		}
+		// a faster time multiplier, changed by the tool of the public player like the speed keys: the server sends
+		// it to all clients, which change the speed at the same step (a client that joins resets it to normal)
+		const bool on = arg_bool(a, "on", !fast_forward_on());
+		const sint32 delta = (on ? NETWORK_FAST_FORWARD_MULTIPLIER : 16) - welt->get_time_multiplier();
+		if (delta != 0) {
+			tool_t *tool = create_tool(TOOL_CHANGE_GAME_SPEED | SIMPLE_TOOL);
+			if (tool == NULL) {
+				return "cannot change the speed";
+			}
+			char param[16];
+			sprintf(param, "%d", (int)delta);
+			tool->set_default_param(param);
+			// sent by the server: no password check of the public player (like scenario scripts)
+			tool->flags = tool_t::WFL_SCRIPT | tool_t::WFL_NO_CHK;
+			bool suspended;
+			welt->set_tool_api(tool, welt->get_public_player(), suspended);
+			delete tool;
+		}
+		j.kv("fast_forward", on);
+		j.kv("time_multiplier", (int)(on ? NETWORK_FAST_FORWARD_MULTIPLIER : 16));
+		return NULL;
+	}
 	welt->set_fast_forward(arg_bool(a, "on", !welt->is_fast_forward()));
 	j.kv("fast_forward", welt->is_fast_forward());
 	return NULL;
@@ -6035,7 +6071,7 @@ static const char *cmd_vehicles3d(const args_t &a, json_t &j)
 
 	j.kv("x1", (int)x1).kv("y1", (int)y1).kv("x2", (int)x2).kv("y2", (int)y2);
 	j.kv("ticks", (sint64)welt->get_ticks());
-	j.kv("paused", welt->is_paused()).kv("ff", welt->is_fast_forward()).kv("mult", (int)welt->get_time_multiplier());
+	j.kv("paused", welt->is_paused()).kv("ff", fast_forward_on()).kv("mult", (int)welt->get_time_multiplier());
 	j.kv("drive_left", welt->get_settings().is_drive_left());
 	j.kv("diag_steps", (int)vehicle_base_t::get_diagonal_vehicle_steps_per_tile());
 	j.kv("desc_gen", cat.gen);
@@ -6092,7 +6128,7 @@ static const char *cmd_poll(const args_t &, json_t &j)
 	j.kv("month_progress", progress);
 	j.kv("ticks_per_month", per_month);
 	j.kv("paused", welt->is_paused());
-	j.kv("ff", welt->is_fast_forward());
+	j.kv("ff", fast_forward_on());
 	j.kv("mult", (int)welt->get_time_multiplier());
 
 	player_t *active = welt->get_active_player();
@@ -6505,7 +6541,8 @@ enum command_kind_t
 {
 	CMD_READ,       ///< only reads the game and the GUI, allowed with -remote_control_readonly
 	CMD_READ_HEAVY, ///< like CMD_READ, but takes milliseconds: at most one per poll (see execute_requests)
-	CMD_ACTION      ///< changes the game, the GUI or files (input, view, time, scripts, screenshots, ...)
+	CMD_TIME,       ///< pauses or speeds up the game: with -remote_control_readonly only with -remote_control_time
+	CMD_ACTION      ///< changes the game, the GUI or files (input, view, scripts, screenshots, ...)
 };
 
 struct command_t
@@ -6535,8 +6572,8 @@ static const command_t commands[] = {
 	{ "screen_pos",   cmd_screen_pos,   CMD_READ },
 	{ "tile",         cmd_tile,         CMD_READ },
 	{ "messages",     cmd_messages,     CMD_READ },
-	{ "pause",        cmd_pause,        CMD_ACTION },
-	{ "fast_forward", cmd_fast_forward, CMD_ACTION },
+	{ "pause",        cmd_pause,        CMD_TIME },
+	{ "fast_forward", cmd_fast_forward, CMD_TIME },
 	{ "zoom",         cmd_zoom,         CMD_ACTION },
 	{ "eval",         cmd_eval,         CMD_ACTION },
 	{ "map",          cmd_map,          CMD_READ },
@@ -6578,6 +6615,8 @@ static const command_t commands[] = {
 
 /// -remote_control_readonly: only CMD_READ and CMD_READ_HEAVY commands
 static bool read_only = false;
+/// -remote_control_time: CMD_TIME commands also with -remote_control_readonly
+static bool time_control = false;
 
 
 static const command_t *find_command(const std::string &name)
@@ -6637,7 +6676,8 @@ static void execute_request(const std::string &line, json_t &j)
 		err = "no world loaded";
 	}
 	else if (const command_t *cmd = find_command(name)) {
-		err = (read_only  &&  cmd->kind == CMD_ACTION) ? "read-only remote control" : cmd->fn(args, j);
+		const bool refused = read_only  &&  (cmd->kind == CMD_ACTION  ||  (cmd->kind == CMD_TIME  &&  !time_control));
+		err = refused ? "read-only remote control" : cmd->fn(args, j);
 	}
 	if (err) {
 		j.kv("ok", false);
@@ -7035,7 +7075,7 @@ static void watch_status(subscription_t &s, uint32 client, uint32 now, bool emit
 {
 	karte_t *welt = world();
 	const bool paused = welt->is_paused();
-	const bool ff = welt->is_fast_forward();
+	const bool ff = fast_forward_on();
 	const sint32 mult = welt->get_time_multiplier();
 	const int player = welt->get_active_player() ? (int)welt->get_active_player_nr() : -1;
 	if (emit) {
@@ -7446,12 +7486,13 @@ static const char *cmd_unsubscribe(const args_t &a, json_t &j)
 }
 
 
-bool remote_control_init(int port, bool readonly)
+bool remote_control_init(int port, bool readonly, bool time)
 {
 	if (listen_socket != INVALID_SOCKET) {
 		return true;
 	}
 	read_only = readonly;
+	time_control = time;
 #if USE_WINSOCK
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -7480,7 +7521,7 @@ bool remote_control_init(int port, bool readonly)
 		listen_socket = INVALID_SOCKET;
 		return false;
 	}
-	dbg->message("remote_control_init", "remote control listening on 127.0.0.1:%d%s", port, read_only ? " (read-only)" : "");
+	dbg->message("remote_control_init", "remote control listening on 127.0.0.1:%d%s", port, read_only ? (time_control ? " (read-only, time control)" : " (read-only)") : "");
 	return true;
 }
 
@@ -7598,7 +7639,7 @@ static bool execute_next(remote_client_t &c, bool allow_heavy, bool &heavy)
 		}
 		c.greeted = true;
 		c.protocol = protocol;
-		j.obj().kv("ok", true).kv("protocol", protocol).kv("read_only", read_only).end_obj();
+		j.obj().kv("ok", true).kv("protocol", protocol).kv("read_only", read_only).kv("time_control", !read_only  ||  time_control).end_obj();
 	}
 	else {
 		current_client = &c;

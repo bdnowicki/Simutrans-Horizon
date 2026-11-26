@@ -31,11 +31,14 @@ commands that read the game and the windows (`ping`, `status`, `windows`, `tile`
 `world_stats`, `desc_list`, `scene3d`, `heights`, `vehicles3d`). Every other command, including `eval`, `tool`,
 `screenshot`, GUI input, `view`, `zoom`, `pause` and `tool_visibility`, gets
 `{"ok":false,"error":"read-only remote control"}`. Most MCP tools that act on the game then fail.
+With `-remote_control_time` as well, the time commands `pause` and `fast_forward` are accepted too
+(e.g. a dedicated server whose dashboard may pause and speed up the game for all clients).
 
 ### Protocol notes
 
 * The greeting `HELLO simutrans-remote 1` must arrive within 5 seconds of connecting. The reply is
-  `{"ok":true,"protocol":1,"read_only":false}`. `HELLO simutrans-remote 2` works the same way
+  `{"ok":true,"protocol":1,"read_only":false,"time_control":true}` (`time_control`: `pause` and
+  `fast_forward` are accepted). `HELLO simutrans-remote 2` works the same way
   (reply `"protocol":2`) and also allows events (see [Events](#events-protocol-2)); a protocol 1
   connection never gets event lines. The MCP server uses protocol 1; the
   [browser dashboard](../dashboard/README.md) in tools/dashboard uses protocol 2 (events, map export,
@@ -80,7 +83,7 @@ files and are refused there. Commands marked with a section are described below.
 | `screenshot` | action | `path=<file> [x y w h] [scale=1-8]`; refuses network paths |
 | `view` | action | `x y [z]` center the view on a tile |
 | `zoom` | action | `[dir=in\|out] [count=1-10]` |
-| `pause`, `fast_forward` | action | `[on=0\|1]` (toggle if missing); not in network games |
+| `pause`, `fast_forward` | action | `[on=0\|1]` (toggle if missing). In network games only on the server, for all clients: `pause` stops the server's steps, so its clients wait; `fast_forward` sets the time multiplier to 4× normal (64) with the speed tool of the public player, which every client applies at the same step, and `fast_forward`/`ff` in `status` and `poll` then mean a multiplier above normal. A client that joins resumes the game and resets the speed to normal, as Simutrans does. A network client refuses both |
 | `eval` | action | `code=<Squirrel> [reset=1] [unowned=1] [ops= owner= max_size=]`; the scripted tools are refused (see Security) |
 | `cash` | action | `amount=<credits> [player=N]` |
 | `tool` | action | build or remove tool at map positions, see below |

@@ -70,6 +70,11 @@ load other worlds while the bridge runs; the bridge reconnects (1 to 10 s backof
 | player | same | `view zoom pause fast_forward tool` |
 | admin | same | player's + `cash` |
 
+A game whose remote control is read only (`-remote_control_readonly`, from its greeting) accepts no actions,
+or only `pause` and `fast_forward` with `-remote_control_time`: the bridge then offers and accepts only those
+(`allowed.action` of the session, otherwise 403). On a dedicated server they pause and speed up the game for
+all clients (see the commands `pause` and `fast_forward` in [tools/mcp](../mcp/README.md)).
+
 Never available, whatever the role: `eval`, `screenshot`, `click`, `move`, `drag`, `wheel`,
 `key`, `text`, `unlock_game`, `remove_password`, `tool_visibility`, `windows` and every command
 not listed above. `tool` always acts as the active player of the game (`player`/`unowned` are
@@ -400,8 +405,8 @@ const reply = await r.json();          // {"paused":true,"ok":true}
 |---|---|---|
 | `view` | `x`, `y`, `z`? | `{"center":{"x","y","z"}}` (moves the game window's view) |
 | `zoom` | `dir`: `"in"`/`"out"`, `count`: 1–10 | `{"zoom_index","tile_raster_width"}` |
-| `pause` | `on`: bool (missing = toggle) | `{"paused":bool}`; not in network games |
-| `fast_forward` | `on`: bool (missing = toggle) | `{"fast_forward":bool}`; not in network games |
+| `pause` | `on`: bool (missing = toggle) | `{"paused":bool}`; in network games only on the server, for all clients |
+| `fast_forward` | `on`: bool (missing = toggle) | `{"fast_forward":bool}`; in network games only on the server: 4× normal speed for all clients (`time_multiplier` 64) |
 | `tool` | `tool`, `x`, `y`, `z`?, `x2`?, `y2`?, `z2`?, `param`?, `ctrl`?, `shift`? | `{"result":null}`, or in network games `{"pending":true}`; a refusal of the game is 400 `{"ok":false,"error":"<text>"}` |
 | `cash` (admin) | `amount`, `player`?, `confirm`: **true** (required) | `{"player","name","amount","cash_before","cash","steps"}` (+ `"pending":true` in network games) |
 
