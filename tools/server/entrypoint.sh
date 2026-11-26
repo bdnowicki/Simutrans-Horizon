@@ -4,6 +4,7 @@
 #
 # Container entrypoint: starts the dedicated server and the dashboard bridge, passes SIGTERM
 # to the server (it saves the game before it quits) and exits when the server exits.
+# Secrets (DEEPSEEK_API_KEY, dashboard tokens) come from the environment and are never printed.
 
 set -u
 
@@ -18,8 +19,28 @@ INITIAL_SAVE=${SIMUTRANS_INITIAL_SAVE:-}
 DEBUG_LEVEL=${SIMUTRANS_DEBUG_LEVEL:-2}
 # 1: the player token of the dashboard pauses and speeds up the game for all clients
 TIME_CONTROL=${SIMUTRANS_TIME_CONTROL:-1}
+# 1: the AI team of the dashboard: the game accepts the agent commands (-remote_control_agent) and the
+# players' Team tab works (needs DEEPSEEK_API_KEY); otherwise the dashboard offers no Team tab
+AGENTS=${SIMUTRANS_AGENTS:-0}
+# access tokens and the AI team's history, kept in the user directory
+DASHBOARD_DB=${SIMUTRANS_DASHBOARD_DB:-$USER_DIR/dashboard/agents.sqlite}
+# daily cost limits of the AI team in USD (all companies / per company or "off"); stored in the database
+TEAM_LIMIT=${SIMUTRANS_TEAM_LIMIT:-}
+TEAM_COMPANY_LIMIT=${SIMUTRANS_TEAM_COMPANY_LIMIT:-}
+# addresses or networks of the reverse proxies in front of the dashboard (X-Forwarded-For is trusted from them)
+TRUSTED_PROXIES=${SIMUTRANS_DASHBOARD_TRUSTED_PROXIES:-}
 
 log() { echo "entrypoint: $*" >&2; }
+
+# the container log must show no secret: the bridge prints access links with tokens (first start with an
+# empty database) and never a key, but anything that looks like a token or a key is hidden anyway
+redact() {
+	sed -u -E \
+		-e 's/(token=)[^[:space:]&"]*/\1<hidden>/g' \
+		-e 's/(Bearer )[^[:space:]"]+/\1<hidden>/g' \
+		-e 's/\bsk-[A-Za-z0-9_-]{8,}/sk-<hidden>/g' \
+		-e 's/((DEEPSEEK_API_KEY|SIMUTRANS_DASHBOARD_TOKEN_[A-Z]+)=)[^[:space:]]*/\1<hidden>/g'
+}
 
 if [ ! -f "$BASE_DIR/config/simuconf.tab" ] || [ ! -d "$BASE_DIR/$PAKSET" ]; then
 	log "$BASE_DIR must hold the base files (config, text, ...) and the pakset $PAKSET"
@@ -49,6 +70,12 @@ args=(-server "$GAME_PORT" -set_basedir "$BASE_DIR/" -objects "$PAKSET/" -set_us
 if [ "$TIME_CONTROL" = 1 ]; then
 	args+=(-remote_control_time)
 fi
+if [ "$AGENTS" = 1 ]; then
+	args+=(-remote_control_agent)
+	if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+		log "SIMUTRANS_AGENTS=1 but DEEPSEEK_API_KEY is not set: the Team tab of the dashboard stays disabled"
+	fi
+fi
 if [ -f "$network" ]; then
 	log "continuing $(basename "$network")"
 elif [ -n "$INITIAL_SAVE" ] && [ -f "$USER_DIR/save/$INITIAL_SAVE" ]; then
@@ -61,15 +88,29 @@ fi
 
 bridge_pid=
 start_bridge() {
-	local hosts=() h
-	for h in $DASHBOARD_HOSTS; do
-		hosts+=(--allowed-host "$h")
+	local opts=(--db "$DASHBOARD_DB") words=() w
+	read -r -a words <<< "$DASHBOARD_HOSTS"
+	for w in "${words[@]}"; do
+		opts+=(--allowed-host "$w")
 	done
-	# the bridge prints its access URLs; keep the tokens out of the container log
+	read -r -a words <<< "${TRUSTED_PROXIES//,/ }"
+	for w in "${words[@]}"; do
+		opts+=(--trusted-proxy "$w")
+	done
+	if [ "$AGENTS" != 1 ]; then
+		opts+=(--no-team)
+	fi
+	if [ -n "$TEAM_LIMIT" ]; then
+		opts+=(--team-limit "$TEAM_LIMIT")
+	fi
+	if [ -n "$TEAM_COMPANY_LIMIT" ]; then
+		opts+=(--team-company-limit "$TEAM_COMPANY_LIMIT")
+	fi
+	# DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL and SIMUTRANS_DASHBOARD_PLAYER_COMPANY reach the bridge through the
+	# environment; the bridge prints its access URLs, redact keeps the tokens out of the container log
 	python3 -u /opt/simutrans/tools/dashboard/simutrans_dashboard.py --game-port "$REMOTE_PORT" \
-		--bind 0.0.0.0 --port "$DASHBOARD_PORT" "${hosts[@]}" \
-		> >(sed -u 's/token=[^[:space:]&]*/token=<see .env>/g') \
-		2> >(sed -u 's/token=[^[:space:]&]*/token=<see .env>/g' >&2) &
+		--bind 0.0.0.0 --port "$DASHBOARD_PORT" "${opts[@]}" \
+		> >(redact) 2> >(redact >&2) &
 	bridge_pid=$!
 }
 
