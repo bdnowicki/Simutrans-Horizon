@@ -33,12 +33,18 @@ commands that read the game and the windows (`ping`, `status`, `windows`, `tile`
 `{"ok":false,"error":"read-only remote control"}`. Most MCP tools that act on the game then fail.
 With `-remote_control_time` as well, the time commands `pause` and `fast_forward` are accepted too
 (e.g. a dedicated server whose dashboard may pause and speed up the game for all clients).
+With `-remote_control_agent` as well, the [agent commands](#agent-commands) are accepted too
+(`agent_tool`, `depot_op`, `line_op`, `convoy_op`, `plan_way`, `estimate`): allow-listed changes for
+one company, e.g. for the AI team of the dashboard on a dedicated server. Without the option they get
+`{"ok":false,"error":"read-only remote control: agent commands need -remote_control_agent"}`. A full
+`-remote_control` accepts them anyway.
 
 ### Protocol notes
 
 * The greeting `HELLO simutrans-remote 1` must arrive within 5 seconds of connecting. The reply is
-  `{"ok":true,"protocol":1,"read_only":false,"time_control":true}` (`time_control`: `pause` and
-  `fast_forward` are accepted). `HELLO simutrans-remote 2` works the same way
+  `{"ok":true,"protocol":1,"read_only":false,"time_control":true,"agent":true}` (`time_control`: `pause`
+  and `fast_forward` are accepted; `agent`: the agent commands are accepted). `HELLO simutrans-remote 2`
+  works the same way
   (reply `"protocol":2`) and also allows events (see [Events](#events-protocol-2)); a protocol 1
   connection never gets event lines. The MCP server uses protocol 1; the
   [browser dashboard](../dashboard/README.md) in tools/dashboard uses protocol 2 (events, map export,
@@ -51,8 +57,8 @@ With `-remote_control_time` as well, the time commands `pause` and `fast_forward
 * The game executes requests between two frames, round-robin over the connections: one request per
   connection and frame, more until about 4 ms of the frame are used. A single request is not
   interrupted, so a large `map` or `eval` still takes its time.
-* Heavy commands ("read, heavy" below: `scene3d`, `desc_list`, `heights`, and `vehicles3d` with
-  `extras=1`, about 1-3 ms each) run at most one per frame, and only within the first millisecond of the frame's request work. A connection whose next
+* Heavy commands ("read, heavy" below: `scene3d`, `desc_list`, `heights`, `vehicles3d` with
+  `extras=1`, about 1-3 ms each, and `plan_way`, a route search) run at most one per frame, and only within the first millisecond of the frame's request work. A connection whose next
   request is heavy waits for a later frame; its later requests wait behind it (replies keep their
   order), the other connections go on. The first connection changes with every frame, so every
   connection gets its turn. A burst of `scene3d` requests is thus spread over frames, one chunk per
@@ -67,7 +73,8 @@ With `-remote_control_time` as well, the time commands `pause` and `fast_forward
 
 `<command> <url-encoded k=v&k=v>`. "read" commands only read the game and the windows and are
 accepted with `-remote_control_readonly`; "action" commands change the game, the GUI, the time or
-files and are refused there. Commands marked with a section are described below.
+files and are refused there; "agent" commands are accepted there only with `-remote_control_agent`.
+Commands marked with a section are described below.
 
 | command | kind | arguments, remarks |
 | --- | --- | --- |
@@ -101,6 +108,10 @@ files and are refused there. Commands marked with a section are described below.
 | `desc_list`, `scene3d`, `heights` | read, heavy | see 3D export |
 | `vehicles3d` | read (heavy with `extras=1`) | see 3D export |
 | `subscribe`, `unsubscribe` | read | see Events (protocol 2); they only change the connection |
+| `depot` | read | `x y [z]` a depot with its convoys and stored vehicles, see Agent commands |
+| `agent_tool`, `depot_op`, `line_op`, `convoy_op` | agent | changes for one company, see Agent commands |
+| `plan_way` | agent, heavy | dry run of way building, see Agent commands |
+| `estimate` | agent | prices of ways, buildings and vehicles, see Agent commands |
 
 The text input is queued: every `text` request keeps its text until the game has processed it.
 When 1024 texts or 16 MB of text are already waiting, the request fails with
@@ -199,6 +210,100 @@ when the tool worked, `{"ok":false,"error":"<text of the game>"}` when it did no
 without a text gives `the tool did not work here (no reason given)`). In network games the tool
 goes to the server like a click and the reply is `{"pending":true}`; a refusal then shows up in the
 game.
+
+### Agent commands
+
+The agent commands let a trusted program, the AI team of the [dashboard](../dashboard/README.md),
+change the game for ONE company through a few allow-listed operations. They are accepted with
+`-remote_control`, and with `-remote_control_readonly` only together with `-remote_control_agent`
+(a dedicated server). The program that may connect to the port is the authorization: the tools are
+sent like the tools of scenario scripts (`WFL_SCRIPT | WFL_NO_CHK`), so a company protected by a
+password acts in single player and on a network server. On a network client the server does not
+trust these flags: a company that is locked on that client is refused with
+`... is protected by a password on this client ...` (companies the client has unlocked work).
+
+Common rules (all but `estimate`):
+
+* `player=N` is required: refused when missing (`player=N is required`), not a number, no such
+  company, `N` 15 or higher, and for the public player 1 (`agents cannot act as the public player`).
+* Every object an agent uses, changes or removes must belong to company N (depots, convoys, lines,
+  removed objects); objects of nobody (cities, nature), of the public player or of other companies
+  are refused. The engine's change tools check owners only in network games, so the commands check
+  them themselves.
+* The scenario rules apply as to a human player: the commands check what the flags would skip
+  (`is_tool_allowed` for the tool, `is_work_allowed_here` at the positions, `is_schedule_allowed`
+  for schedules) and refuse with the scenario's message (`Forbidden by scenario` without one).
+* Replies: single player `{"result":null,...}` when it worked; network game `{"pending":true}` (the
+  tool goes through the server, read the game again to see the result). Nothing opens a dialog,
+  except the short message the game shows when a convoy is sent to a depot. Money values are credits
+  like `cash` of `players`. Way building and purchases do not check the money of the company.
+
+`agent_tool tool=<name|id> x= y= [z=] [x2= y2= [z2=]] [param=] [ctrl=1] [shift=1] player=N` works like
+`tool`, but only for `tool_build_way`, `tool_build_bridge`, `tool_build_tunnel`, `tool_build_wayobj`,
+`tool_build_station`, `tool_build_roadsign`, `tool_build_depot`, `tool_remove_way`,
+`tool_remove_wayobj` and `tool_remover`; every other tool gets `... is not allowed for agents ...`.
+The build tools need the name of an object that is available now (`param` of `tool_build_way`:
+`<way>[,[a][k][s][t][,<max length>,<bridge>[,<tunnel>]]]`, `s` = straight; `tool_build_station`:
+`<name>[,<rotation>]`). Before a removal the command predicts everything the tool would remove and
+refuses with `cannot remove <what> '<name>' at x,y,z: it belongs to <owner>` unless all of it
+belongs to the company: the remover takes one thing per click in the game's order (a marker, a city
+car - then refused, try again -, a powerline, a sign, the stop building, a way object, a whole bridge,
+a whole tunnel with all its squares (`ctrl=1`: also branches), a depot, a building, other objects,
+then one way); `tool_remove_way` (`param=<waytype>`: 1 road, 2 track and tram, 3 water, 5 monorail,
+6 maglev, 8 narrow gauge, 16 air) takes the ways along the route and the signs, way objects, stops and
+tunnels of that waytype on them, and whole bridges that start on the route; `tool_remove_wayobj`
+(`param=<waytype>`) takes or shortens the way objects along the route. Removal on crossings with the
+remover, powerline bridges and tunnels, and routes through depots are refused; when the prediction is
+unsure the command refuses.
+
+`depot x= y= [z=]` (read): `{"pos":[x,y,z],"owner":N,"waytype":"road","name":"<depot>",
+"max_convoy_length":N,"convoys":[{"id":N,"name":"..","vehicles":["<vehicle>",...],"line":<id>|null}],
+"stored":["<vehicle>",...]}`; without z the depot on any ground of the square.
+
+`depot_op player=N x= y= [z=] op=<a|i|b|d|v|s> convoy=<id> vehicle=<name>`: `a`/`i` append/insert
+`vehicle` (with the vehicles it must be coupled with, which the depot buys together) to `convoy`,
+`convoy=0` makes a new convoy (single player: the reply has `"convoy":<id>`); `b` starts the convoy
+(it needs a schedule), `d` disassembles it into the depot, `v` sells it, `s` sells the stored vehicle
+`vehicle`. The depot and the convoy belong to the company and the convoy is in this depot; the
+vehicle fits the depot's waytype, is available now (not future, not obsolete), can be coupled (as
+the depot window allows) and the convoy does not get too long. The depot tool of the game fails
+without a message, so all this is checked before.
+
+`line_op player=N op=c waytype=<1..8|road|rail|water|air|monorail|tram|maglev|narrowgauge>
+[schedule=<text>]` creates a line (single player: `"line":<id>`; without a schedule an empty one);
+`op=g line= schedule=` sets its schedule, `op=d line=` deletes it, `op=w line= withdraw=0|1` withdraws
+its convoys (refused for a line without convoys), `op=r line= name=` renames it. Not offered: trim
+and unite, which change convoys of all companies.
+
+`convoy_op player=N convoy=<id> op=l line=<id>` puts the convoy on the line (the schedule type must
+fit), `op=g schedule=<text>` gives it an own schedule, `op=x` sells it, `op=d` sends it to the nearest
+depot, `op=w withdraw=0|1` sets withdraw (the game toggles it; when the convoy already has the value
+nothing is sent and the reply has `"changed":false`). As in the game, a withdrawn empty convoy is
+sold at once; a convoy standing in a depot is not withdrawn (refused).
+
+Schedules are the engine's text `<current stop>|<type>|<x>,<y>,<z>,<min load>,<wait>|...|`, types
+1 road, 2 train, 3 ship, 4 air, 5 monorail, 6 tram, 7 maglev, 8 narrow gauge, e.g.
+`0|1|10,20,0,0,0|30,40,1,50,0|`. They are checked: the type, every stop on an existing ground where
+this kind of vehicle can stop and that the company may use (no ways or depots of other companies,
+only stops it may use, as the schedule window checks), minimum load 0..100, at least two different
+stops, the scenario. The game reads the text as given (it drops doubled stops).
+
+`plan_way player=N way=<way name> x= y= [z=] x2= y2= [z2=] [bridge=<name>] [tunnel=<name>]
+[straight=1]` is a dry run of `tool_build_way` with the company as builder: the route the way builder
+finds and its price, computed in this game only (never sent to the server, never changes anything):
+`{"ok":true,"tiles":[[x,y,z],...],"length":N,"cost":<credits>,"bridges":[[[x,y,z],[x,y,z]],...],
+"tunnels":[...],"param":"<param of agent_tool tool_build_way that builds it>"}` (bridges and tunnels:
+start and end of the new ones) or `{"ok":false,"error":"<text>","reason":"<text>"}` (the same text
+in both keys). The cost is the
+game's estimate (the one the way tool shows while dragging).
+
+`estimate kind=<way|bridge|tunnel|wayobj|roadsign|station|depot|vehicle> name=<name> [count=N]
+[length=N] [size=XxY]` (no player needed, changes nothing): `{"kind","name","price","maintenance",
+"count","total","available"}` with the price per unit (way, way object, bridge, tunnel: per square,
+total = price × length × count; station: per square, total = price × X × Y × count, `size` defaults
+to the building's size; depot, sign, vehicle: per piece) and the maintenance per unit and month.
+Vehicles add `running_cost` (per km), `fixed_cost` (per month), `power`, `speed`, `capacity`,
+`freight`, `waytype`, `intro_year`, `obsolete`.
 
 ### Details and histories
 
@@ -946,3 +1051,6 @@ files; `include()` still loads `.nut` scripts. `command_x` refuses the scripted 
 (`tool_exec_script`, `tool_exec_two_click_script`), which would load a `tool.nut` from any
 directory with the full system library. `screenshot` refuses network paths (`\\host\...`,
 `//host/...`, `\??\...`). `-remote_control_readonly` allows only reading commands.
+`-remote_control_agent` lets every program that can connect act for any company but the public player
+through the agent commands, also for companies protected by a password (on a server for all
+clients): enable it only where the connecting program (the dashboard bridge) does the authorization.

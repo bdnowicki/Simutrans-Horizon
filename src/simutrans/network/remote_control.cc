@@ -2,7 +2,8 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: new file, the -remote_control automation interface
+ * Simutrans-Horizon, 2026-11: new file, the -remote_control automation interface, with the agent mode
+ * (-remote_control_agent) for the AI team of the dashboard
  */
 
 // must be included before all simutrans stuff (winsock)
@@ -54,6 +55,7 @@
 #include "../builder/vehikelbauer.h"
 #include "../builder/wegbauer.h"
 #include "../dataobj/ribi.h"
+#include "../dataobj/route.h"
 #include "../dataobj/schedule.h"
 #include "../descriptor/bridge_desc.h"
 #include "../descriptor/building_desc.h"
@@ -82,11 +84,13 @@
 #include "../vehicle/air_vehicle.h"
 #include "../vehicle/pedestrian.h"
 #include "../vehicle/simroadtraffic.h"
+#include "../vehicle/simtestdriver.h"
 #include "../vehicle/vehicle.h"
 #include "../script/script.h"
 #include "../script/script_loader.h"
 #include "../sys/simsys.h"
 #include "../utils/cbuffer.h"
+#include "../utils/simrandom.h"
 #include "../utils/simstring.h"
 #include "../tpl/slist_tpl.h"
 #include "../tpl/vector_tpl.h"
@@ -97,6 +101,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -6547,12 +6552,2074 @@ static const char *cmd_remove_password(const args_t &a, json_t &j)
 }
 
 
+// ---------------------------------------------------------------------------
+// agent mode: allow-listed changes for one company (AI team of the dashboard)
+// ---------------------------------------------------------------------------
+
+/*
+ * The agent commands (kind CMD_AGENT) let a trusted program, the dashboard bridge, change the game for ONE company
+ * (player=N, never the public player) through a few allow-listed operations: build and remove infrastructure
+ * (agent_tool), depots (depot_op), lines (line_op), convoys (convoy_op), way planning without building (plan_way)
+ * and prices (estimate). They are allowed with -remote_control, and with -remote_control_readonly only together with
+ * -remote_control_agent (dedicated server).
+ *
+ * Who can connect to this port is the authorization, so the tools are sent with WFL_SCRIPT | WFL_NO_CHK like the
+ * tools of scenario scripts: a company protected by a password acts in single player and on a network server (the
+ * server keeps WFL_NO_CHK of its own commands); on a network client the server removes the flag, so a company that
+ * is locked on this client is refused here. WFL_NO_CHK also skips the scenario rules of karte_t::set_tool_api,
+ * call_work_api and nwc_tool_t::clone, and the change tools check owners only in network games, so the agent commands
+ * check the scenario rules and the owners themselves: every object they use, change or remove must belong to the
+ * company. Removals are predicted before the tool is sent; when the prediction is unsure the command is refused.
+ *
+ * Replies: single player {"result":null,...}; network game {"pending":true}: the tool goes through the server, re-read
+ * the game to see its result. The commands open no dialogs (except the short message the engine shows when a convoy is
+ * sent to a depot).
+ */
+
+/// set by a command that writes "ok" itself (plan_way: "ok":false is a result there, not an error)
+static bool reply_wrote_ok = false;
+
+
+/// error message with several values (make_error takes one)
+static const char *agent_error(const char *fmt, ...)
+{
+	char buf[2048];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	error_buffer = buf;
+	return error_buffer.c_str();
+}
+
+
+static std::string pos_text(koord3d pos)
+{
+	char buf[48];
+	snprintf(buf, sizeof(buf), "%d,%d,%d", (int)pos.x, (int)pos.y, (int)pos.z);
+	return buf;
+}
+
+
+/// who owns something, for error messages
+static std::string owner_text(sint8 nr)
+{
+	if (nr == PLAYER_PUBLIC_NR) {
+		return "the public player";
+	}
+	if (nr < 0  ||  nr >= PLAYER_UNOWNED) {
+		return "nobody (a city or nature)";
+	}
+	const player_t *player = world()->get_player((uint8)nr);
+	char buf[160];
+	snprintf(buf, sizeof(buf), "company %d%s%s%s", (int)nr, player ? " (" : "", player ? player->get_name() : "", player ? ")" : "");
+	return buf;
+}
+
+
+static void write_pos_array(json_t &j, const char *k, koord3d pos)
+{
+	j.key(k).arr().num(pos.x).num(pos.y).num(pos.z).end_arr();
+}
+
+
+/// a whole number argument; false if it is missing or not a number
+static bool agent_number(const args_t &a, const char *k, sint64 &v)
+{
+	const std::string s = arg_str(a, k);
+	if (s.empty()) {
+		return false;
+	}
+	char *end = NULL;
+	v = strtoll(s.c_str(), &end, 10);
+	return *end == 0;
+}
+
+
+/// the company of an agent command: player=N, required, never the public player
+static const char *get_agent_player(const args_t &a, player_t *&player)
+{
+	player = NULL;
+	sint64 nr = 0;
+	if (!has_arg(a, "player")  ||  arg_str(a, "player").empty()) {
+		return "player=N is required";
+	}
+	if (!agent_number(a, "player", nr)) {
+		return make_error("player=N must be a number, not '%s'", arg_str(a, "player").c_str());
+	}
+	if (nr == PLAYER_PUBLIC_NR) {
+		return "agents cannot act as the public player";
+	}
+	player_t *p = (nr >= 0  &&  nr < PLAYER_UNOWNED) ? world()->get_player((uint8)nr) : NULL;
+	if (p == NULL) {
+		return "no such player";
+	}
+	if (env_t::networkmode  &&  !env_t::server  &&  p->is_locked()) {
+		// the server removes WFL_NO_CHK of tools from clients and drops tools of companies locked for this client
+		return make_error("player %s is protected by a password on this client: use the remote control of the server, or unlock the company in this client", p->get_name());
+	}
+	player = p;
+	return NULL;
+}
+
+
+/// the scenario rule for a tool, as set_tool_api, call_work_api and nwc_tool_t::clone check it without WFL_NO_CHK
+static const char *agent_scenario_tool(player_t *player, tool_t *tool)
+{
+	if (!world()->get_scenario()->is_tool_allowed(player, tool->get_id(), tool->get_waytype(), tool->get_default_param())) {
+		return "Forbidden by scenario";
+	}
+	return NULL;
+}
+
+
+/// the scenario rule for a tool at a position (call_work_api, nwc_tool_t::clone)
+static const char *agent_scenario_pos(player_t *player, tool_t *tool, koord3d pos)
+{
+	scenario_t *scen = world()->get_scenario();
+	if (!scen->is_scripted()) {
+		return NULL;
+	}
+	if (const char *err = scen->is_work_allowed_here(player, tool->get_id(), tool->get_waytype(), tool->get_default_param(), pos)) {
+		return *err ? make_error("%s", err) : make_error("Forbidden by scenario at %s", pos_text(pos).c_str());
+	}
+	return NULL;
+}
+
+
+/**
+ * Route searches call INT_CHECK, which may run a sync step and draw the screen: not while a command computes. In network
+ * games the interrupts are always off (stepping with a fixed ratio, or paused), so nothing is changed there.
+ */
+struct agent_no_interrupts_t
+{
+	bool restore;
+	agent_no_interrupts_t() : restore(!env_t::networkmode  &&  !world()->is_paused())
+	{
+		if (!env_t::networkmode) {
+			intr_disable();
+		}
+	}
+	~agent_no_interrupts_t()
+	{
+		if (restore) {
+			intr_enable();
+		}
+	}
+};
+
+
+/**
+ * Sends a simple tool (TOOL_CHANGE_DEPOT, TOOL_CHANGE_LINE, TOOL_CHANGE_CONVOI, TOOL_RENAME) for an agent as scripts
+ * do it (set_tool_api), with WFL_NO_CHK: the scenario rule for the tool, which set_tool_api and nwc_tool_t::clone then
+ * skip, is checked here. suspended: network game, the tool goes through the server and works later.
+ */
+static const char *agent_simple_tool(uint16 nr, const char *param, player_t *player, bool &suspended)
+{
+	suspended = false;
+	karte_t *welt = world();
+	if (get_random_mode() & LOAD_RANDOM) {
+		return "the game is loading";
+	}
+	std::unique_ptr<tool_t> tool(create_tool(nr | SIMPLE_TOOL));
+	if (!tool) {
+		return "could not create this tool";
+	}
+	tool->set_default_param(param);
+	tool->flags = tool_t::WFL_SCRIPT | tool_t::WFL_NO_CHK;
+	tool->callback_id = 0;
+	if (const char *err = agent_scenario_tool(player, tool.get())) {
+		return err;
+	}
+	// single player: works at once (init); network game: sent to the server as a copy (nwc_tool_t)
+	welt->set_tool_api(tool.get(), player, suspended);
+	return NULL;
+}
+
+
+static void agent_reply(json_t &j, bool suspended)
+{
+	if (suspended) {
+		j.kv("pending", true);
+	}
+	else {
+		j.key("result").null();
+	}
+}
+
+
+// ---- removal prediction ----
+
+/// things that are nobody's property for the removal checks: cursors, pedestrians, city cars, animals, smoke
+static bool agent_ignorable(const obj_t *obj)
+{
+	switch (obj->get_typ()) {
+		case obj_t::zeiger:
+		case obj_t::pedestrian:
+		case obj_t::road_user:
+		case obj_t::movingobj:
+		case obj_t::cloud:
+			return true;
+		default:
+			return false;
+	}
+}
+
+
+static const char *agent_cannot_remove(const obj_t *obj, koord3d pos)
+{
+	return agent_error("cannot remove %s '%s' at %s: it belongs to %s", obj_type_name(obj->get_typ()), obj->get_name(),
+		pos_text(pos).c_str(), owner_text(obj->get_owner_nr()).c_str());
+}
+
+
+/**
+ * Every object on the square (also ways; labels only if with_labels) must belong to the company; no vehicles there.
+ * keep_nature: trees and ground objects stay (ends of bridges and tunnels, whose objects move to the new ground).
+ */
+static const char *agent_check_square(const player_t *player, const grund_t *gr, bool with_labels, bool keep_nature = false)
+{
+	for (uint8 i = 0; i < gr->obj_count(); i++) {
+		const obj_t *obj = gr->obj_bei(i);
+		if (obj == NULL  ||  agent_ignorable(obj)  ||  (!with_labels  &&  obj->get_typ() == obj_t::label)) {
+			continue;
+		}
+		if (keep_nature  &&  (obj->get_typ() == obj_t::baum  ||  obj->get_typ() == obj_t::groundobj)) {
+			continue;
+		}
+		if (obj->is_moving()) {
+			return agent_error("cannot remove at %s now: a vehicle (%s) is there", pos_text(gr->get_pos()).c_str(), obj->get_name());
+		}
+		if (obj->get_owner_nr() != player->get_player_nr()) {
+			return agent_cannot_remove(obj, gr->get_pos());
+		}
+	}
+	return NULL;
+}
+
+
+/// every object on the square whose waytype is wt (tram and track count as the same) must belong to the company
+static const char *agent_check_way_objects(const player_t *player, const grund_t *gr, waytype_t wt)
+{
+	for (uint8 i = 0; i < gr->obj_count(); i++) {
+		const obj_t *obj = gr->obj_bei(i);
+		if (obj == NULL  ||  agent_ignorable(obj)) {
+			continue;
+		}
+		const waytype_t owt = obj->get_waytype();
+		const bool same = owt == wt  ||  (owt == tram_wt  &&  wt == track_wt)  ||  (owt == track_wt  &&  wt == tram_wt);
+		if (same  &&  obj->get_owner_nr() != player->get_player_nr()) {
+			return agent_cannot_remove(obj, gr->get_pos());
+		}
+	}
+	return NULL;
+}
+
+
+/**
+ * What bridge_builder_t::remove(player, start, wegtyp) removes: the whole bridge found from start (the same walk),
+ * every object on its squares, the pillars below, and ways next to it that it shortens or removes (bridges that do not
+ * end on the ground). All of it must belong to the company. covered collects the bridge squares.
+ */
+static const char *agent_predict_bridge(const player_t *player, koord3d pos_start, waytype_t wegtyp, vector_tpl<koord3d> *covered)
+{
+	karte_t *welt = world();
+	if (wegtyp == powerline_wt) {
+		return agent_error("cannot remove the powerline bridge at %s as an agent", pos_text(pos_start).c_str());
+	}
+	vector_tpl<koord3d> part_list, end_list, tmp_list;
+	vector_tpl<const grund_t *> marked;
+	const grund_t *gs = welt->lookup(pos_start);
+	if (gs == NULL) {
+		return "no ground there";
+	}
+	tmp_list.append(pos_start);
+	marked.append(gs);
+	do {
+		const koord3d pos = tmp_list.pop_back();
+		const grund_t *from = welt->lookup(pos);
+		if (from == NULL) {
+			return agent_error("cannot remove the bridge at %s as an agent: unusual bridge", pos_text(pos_start).c_str());
+		}
+		grund_t *to;
+		koord zv = koord::invalid;
+		if (pos != pos_start  &&  from->ist_karten_boden()) {
+			if (from->get_grund_hang() != slope_t::flat) {
+				zv = -koord(from->get_grund_hang());
+			}
+			else if (from->get_weg_hang() != slope_t::flat) {
+				zv = koord(from->get_weg_hang());
+			}
+			end_list.append(pos);
+		}
+		else if (pos == pos_start) {
+			if (from->ist_karten_boden()) {
+				if (from->get_grund_hang() != slope_t::flat) {
+					zv = -koord(from->get_grund_hang());
+				}
+				else if (from->get_weg_hang() != slope_t::flat) {
+					zv = koord(from->get_weg_hang());
+				}
+				end_list.append(pos);
+			}
+			else {
+				const weg_t *w0 = from->get_weg_nr(0);
+				if (w0 == NULL) {
+					return agent_error("cannot remove the bridge at %s as an agent: unusual bridge", pos_text(pos_start).c_str());
+				}
+				const ribi_t::ribi r = w0->get_ribi_unmasked();
+				const ribi_t::ribi dir1 = r & ribi_t::northeast;
+				const ribi_t::ribi dir2 = r & ribi_t::southwest;
+				bool is_end1 = dir1 == ribi_t::none;
+				if (ribi_t::is_single(dir1)) {
+					is_end1 = !from->get_neighbour(to, wegtyp, dir1)  ||  !to->ist_bruecke();
+				}
+				bool is_end2 = dir2 == ribi_t::none;
+				if (ribi_t::is_single(dir2)) {
+					is_end2 = !from->get_neighbour(to, wegtyp, dir2)  ||  !to->ist_bruecke();
+				}
+				if (!is_end1  &&  !is_end2) {
+					return "Cannot delete a bridge from its centre";
+				}
+				zv = koord(is_end1 ? dir2 : dir1);
+				part_list.append(pos);
+			}
+		}
+		else if (from->ist_bruecke()) {
+			part_list.append(pos);
+		}
+		if (const char *msg = from->kann_alle_obj_entfernen(player)) {
+			if (const char *err = agent_check_square(player, from, true, from->ist_karten_boden())) {
+				return err; // names what belongs to whom
+			}
+			return agent_error("cannot remove the bridge at %s: %s (at %s)", pos_text(pos_start).c_str(), msg, pos_text(pos).c_str());
+		}
+		if (from->get_halt().is_bound()  &&  from->get_halt()->get_first_owner() != player) {
+			return agent_error("cannot remove the bridge at %s: the stop at %s belongs to %s", pos_text(pos_start).c_str(),
+				pos_text(pos).c_str(), from->get_halt()->get_first_owner() ? owner_text(from->get_halt()->get_first_owner()->get_player_nr()).c_str() : "nobody");
+		}
+		for (int r = 0; r < 4; r++) {
+			if ((zv == koord::invalid  ||  zv == koord::nesw[r])  &&  from->get_neighbour(to, wegtyp, ribi_t::nesw[r])  &&  !marked.is_contained(to)  &&  to->ist_bruecke()) {
+				tmp_list.append(to->get_pos());
+				marked.append(to);
+			}
+		}
+	} while (!tmp_list.empty());
+
+	// everything on the bridge squares is removed (ways and stops too)
+	vector_tpl<koord3d> all = part_list;
+	for (koord3d const &pos : end_list) {
+		all.append(pos);
+	}
+	for (koord3d const &pos : all) {
+		if (const char *err = agent_check_square(player, welt->lookup(pos), true, end_list.is_contained(pos))) {
+			return err;
+		}
+		if (covered) {
+			covered->append_unique(pos);
+		}
+	}
+	for (koord3d const &pos : part_list) {
+		// all pillars on the ground below are removed, also those of other bridges or elevated ways there
+		const grund_t *ground = welt->lookup_kartenboden(pos.get_2d());
+		for (uint8 i = 0; ground  &&  i < ground->obj_count(); i++) {
+			const obj_t *obj = ground->obj_bei(i);
+			if (obj->get_typ() == obj_t::pillar  &&  obj->get_owner_nr() != player->get_player_nr()) {
+				return agent_cannot_remove(obj, ground->get_pos());
+			}
+		}
+		// bridges without a ramp: the ways they continue from are shortened or removed
+		const grund_t *gr = welt->lookup(pos);
+		const ribi_t::ribi bridge_ribi = gr->get_weg_ribi_unmasked(wegtyp);
+		for (uint i = 0; i < 4; i++) {
+			grund_t *prev;
+			if ((bridge_ribi & ribi_t::nesw[i])  &&  gr->get_neighbour(prev, wegtyp, ribi_t::nesw[i])  &&  !prev->ist_bruecke()  &&  !end_list.is_contained(prev->get_pos())) {
+				if (const char *err = agent_check_square(player, prev, true)) {
+					return err;
+				}
+			}
+		}
+	}
+	for (koord3d const &pos : end_list) {
+		// ramps: a higher way next to them (elevated way) is shortened or removed
+		const grund_t *gr = welt->lookup(pos);
+		const ribi_t::ribi bridge_ribi = gr->get_weg_ribi_unmasked(wegtyp);
+		for (uint i = 0; i < 4; i++) {
+			grund_t *prev;
+			if ((bridge_ribi & ribi_t::nesw[i])  &&  gr->get_neighbour(prev, wegtyp, ribi_t::nesw[i])  &&  !part_list.is_contained(prev->get_pos())  &&  prev->get_hoehe() > gr->get_hoehe()) {
+				if (const char *err = agent_check_square(player, prev, true)) {
+					return err;
+				}
+			}
+		}
+	}
+	return NULL;
+}
+
+
+/**
+ * What tunnel_builder_t::remove(player, start, wegtyp, remove_all) removes: all tunnel squares found from start (the
+ * same walk, branches only with remove_all = ctrl) with everything on them, and the portals. All of it must belong to
+ * the company.
+ */
+static const char *agent_predict_tunnel(const player_t *player, koord3d start, waytype_t wegtyp, bool remove_all)
+{
+	karte_t *welt = world();
+	vector_tpl<koord3d> squares, tmp_list;
+	vector_tpl<const grund_t *> marked;
+	const grund_t *gs = welt->lookup(start);
+	if (gs == NULL) {
+		return "no ground there";
+	}
+	tmp_list.append(start);
+	marked.append(gs);
+	do {
+		const koord3d pos = tmp_list.pop_back();
+		const grund_t *from = welt->lookup(pos);
+		grund_t *to;
+		koord zv = koord::invalid;
+		if (from->ist_karten_boden()) {
+			// a portal: search only into the tunnel
+			zv = koord(from->get_grund_hang());
+		}
+		squares.append(pos);
+		if (const char *msg = from->kann_alle_obj_entfernen(player)) {
+			if (const char *err = agent_check_square(player, from, true, from->ist_karten_boden())) {
+				return err; // names what belongs to whom
+			}
+			return agent_error("cannot remove the tunnel at %s: %s (at %s)", pos_text(start).c_str(), msg, pos_text(pos).c_str());
+		}
+		const ribi_t::ribi waytype_ribi = from->get_weg_ribi_unmasked(wegtyp);
+		if (!remove_all  &&  ribi_t::is_threeway(waytype_ribi)) {
+			return "This tunnel branches. You can try Control+Click to remove.";
+		}
+		for (int r = 0; r < 4; r++) {
+			if ((zv == koord::invalid  ||  zv == koord::nesw[r])  &&  from->get_neighbour(to, wegtyp, ribi_t::nesw[r])  &&  !marked.is_contained(to)) {
+				tmp_list.append(to->get_pos());
+				marked.append(to);
+			}
+		}
+	} while (!tmp_list.empty());
+
+	for (koord3d const &pos : squares) {
+		const grund_t *gr = welt->lookup(pos);
+		if (const char *err = agent_check_square(player, gr, true, gr->ist_karten_boden())) {
+			return err;
+		}
+	}
+	return NULL;
+}
+
+
+/**
+ * Predicts what tool_remover_t removes at pos (tool_remover_t::tool_remover_intern, the same order of checks) and
+ * refuses unless all of it belongs to the company. type: obj_t::undefined, signal, roadsign, wayobj or bahndepot.
+ * NULL: the remover only removes things of the company there.
+ */
+static const char *agent_predict_remover(const player_t *player, koord3d pos, int type, bool ctrl)
+{
+	karte_t *welt = world();
+	const grund_t *gr = welt->lookup(pos);
+	const std::string where = pos_text(pos);
+	const sint8 me = player->get_player_nr();
+	if (gr == NULL  ||  gr->obj_count() == 0) {
+		return agent_error("nothing to remove at %s", where.c_str());
+	}
+	const bool any = type == obj_t::undefined;
+
+	if (any) {
+		// markers first
+		if (label_t *label = gr->find<label_t>()) {
+			if (label->get_removal_error(player) == NULL) {
+				return label->get_owner_nr() == me ? NULL : agent_cannot_remove(label, pos);
+			}
+			if (gr->obj_count() == 1) {
+				return agent_cannot_remove(label, pos);
+			}
+		}
+		// the remover deletes a city car on the square instead of anything else
+		if (gr->find<private_car_t>()) {
+			return agent_error("cannot remove at %s now: a city car is on this square and would be removed instead; try again", where.c_str());
+		}
+	}
+
+	// powerlines (can cross ground of another company)
+	leitung_t *lt = gr->get_leitung();
+	if (any  &&  lt  &&  lt->get_removal_error(player) == NULL) {
+		if (lt->get_owner_nr() != me) {
+			return agent_cannot_remove(lt, pos);
+		}
+		if ((gr->get_typ() == grund_t::monorailboden  &&  !gr->get_weg_nr(0))  ||  gr->ist_bruecke()  ||  gr->ist_tunnel()) {
+			return agent_error("cannot remove the powerline at %s as an agent: elevated, bridge and tunnel powerlines are not supported", where.c_str());
+		}
+		return NULL;
+	}
+
+	// signal or roadsign
+	obj_t *rs = gr->suche_obj(obj_t::signal);
+	if (rs == NULL) {
+		rs = gr->suche_obj(obj_t::roadsign);
+	}
+	if ((any  ||  type == obj_t::signal  ||  type == obj_t::roadsign)  &&  rs) {
+		return rs->get_owner_nr() == me ? NULL : agent_cannot_remove(rs, pos);
+	}
+
+	// stop (not at a factory, e.g. an oil rig): the building of this square
+	if (any  &&  gr->is_halt()  &&  gr->get_halt().is_bound()  &&  fabrik_t::get_fab(pos.get_2d()) == NULL) {
+		gebaeude_t *gb = gr->find<gebaeude_t>();
+		if (gb  &&  gb->check_owner(player)) {
+			return gb->get_owner_nr() == me ? NULL : agent_cannot_remove(gb, pos);
+		}
+	}
+
+	// catenary or other way object
+	if (wayobj_t *wo = gr->find<wayobj_t>()) {
+		if (any  ||  type == obj_t::wayobj) {
+			return wo->get_owner_nr() == me ? NULL : agent_cannot_remove(wo, pos);
+		}
+	}
+
+	// bridge: the whole bridge
+	if (any  &&  gr->ist_bruecke()) {
+		bruecke_t *br = gr->find<bruecke_t>();
+		if (br == NULL) {
+			return agent_error("cannot remove at %s as an agent: unusual bridge square", where.c_str());
+		}
+		return agent_predict_bridge(player, pos, br->get_desc()->get_waytype(), NULL);
+	}
+
+	// tunnel portal: the whole tunnel
+	if (any  &&  gr->ist_tunnel()  &&  gr->ist_karten_boden()) {
+		const weg_t *w = gr->get_weg_nr(0);
+		if (gr->get_leitung()  ||  w == NULL) {
+			return agent_error("cannot remove the tunnel at %s as an agent: powerline tunnels are not supported", where.c_str());
+		}
+		return agent_predict_tunnel(player, pos, w->get_waytype(), ctrl);
+	}
+
+	// fields belong to factories
+	if (any  &&  gr->find<field_t>()) {
+		return agent_error("cannot remove the field at %s: it belongs to a factory", where.c_str());
+	}
+
+	// depot
+	depot_t *dep = gr->get_depot();
+	if (dep  &&  (any  ||  type == obj_t::bahndepot)) {
+		if (dep->get_owner_nr() != me) {
+			return agent_cannot_remove(dep, pos);
+		}
+		if (const char *msg = dep->get_removal_error(player)) {
+			return agent_error("cannot remove the depot at %s: %s", where.c_str(), msg);
+		}
+		return NULL;
+	}
+
+	// other buildings (all squares of the building)
+	gebaeude_t *gb = gr->find<gebaeude_t>();
+	if (any  &&  gb) {
+		gb = gb->get_first_tile();
+		if (gb->get_owner_nr() != me) {
+			return agent_cannot_remove(gb, pos);
+		}
+		if (gb->is_townhall()) {
+			return agent_error("cannot remove the town hall at %s", where.c_str());
+		}
+		return NULL;
+	}
+
+	if (!any) {
+		for (uint8 i = 0; i < gr->obj_count(); i++) {
+			if (gr->obj_bei(i)->get_typ() == type) {
+				return agent_error("cannot remove this object at %s as an agent", where.c_str());
+			}
+		}
+		return agent_error("nothing of this type to remove at %s", where.c_str());
+	}
+
+	// the rest: the remover takes out crossings, markers, cursors, aircraft and a powerline of another company, then
+	// removes all other objects except ways at once if it may remove all of them; only if there are none, one way
+	bool crossing = false;
+	vector_tpl<obj_t *> others;
+	for (uint8 i = 0; i < gr->obj_count(); i++) {
+		obj_t *obj = gr->obj_bei(i);
+		const obj_t::typ t = obj->get_typ();
+		if (t == obj_t::way  ||  obj == lt  ||  t == obj_t::zeiger  ||  t == obj_t::label) {
+			continue;
+		}
+		if (t == obj_t::crossing) {
+			crossing = true;
+			continue;
+		}
+		if (t == obj_t::air_vehicle  ||  (obj->is_moving()  &&  !agent_ignorable(obj))) {
+			return agent_error("cannot remove at %s now: a vehicle (%s) is there", where.c_str(), obj->get_name());
+		}
+		others.append(obj);
+	}
+	if (crossing) {
+		return agent_error("cannot remove the crossing at %s with the remover as an agent: use tool_remove_way for one of its ways", where.c_str());
+	}
+	for (obj_t *obj : others) {
+		if (const char *msg = obj->get_removal_error(player)) {
+			return agent_error("cannot remove %s '%s' at %s: %s", obj_type_name(obj->get_typ()), obj->get_name(), where.c_str(), msg);
+		}
+	}
+	const bool tunnel_ground = gr->get_typ() == grund_t::tunnelboden;
+	if (!others.empty()  &&  !tunnel_ground) {
+		for (obj_t *obj : others) {
+			if (!agent_ignorable(obj)  &&  obj->get_owner_nr() != me) {
+				return agent_cannot_remove(obj, pos);
+			}
+		}
+		return NULL;
+	}
+	if (!tunnel_ground  ||  gr->has_two_ways()) {
+		// one way, the second one first (not water)
+		weg_t *w = gr->get_weg_nr(1);
+		if (w  &&  w->get_waytype() == water_wt) {
+			w = NULL;
+		}
+		if (w == NULL  ||  w->get_removal_error(player) != NULL) {
+			w = gr->get_weg_nr(0);
+			if (w == NULL) {
+				return agent_error("nothing to remove at %s", where.c_str());
+			}
+		}
+		return w->get_owner_nr() == me ? NULL : agent_cannot_remove(w, pos);
+	}
+	// a square in a tunnel with one way: the way, everything on it and the square
+	return agent_check_square(player, gr, true);
+}
+
+
+/// way_checker_t (and scenario_checker_t) of simtool.cc: the route of tool_wayremover_t and tool_build_wayobj_t
+class agent_way_checker_t : public test_driver_t
+{
+	waytype_t wt;
+	const player_t *player;
+	uint16 tool_id;
+	bool scenario;
+public:
+	agent_way_checker_t(waytype_t w, const player_t *p, uint16 id) : wt(w), player(p), tool_id(id), scenario(world()->get_scenario()->is_scripted()) {}
+	bool check_next_tile(const grund_t *gr) const OVERRIDE
+	{
+		return gr->hat_weg(wt)  &&  (!scenario  ||  world()->get_scenario()->is_work_allowed_here(player, tool_id, wt, 0, gr->get_pos()) == NULL);
+	}
+	ribi_t::ribi get_ribi(const grund_t *gr) const OVERRIDE { return gr->get_weg_ribi(wt); }
+	waytype_t get_waytype() const OVERRIDE { return wt; }
+	int get_cost(const grund_t *, const weg_t *, const sint32, ribi_t::ribi) const OVERRIDE { return 1; }
+	bool is_target(const grund_t *, const grund_t *) const OVERRIDE { return false; }
+};
+
+
+/**
+ * Predicts what tool_wayremover_t removes from start to end (the same route and checks as its calc_route/do_work):
+ * the ways of the waytype along the route (or some of their directions), the signs, way objects, tunnels and stops of
+ * that waytype on them, whole bridges that start on the route, and on squares in tunnels or of elevated ways whose way
+ * goes completely everything there. All of it must belong to the company.
+ */
+static const char *agent_predict_wayremover(const player_t *player, koord3d start, koord3d end, waytype_t tool_wt)
+{
+	karte_t *welt = world();
+	const waytype_t wt = tool_wt;
+	route_t verbindung;
+	if (start == end) {
+		const grund_t *gr = welt->lookup(start);
+		if (gr  &&  gr->get_weg(wt)) {
+			verbindung.append(start);
+		}
+	}
+	else {
+		agent_way_checker_t driver(wt, player, TOOL_WAYREMOVER | GENERAL_TOOL);
+		agent_no_interrupts_t no_interrupts;
+		verbindung.calc_route(welt, start, end, &driver, 0, 0);
+	}
+	if (verbindung.get_count() == 0  ||  (start != end  &&  verbindung.get_count() < 2)) {
+		return "Ways not connected";
+	}
+	koord3d_vector_t const &route = verbindung.get_route();
+	// the checks of tool_wayremover_t::calc_route: if one fails, the tool removes nothing
+	for (koord3d const &pos : route) {
+		const grund_t *gr = welt->lookup(pos);
+		if (gr == NULL  ||  gr->get_weg(wt) == NULL) {
+			return "Ways not connected";
+		}
+		if (gr->get_depot()) {
+			return agent_error("cannot remove the way at %s as an agent: there is a depot (remove the depot first)", pos_text(pos).c_str());
+		}
+		const bool check_all = !gr->ist_karten_boden()  &&  gr->has_two_ways()  &&  gr->get_weg_nr(0)->get_waytype() == wt;
+		for (uint8 i = 0; i < gr->obj_count(); i++) {
+			obj_t *obj = gr->obj_bei(i);
+			const obj_t::typ t = obj->get_typ();
+			if (t == obj_t::pillar  ||  t == obj_t::leitung) {
+				continue;
+			}
+			if (t == obj_t::air_vehicle  &&  !static_cast<air_vehicle_t *>(obj)->is_on_ground()) {
+				continue;
+			}
+			const waytype_t obj_wt = obj->get_waytype();
+			bool check = true;
+			if (obj_wt != invalid_wt) {
+				const bool force_remove = (t == obj_t::gebaeude  &&  !gr->has_two_ways())  ||  (obj_wt == tram_wt  &&  wt == track_wt);
+				check = check_all  ||  obj_wt == wt  ||  force_remove;
+			}
+			if (check) {
+				if (const char *msg = obj->get_removal_error(player)) {
+					if (obj->get_owner_nr() != player->get_player_nr()) {
+						return agent_cannot_remove(obj, pos);
+					}
+					return agent_error("cannot remove the way at %s: %s", pos_text(pos).c_str(), msg);
+				}
+			}
+		}
+	}
+	// what tool_wayremover_t::do_work removes
+	vector_tpl<koord3d> covered;
+	for (uint32 i = 0; i < route.get_count(); i++) {
+		const koord3d pos = route[i];
+		const grund_t *gr = welt->lookup(pos);
+		if (gr == NULL  ||  gr->is_water()  ||  covered.is_contained(pos)) {
+			continue;
+		}
+		if (gr->ist_bruecke()) {
+			const bruecke_t *br = gr->find<bruecke_t>();
+			if (br == NULL) {
+				return agent_error("cannot remove the way at %s as an agent: unusual bridge square", pos_text(pos).c_str());
+			}
+			if (br->get_desc()->get_waytype() == wt) {
+				if (bridge_builder_t::is_start_of_bridge(gr)) {
+					if (const char *err = agent_predict_bridge(player, pos, wt, &covered)) {
+						return err;
+					}
+				}
+				// the way on a bridge stays (or went with the bridge)
+				continue;
+			}
+		}
+		ribi_t::ribi rem = 15 ^ route.get_ribi(i);
+		if (route.get_count() <= 1) {
+			rem = 0;
+		}
+		const weg_t *w = gr->get_weg(wt);
+		if (w->get_owner_nr() != player->get_player_nr()) {
+			return agent_cannot_remove(w, pos);
+		}
+		if (wt == water_wt  &&  pos.z == welt->get_water_hgt(pos.get_2d())  &&  gr->get_grund_hang() != slope_t::flat) {
+			rem &= ~ribi_t::doubles(ribi_type(gr->get_grund_hang()));
+		}
+		const bool completely = (w->get_ribi_unmasked() & rem) == 0;
+		if (gr->is_halt()  &&  !gr->has_two_ways()) {
+			// the stop on this square goes
+			if (const gebaeude_t *gb = gr->find<gebaeude_t>()) {
+				if (gb->get_owner_nr() != player->get_player_nr()) {
+					return agent_cannot_remove(gb, pos);
+				}
+			}
+		}
+		if (const char *err = agent_check_way_objects(player, gr, wt)) {
+			return err;
+		}
+		if (completely  &&  !gr->ist_karten_boden()  &&  (gr->get_typ() == grund_t::tunnelboden  ||  gr->get_typ() == grund_t::monorailboden)  &&  gr->get_weg_nr(0)->get_waytype() == wt) {
+			// in a tunnel or elevated: the square goes with everything on it, also a second way
+			if (const char *err = agent_check_square(player, gr, true)) {
+				return err;
+			}
+		}
+	}
+	return NULL;
+}
+
+
+/**
+ * Predicts what tool_remove_wayobj_t (tool_build_wayobj_t with build=false) changes from start to end: on every square
+ * of its route the way objects of the waytype are removed or lose directions. All of them must belong to the company.
+ */
+static const char *agent_predict_remove_wayobj(const player_t *player, koord3d start, koord3d end, waytype_t wt)
+{
+	karte_t *welt = world();
+	const grund_t *gs = welt->lookup(start);
+	const grund_t *ge = welt->lookup(end);
+	if (gs == NULL  ||  ge == NULL) {
+		return "Ways not connected";
+	}
+	waytype_t waytype = wt;
+	if (waytype == track_wt) {
+		if (const depot_t *dp = gs->get_depot()) {
+			waytype = dp->get_waytype();
+		}
+		else if (const depot_t *dp = ge->get_depot()) {
+			waytype = dp->get_waytype();
+		}
+	}
+	route_t verbindung;
+	if (start != end) {
+		agent_way_checker_t driver(waytype == tram_wt ? track_wt : waytype, player, TOOL_REMOVE_WAYOBJ | GENERAL_TOOL);
+		agent_no_interrupts_t no_interrupts;
+		if (verbindung.calc_route(welt, start, end, &driver, 0, 0) == route_t::no_route) {
+			return "Ways not connected";
+		}
+	}
+	else {
+		verbindung.append(start);
+	}
+	for (koord3d const &pos : verbindung.get_route()) {
+		const grund_t *gr = welt->lookup(pos);
+		for (uint8 i = 0; gr  &&  i < gr->obj_count(); i++) {
+			const obj_t *obj = gr->obj_bei(i);
+			if (obj->get_typ() == obj_t::wayobj  &&  obj->get_waytype() == wt  &&  obj->get_owner_nr() != player->get_player_nr()) {
+				return agent_cannot_remove(obj, pos);
+			}
+		}
+	}
+	return NULL;
+}
+
+
+// ---- agent commands ----
+
+/// the general tools an agent may use (infrastructure of its own company)
+static const uint16 agent_tools[] = {
+	TOOL_BUILD_WAY, TOOL_BUILD_BRIDGE, TOOL_BUILD_TUNNEL, TOOL_WAYREMOVER, TOOL_BUILD_WAYOBJ, TOOL_REMOVE_WAYOBJ,
+	TOOL_BUILD_STATION, TOOL_BUILD_ROADSIGN, TOOL_BUILD_DEPOT, TOOL_REMOVER
+};
+
+
+/// object type parameters of the remover that agents may use (none = anything, in the remover's order)
+static bool agent_remover_type(const std::string &param, int &type)
+{
+	type = obj_t::undefined;
+	if (param.empty()) {
+		return true;
+	}
+	char *end = NULL;
+	const long t = strtol(param.c_str(), &end, 10);
+	if (*end != 0) {
+		return false;
+	}
+	if (t == 0  ||  t == -1) {
+		return true;
+	}
+	if (t == obj_t::signal  ||  t == obj_t::roadsign  ||  t == obj_t::wayobj  ||  t == obj_t::bahndepot) {
+		type = (int)t;
+		return true;
+	}
+	return false;
+}
+
+
+/// a waytype number as the removal tools take it
+static bool agent_waytype_param(const std::string &param, waytype_t &wt)
+{
+	char *end = NULL;
+	const long v = strtol(param.c_str(), &end, 10);
+	if (param.empty()  ||  *end != 0) {
+		return false;
+	}
+	wt = (waytype_t)v;
+	return true;
+}
+
+
+static const char *agent_check_available(const obj_desc_timelined_t *desc, const char *what, const char *name)
+{
+	if (desc == NULL) {
+		return agent_error("no %s named '%s'", what, name);
+	}
+	const uint16 month = world()->get_timeline_year_month();
+	if (!desc->is_available(month)) {
+		return agent_error("%s '%s' is %s", what, name, desc->is_future(month) ? "not available yet" : "obsolete");
+	}
+	return NULL;
+}
+
+
+/**
+ * The parameter of an agent tool: build tools need the name of an object that is available now (no future or obsolete
+ * objects, no defaults by waytype); the removal tools only the waytypes and object types that are predicted.
+ */
+static const char *agent_check_tool_param(uint16 nr, bool has_param, const std::string &param)
+{
+	switch (nr) {
+		case TOOL_BUILD_WAY: {
+			// <way>[,[a][k][s][t][,<max length>,<bridge>[,<tunnel>]]] (tool_build_way_t::init)
+			const size_t comma = param.find(',');
+			const std::string name = param.substr(0, comma);
+			const way_desc_t *desc = way_builder_t::get_desc(name.c_str(), 0);
+			if (const char *err = agent_check_available(desc, "way", name.c_str())) {
+				return err;
+			}
+			if (desc->get_styp() == type_river) {
+				return "agents cannot build rivers";
+			}
+			if (comma != std::string::npos) {
+				size_t i = comma + 1;
+				for (const char *flag = "akst"; *flag; flag++) {
+					if (i < param.size()  &&  param[i] == *flag) {
+						i++;
+					}
+				}
+				if (i < param.size()  &&  param[i] == ',') {
+					const size_t next = param.find(',', i + 1);
+					if (next != std::string::npos) {
+						const std::string rest = param.substr(next + 1);
+						const size_t c2 = rest.find(',');
+						const std::string bridge = rest.substr(0, c2);
+						const std::string tunnel = c2 == std::string::npos ? std::string() : rest.substr(c2 + 1);
+						if (!bridge.empty()) {
+							if (const char *err = agent_check_available(bridge_builder_t::get_desc(bridge.c_str()), "bridge", bridge.c_str())) {
+								return err;
+							}
+						}
+						if (!tunnel.empty()) {
+							if (const char *err = agent_check_available(tunnel_builder_t::get_desc(tunnel.c_str()), "tunnel", tunnel.c_str())) {
+								return err;
+							}
+						}
+					}
+				}
+				else if (i < param.size()) {
+					return "param of tool_build_way: <way>[,[a][k][s][t][,<max length>,<bridge>[,<tunnel>]]]";
+				}
+			}
+			return NULL;
+		}
+		case TOOL_BUILD_BRIDGE:
+			return agent_check_available(bridge_builder_t::get_desc(param.c_str()), "bridge", param.c_str());
+		case TOOL_BUILD_TUNNEL:
+			return agent_check_available(tunnel_builder_t::get_desc(param.c_str()), "tunnel", param.c_str());
+		case TOOL_BUILD_WAYOBJ:
+			return agent_check_available(wayobj_t::find_desc(param.c_str()), "way object", param.c_str());
+		case TOOL_BUILD_ROADSIGN:
+			return agent_check_available(roadsign_t::find_desc(param.c_str()), "sign", param.c_str());
+		case TOOL_BUILD_STATION: {
+			// <name>[,<rotation>] (tool_build_station_t::get_desc)
+			std::string name = param;
+			const size_t comma = param.rfind(',');
+			if (comma != std::string::npos) {
+				name = param.substr(0, comma);
+			}
+			const building_tile_desc_t *tile = hausbauer_t::find_tile(name.c_str(), 0);
+			const building_desc_t *desc = tile ? tile->get_desc() : NULL;
+			if (desc  &&  (!desc->is_transport_building()  ||  desc->is_depot())) {
+				return make_error("'%s' is not a stop or station building", name.c_str());
+			}
+			return agent_check_available(desc, "station", name.c_str());
+		}
+		case TOOL_BUILD_DEPOT: {
+			const building_tile_desc_t *tile = hausbauer_t::find_tile(param.c_str(), 0);
+			const building_desc_t *desc = tile ? tile->get_desc() : NULL;
+			if (desc  &&  !desc->is_depot()) {
+				return make_error("'%s' is not a depot", param.c_str());
+			}
+			return agent_check_available(desc, "depot", param.c_str());
+		}
+		case TOOL_REMOVER: {
+			int type;
+			if (!agent_remover_type(has_param ? param : std::string(), type)) {
+				return "param of tool_remover for agents: nothing (remove what the remover removes first), 8 (signal), 19 (roadsign), 25 (way object) or 12 (depot)";
+			}
+			return NULL;
+		}
+		case TOOL_WAYREMOVER: {
+			waytype_t wt;
+			if (!agent_waytype_param(param, wt)) {
+				return "param of tool_remove_way: the waytype number (1 road, 2 track and tram, 3 water, 5 monorail, 6 maglev, 8 narrow gauge, 16 air)";
+			}
+			if (wt == tram_wt) {
+				return "tool_remove_way: use waytype 2 (track) for tram tracks";
+			}
+			if (wt != road_wt  &&  wt != track_wt  &&  wt != water_wt  &&  wt != monorail_wt  &&  wt != maglev_wt  &&  wt != narrowgauge_wt  &&  wt != air_wt) {
+				return "tool_remove_way: agents can remove ways of the waytypes 1, 2, 3, 5, 6, 8 and 16 (no powerlines)";
+			}
+			return NULL;
+		}
+		case TOOL_REMOVE_WAYOBJ: {
+			waytype_t wt;
+			if (!agent_waytype_param(param, wt)  ||  wt == ignore_wt  ||  wt == overheadlines_wt  ||  wt == powerline_wt  ||  wt == decoration_wt  ||  wt < 0) {
+				return "param of tool_remove_wayobj: the waytype number of the way objects (1 road, 2 track, 3 water, 5 monorail, 6 maglev, 7 tram, 8 narrow gauge, 16 air)";
+			}
+			return NULL;
+		}
+		default:
+			return NULL;
+	}
+}
+
+
+/**
+ * agent: agent_tool tool=<name|id> x,y[,z] [x2,y2[,z2]] [param=...] [ctrl=1] [shift=1] player=N
+ * Like the command tool, for the infrastructure tools of agent_tools only: build way, bridge, tunnel, way object,
+ * station, roadsign, depot; remove way, way object; the remover. Objects to build must be available now. Before a
+ * removal the command predicts everything the tool would remove (whole bridges and tunnels too) and refuses ("cannot
+ * remove ...") unless all of it belongs to the company.
+ */
+static const char *cmd_agent_tool(const args_t &a, json_t &j)
+{
+	karte_t *welt = world();
+	player_t *player;
+	if (const char *err = get_agent_player(a, player)) {
+		return err;
+	}
+	uint16 id = 0;
+	const std::string tool_name = arg_str(a, "tool");
+	if (const char *err = parse_work_tool(tool_name, id)) {
+		return err;
+	}
+	const uint16 nr = id & 0x0FFF;
+	bool allowed = false;
+	for (uint16 t : agent_tools) {
+		allowed |= t == nr;
+	}
+	if (!allowed) {
+		return make_error("tool '%s' is not allowed for agents (only: build way, bridge, tunnel, wayobj, station, roadsign, depot; remove way, wayobj; remover)", tool_name.c_str());
+	}
+	koord3d start, end = koord3d::invalid;
+	if (const char *err = get_tile_pos(a, start)) {
+		return err;
+	}
+	const bool twoclick = has_arg(a, "x2")  ||  has_arg(a, "y2");
+	if (twoclick) {
+		if (const char *err = get_tile_pos(a, end, "x2", "y2", "z2")) {
+			return err;
+		}
+	}
+	const bool has_param = has_arg(a, "param");
+	const std::string param = arg_str(a, "param");
+	if (const char *err = agent_check_tool_param(nr, has_param, param)) {
+		return err;
+	}
+
+	std::unique_ptr<tool_t> tool(create_tool(id));
+	if (!tool) {
+		return "could not create this tool";
+	}
+	// the tool keeps a pointer to its parameter, which must live until the tool is deleted
+	tool->set_default_param(has_param ? param.c_str() : NULL);
+	tool->flags = tool_t::WFL_SCRIPT | tool_t::WFL_NO_CHK;
+	if (arg_bool(a, "ctrl", false)) {
+		tool->flags |= tool_t::WFL_CTRL;
+	}
+	if (arg_bool(a, "shift", false)) {
+		tool->flags |= tool_t::WFL_SHIFT;
+	}
+	tool->callback_id = 0;
+
+	// the same checks as cmd_tool
+	const uint8 flags = tool->flags; // init() may reset them
+	if (!tool->is_init_keeps_game_state()) {
+		return "Initializing tool has side effects";
+	}
+	if (!tool->init(player)) {
+		return "Error during initializing tool";
+	}
+	tool->flags = flags;
+	if (tool->is_work_keeps_game_state()  ||  (!twoclick  &&  tool->is_work_here_keeps_game_state(player, start))) {
+		return "Tool has no effects (it cannot work at this position, or it needs a second position x2,y2)";
+	}
+	if (twoclick) {
+		if (dynamic_cast<two_click_tool_t *>(tool.get()) == NULL) {
+			return "Cannot call this tool with two coordinates";
+		}
+		if (!tool->is_work_here_keeps_game_state(player, start)) {
+			return "First click has side effects";
+		}
+	}
+
+	// the scenario rules, which WFL_NO_CHK skips in call_work_api and nwc_tool_t::clone
+	if (const char *err = agent_scenario_tool(player, tool.get())) {
+		return err;
+	}
+	if (const char *err = agent_scenario_pos(player, tool.get(), start)) {
+		return err;
+	}
+	if (twoclick) {
+		if (const char *err = agent_scenario_pos(player, tool.get(), end)) {
+			return err;
+		}
+	}
+
+	// removals: only what belongs to the company
+	if (nr == TOOL_REMOVER) {
+		int type = obj_t::undefined;
+		agent_remover_type(has_param ? param : std::string(), type);
+		if (const char *err = agent_predict_remover(player, start, type, (flags & tool_t::WFL_CTRL) != 0)) {
+			return err;
+		}
+	}
+	else if (nr == TOOL_WAYREMOVER  ||  nr == TOOL_REMOVE_WAYOBJ) {
+		waytype_t wt = invalid_wt;
+		agent_waytype_param(param, wt);
+		const char *err = nr == TOOL_WAYREMOVER ? agent_predict_wayremover(player, start, end, wt) : agent_predict_remove_wayobj(player, start, end, wt);
+		if (err) {
+			return err;
+		}
+	}
+
+	bool suspended = false;
+	const char *err = NULL;
+	if (twoclick) {
+		// first click: only sets the start (checked above), never sent to the server
+		err = welt->call_work_api(tool.get(), player, start, suspended);
+	}
+	if (err == NULL) {
+		// network game: sent to the server as a copy (nwc_tool_t), so the tool can be deleted afterwards
+		err = welt->call_work_api(tool.get(), player, twoclick ? end : start, suspended);
+	}
+	if (err) {
+		// copied, the text may belong to the tool, which is deleted on return
+		return *err ? make_error("%s", err) : "the tool did not work here (no reason given)";
+	}
+	agent_reply(j, suspended);
+	return NULL;
+}
+
+
+/// the depot at x,y[,z]; without z the depot on any ground of the square
+static const char *find_depot(const args_t &a, depot_t *&depot)
+{
+	karte_t *welt = world();
+	depot = NULL;
+	if (!has_arg(a, "x")  ||  !has_arg(a, "y")) {
+		return "missing tile coordinates x,y";
+	}
+	const koord k((sint16)arg_int(a, "x", 0), (sint16)arg_int(a, "y", 0));
+	const planquadrat_t *plan = welt->access(k);
+	if (plan == NULL) {
+		return "tile coordinates outside of the map";
+	}
+	for (unsigned i = 0; i < plan->get_boden_count()  &&  depot == NULL; i++) {
+		const grund_t *gr = plan->get_boden_bei(i);
+		if (!has_arg(a, "z")  ||  gr->get_pos().z == (sint8)arg_int(a, "z", 0)) {
+			depot = gr->get_depot();
+		}
+	}
+	if (depot == NULL) {
+		return make_error("no depot at %s", k.get_str());
+	}
+	return NULL;
+}
+
+
+/**
+ * A depot: x,y[,z] -> {"pos":[x,y,z],"owner":n,"waytype":"road","name":"...","max_convoy_length":n,
+ * "convoys":[{"id":n,"name":"...","vehicles":["<desc>",...],"line":<id>|null}],"stored":["<desc>",...]}
+ */
+static const char *cmd_depot(const args_t &a, json_t &j)
+{
+	depot_t *depot;
+	if (const char *err = find_depot(a, depot)) {
+		return err;
+	}
+	write_pos_array(j, "pos", depot->get_pos());
+	j.kv("owner", owner_of(depot->get_owner_nr()));
+	j.kv("waytype", waytype_name(depot->get_waytype()));
+	j.kv("name", depot->get_tile()->get_desc()->get_name());
+	j.kv("max_convoy_length", (int)depot->get_max_convoi_length());
+	j.key("convoys").arr();
+	for (convoihandle_t cnv : depot->get_convoy_list()) {
+		if (!cnv.is_bound()) {
+			continue;
+		}
+		j.obj();
+		j.kv("id", (int)cnv.get_id());
+		j.kv("name", cnv->get_name());
+		j.key("vehicles").arr();
+		for (uint8 i = 0; i < cnv->get_vehicle_count(); i++) {
+			j.str(cnv->get_vehicle(i)->get_desc()->get_name());
+		}
+		j.end_arr();
+		j.key("line");
+		if (cnv->get_line().is_bound()) {
+			j.num(cnv->get_line().get_id());
+		}
+		else {
+			j.null();
+		}
+		j.end_obj();
+	}
+	j.end_arr();
+	j.key("stored").arr();
+	for (vehicle_t *v : depot->get_vehicle_list()) {
+		j.str(v->get_desc()->get_name());
+	}
+	j.end_arr();
+	return NULL;
+}
+
+
+/**
+ * agent: depot_op player=N x,y[,z] op=<a|i|b|d|v|s> convoy=<id> vehicle=<name>
+ *  a / i  append / insert vehicle `vehicle` (with the vehicles it must be coupled with, which the depot buys together)
+ *         to convoy `convoy`; convoy=0 makes a new convoy, single player: "convoy":<its id> in the reply
+ *  b start convoy `convoy`; d disassemble it into the depot; v sell it; s sell the stored vehicle `vehicle`
+ * The depot and the convoy belong to the company and the convoy is in this depot; the vehicle fits the depot, is
+ * available now (not future, not obsolete), can be coupled and the convoy does not get too long. The depot tool fails
+ * without a message, so all this is checked first.
+ */
+static const char *cmd_depot_op(const args_t &a, json_t &j)
+{
+	player_t *player;
+	if (const char *err = get_agent_player(a, player)) {
+		return err;
+	}
+	depot_t *depot;
+	if (const char *err = find_depot(a, depot)) {
+		return err;
+	}
+	const koord3d dpos = depot->get_pos();
+	if (depot->get_owner() != player) {
+		return agent_error("the depot at %s belongs to %s", pos_text(dpos).c_str(), owner_text(depot->get_owner_nr()).c_str());
+	}
+	const std::string op = arg_str(a, "op");
+	if (op.size() != 1  ||  strchr("aibdvs", op[0]) == NULL) {
+		return "op must be a (append), i (insert), b (start), d (disassemble), v (sell convoy) or s (sell stored vehicle)";
+	}
+	const char c = op[0];
+
+	sint64 cnv_id = 0;
+	if (has_arg(a, "convoy")  &&  !arg_str(a, "convoy").empty()  &&  !agent_number(a, "convoy", cnv_id)) {
+		return "convoy=<id> must be a number";
+	}
+	convoihandle_t cnv;
+	if (c != 's'  &&  cnv_id != 0) {
+		cnv = handle_of<convoi_t>(cnv_id);
+		if (!cnv.is_bound()) {
+			return "no convoy with this id";
+		}
+		if (cnv->get_owner() != player) {
+			return agent_error("convoy %d belongs to %s", (int)cnv_id, owner_text(cnv->get_owner() ? cnv->get_owner()->get_player_nr() : -1).c_str());
+		}
+		if (!depot->get_convoy_list().is_contained(cnv)) {
+			return agent_error("convoy %d is not in the depot at %s", (int)cnv_id, pos_text(dpos).c_str());
+		}
+	}
+	else if (c == 'b'  ||  c == 'd'  ||  c == 'v') {
+		return "convoy=<id> of a convoy in this depot is required";
+	}
+
+	const vehicle_desc_t *desc = NULL;
+	if (c == 'a'  ||  c == 'i'  ||  c == 's') {
+		const std::string name = arg_str(a, "vehicle");
+		if (name.empty()) {
+			return "vehicle=<name> is required";
+		}
+		desc = vehicle_builder_t::get_info(name.c_str());
+		if (desc == NULL) {
+			return make_error("no vehicle named '%s'", name.c_str());
+		}
+		if (desc->get_waytype() != depot->get_waytype()) {
+			return agent_error("vehicle '%s' (%s) does not fit this depot (%s)", desc->get_name(), waytype_name(desc->get_waytype()), waytype_name(depot->get_waytype()));
+		}
+	}
+
+	cbuffer_t param;
+	switch (c) {
+		case 'a':
+		case 'i': {
+			// the vehicles the depot tool buys together (tool_change_depot_t::init)
+			slist_tpl<const vehicle_desc_t *> chain;
+			const vehicle_desc_t *info = desc;
+			if (c != 'a') {
+				while (info->get_leader_count() == 1  &&  info->get_leader(0) != NULL  &&  info->get_leader(0) != vehicle_desc_t::any_vehicle  &&  !chain.is_contained(info->get_leader(0))) {
+					info = info->get_leader(0);
+					chain.insert(info);
+				}
+				info = desc;
+			}
+			chain.append(info);
+			if (c != 'i') {
+				while (info->get_trailer_count() == 1  &&  info->get_trailer(0) != NULL  &&  info->get_trailer(0) != vehicle_desc_t::any_vehicle  &&  !chain.is_contained(info->get_trailer(0))) {
+					info = info->get_trailer(0);
+					chain.append(info);
+				}
+			}
+			for (const vehicle_desc_t *v : chain) {
+				if (const char *err = agent_check_available(v, "vehicle", v->get_name())) {
+					return err;
+				}
+			}
+			const uint32 count_now = cnv.is_bound() ? cnv->get_vehicle_count() : 0;
+			if (count_now + chain.get_count() > depot->get_max_convoi_length()) {
+				return agent_error("the convoy would get too long for this depot: %u + %u vehicles, at most %u", count_now, chain.get_count(), depot->get_max_convoi_length());
+			}
+			if (count_now > 0) {
+				// only couplings the depot window offers
+				if (c == 'a') {
+					const vehicle_desc_t *last = cnv->get_vehicle(count_now - 1)->get_desc();
+					const vehicle_desc_t *first = chain.front();
+					if (!last->can_lead(first)  ||  !first->can_follow(last)) {
+						return agent_error("vehicle '%s' cannot be coupled behind '%s'", first->get_name(), last->get_name());
+					}
+				}
+				else {
+					const vehicle_desc_t *first = cnv->get_vehicle(0)->get_desc();
+					const vehicle_desc_t *last = chain.back();
+					if (!last->can_lead(first)  ||  !first->can_follow(last)) {
+						return agent_error("vehicle '%s' cannot be coupled in front of '%s'", last->get_name(), first->get_name());
+					}
+				}
+			}
+			else if (!cnv.is_bound()  &&  convoihandle_t::is_exhausted()) {
+				return "Convoi handles exhausted!";
+			}
+			param.printf("%c,%s,%u,%s", c, dpos.get_str(), (unsigned)cnv_id, desc->get_name());
+			break;
+		}
+		case 'b':
+			if (cnv->get_vehicle_count() == 0) {
+				return agent_error("convoy %d has no vehicles", (int)cnv_id);
+			}
+			if (cnv->get_schedule() == NULL  ||  cnv->get_schedule()->empty()) {
+				return agent_error("convoy %d has no schedule: give it a line (convoy_op op=l) or a schedule (convoy_op op=g) first", (int)cnv_id);
+			}
+			param.printf("b,%s,%u", dpos.get_str(), (unsigned)cnv_id);
+			break;
+		case 'd':
+		case 'v':
+			param.printf("%c,%s,%u", c, dpos.get_str(), (unsigned)cnv_id);
+			break;
+		case 's': {
+			bool stored = false;
+			for (vehicle_t *v : depot->get_vehicle_list()) {
+				stored |= v->get_desc() == desc;
+			}
+			if (!stored) {
+				return make_error("no vehicle '%s' is stored in this depot", desc->get_name());
+			}
+			param.printf("s,%s,0,%s", dpos.get_str(), desc->get_name());
+			break;
+		}
+	}
+
+	vector_tpl<uint16> before;
+	for (convoihandle_t const &d : depot->get_convoy_list()) {
+		before.append(d.get_id());
+	}
+	const uint32 vehicles_before = cnv.is_bound() ? cnv->get_vehicle_count() : 0;
+	bool suspended = false;
+	if (const char *err = agent_simple_tool(TOOL_CHANGE_DEPOT, param, player, suspended)) {
+		return err;
+	}
+	agent_reply(j, suspended);
+	if (!suspended) {
+		// single player: done, check the result
+		if ((c == 'a'  ||  c == 'i')) {
+			convoihandle_t result = cnv;
+			if (!cnv.is_bound()) {
+				for (convoihandle_t const &d : depot->get_convoy_list()) {
+					if (!before.is_contained(d.get_id())) {
+						result = d;
+					}
+				}
+			}
+			if (!result.is_bound()  ||  result->get_vehicle_count() <= vehicles_before) {
+				return "the vehicle was not added";
+			}
+			j.kv("convoy", (int)result.get_id());
+			j.kv("vehicles", (int)result->get_vehicle_count());
+		}
+		else if (c == 'b'  &&  depot->get_convoy_list().is_contained(cnv)) {
+			return agent_error("convoy %d did not start (no route to its first stop, or the scenario forbids it)", (int)cnv_id);
+		}
+	}
+	return NULL;
+}
+
+
+/// line type (= schedule type) from waytype=<1..8 | road rail water air monorail tram maglev narrowgauge>, 0 if invalid
+static int parse_linetype(const std::string &s)
+{
+	char *end = NULL;
+	const long v = strtol(s.c_str(), &end, 10);
+	if (!s.empty()  &&  *end == 0) {
+		return (v >= simline_t::truckline  &&  v <= simline_t::narrowgaugeline) ? (int)v : 0;
+	}
+	static const struct { const char *name; int type; } names[] = {
+		{ "road", simline_t::truckline }, { "rail", simline_t::trainline }, { "track", simline_t::trainline },
+		{ "train", simline_t::trainline }, { "water", simline_t::shipline }, { "ship", simline_t::shipline },
+		{ "air", simline_t::airline }, { "monorail", simline_t::monorailline }, { "tram", simline_t::tramline },
+		{ "maglev", simline_t::maglevline }, { "narrowgauge", simline_t::narrowgaugeline }
+	};
+	for (auto const &n : names) {
+		if (s == n.name) {
+			return n.type;
+		}
+	}
+	return 0;
+}
+
+
+static schedule_t *agent_new_schedule(int type)
+{
+	switch (type) {
+		case schedule_t::truck_schedule:       return new truck_schedule_t();
+		case schedule_t::train_schedule:       return new train_schedule_t();
+		case schedule_t::ship_schedule:        return new ship_schedule_t();
+		case schedule_t::airplane_schedule:    return new airplane_schedule_t();
+		case schedule_t::monorail_schedule:    return new monorail_schedule_t();
+		case schedule_t::tram_schedule:        return new tram_schedule_t();
+		case schedule_t::maglev_schedule:      return new maglev_schedule_t();
+		case schedule_t::narrowgauge_schedule: return new narrowgauge_schedule_t();
+		default:                               return NULL;
+	}
+}
+
+
+static bool parse_long(const char *&p, long &v)
+{
+	char *end = NULL;
+	v = strtol(p, &end, 10);
+	if (end == p) {
+		return false;
+	}
+	p = end;
+	return true;
+}
+
+
+/**
+ * Checks a schedule for an agent: engine format <current stop>|<type>|<x>,<y>,<z>,<min load>,<wait>|...| with this
+ * type, every stop on an existing ground where this kind of vehicle can stop and that the company may use (as the
+ * schedule window checks it: no ways or depots of other companies, only stops it may use), minimum load 0..100, at
+ * least two different stops (allow_empty: or none), and the scenario rule (as scenario_check_schedule). text becomes
+ * the schedule as the engine reads it, which is sent to the tool.
+ */
+static const char *agent_check_schedule(const player_t *player, int type, std::string &text, bool allow_empty)
+{
+	karte_t *welt = world();
+	if (text.size() > 16384) {
+		return "schedule too long";
+	}
+	// strict syntax first: the engine reads schedules with atoi and fails quietly
+	const char *p = text.c_str();
+	long cur, t;
+	if (!parse_long(p, cur)  ||  cur < 0  ||  *p++ != '|'  ||  !parse_long(p, t)  ||  *p++ != '|') {
+		return "schedule must look like <current stop>|<type>|<x>,<y>,<z>,<min load>,<wait>|... (e.g. 0|1|10,20,0,0,0|30,40,1,0,0|)";
+	}
+	if (t != type) {
+		return agent_error("schedule type %d does not fit: this needs type %d (1 road, 2 train, 3 ship, 4 air, 5 monorail, 6 tram, 7 maglev, 8 narrow gauge)", (int)t, type);
+	}
+	int stops = 0;
+	while (*p) {
+		long e[5];
+		for (int i = 0; i < 5; i++) {
+			if (!parse_long(p, e[i])  ||  *p++ != (i < 4 ? ',' : '|')) {
+				return agent_error("schedule entry %d must be <x>,<y>,<z>,<min load>,<wait>|", stops + 1);
+			}
+		}
+		if (!welt->is_within_limits(koord((sint16)e[0], (sint16)e[1]))  ||  e[0] < 0  ||  e[1] < 0  ||  e[2] < -128  ||  e[2] > 127) {
+			return agent_error("schedule entry %d: position outside of the map", stops + 1);
+		}
+		if (e[3] < 0  ||  e[3] > 100) {
+			return agent_error("schedule entry %d: minimum load must be 0..100", stops + 1);
+		}
+		if (e[4] < 0  ||  e[4] > 65535) {
+			return agent_error("schedule entry %d: waiting time must be 0..65535", stops + 1);
+		}
+		if (++stops > 254) {
+			return "a schedule has at most 254 stops";
+		}
+	}
+	std::unique_ptr<schedule_t> schedule(agent_new_schedule(type));
+	if (!schedule  ||  !schedule->sscanf_schedule(text.c_str())) {
+		return "could not read the schedule";
+	}
+	if (schedule->empty()  &&  !allow_empty) {
+		return "a schedule needs at least two different stops";
+	}
+	for (uint8 i = 0; i < schedule->get_count(); i++) {
+		const koord3d pos = schedule->entries[i].pos;
+		const grund_t *gr = welt->lookup(pos);
+		if (gr == NULL) {
+			return agent_error("schedule stop %d: no ground at %s (give the height z of the way)", i + 1, pos_text(pos).c_str());
+		}
+		if (!schedule->is_stop_allowed(gr)) {
+			return agent_error("schedule stop %d at %s: this kind of vehicle cannot stop there (no suitable way)", i + 1, pos_text(pos).c_str());
+		}
+		// the ownership checks of the schedule window (tool_schedule_insert_aux)
+		if (!gr->is_halt()) {
+			const weg_t *w = gr->get_weg(schedule->get_waytype());
+			if (w == NULL  &&  schedule->get_waytype() == tram_wt) {
+				w = gr->get_weg(track_wt);
+			}
+			if (w  &&  w->get_owner() != welt->get_public_player()  &&  !w->check_owner(player)) {
+				return agent_error("schedule stop %d at %s: the way belongs to %s", i + 1, pos_text(pos).c_str(), owner_text(w->get_owner_nr()).c_str());
+			}
+			if (gr->get_depot()  &&  !gr->get_depot()->check_owner(player)) {
+				return agent_error("schedule stop %d at %s: the depot belongs to %s", i + 1, pos_text(pos).c_str(), owner_text(gr->get_depot()->get_owner_nr()).c_str());
+			}
+		}
+		else if (!gr->get_halt()->can_use_halt(player)) {
+			return agent_error("schedule stop %d at %s: this company may not use the stop %s", i + 1, pos_text(pos).c_str(), gr->get_halt()->get_name());
+		}
+	}
+	scenario_t *scen = welt->get_scenario();
+	if (scen->is_scripted()) {
+		if (const char *err = scen->is_schedule_allowed(player, schedule.get())) {
+			return *err ? make_error("%s", err) : "Forbidden by scenario";
+		}
+	}
+	cbuffer_t buf;
+	schedule->sprintf_schedule(buf);
+	text = buf.get_str();
+	return NULL;
+}
+
+
+/// the line of an agent command: line=<id> of the company
+static const char *get_agent_line(const args_t &a, const player_t *player, linehandle_t &line)
+{
+	sint64 id = 0;
+	if (!agent_number(a, "line", id)) {
+		return "line=<id> is required";
+	}
+	line = handle_of<simline_t>(id);
+	if (!line.is_bound()) {
+		return "no line with this id";
+	}
+	if (line->get_owner() != player) {
+		return agent_error("line %d belongs to %s", (int)id, owner_text(line->get_owner() ? line->get_owner()->get_player_nr() : -1).c_str());
+	}
+	return NULL;
+}
+
+
+static const char *get_withdraw_arg(const args_t &a, int &withdraw)
+{
+	const std::string w = arg_str(a, "withdraw");
+	if (w != "0"  &&  w != "1") {
+		return "withdraw=0 or withdraw=1 is required";
+	}
+	withdraw = w == "1";
+	return NULL;
+}
+
+
+/**
+ * agent: line_op player=N op=c waytype=<1..8|road|rail|water|air|monorail|tram|maglev|narrowgauge> [schedule=<text>]
+ *        (single player: "line":<id> of the new line) | op=g line=<id> schedule=<text> | op=d line=<id>
+ *        | op=w line=<id> withdraw=0|1 | op=r line=<id> name=<text>
+ * The line belongs to the company; schedules are checked (agent_check_schedule). Not offered: t (trim) and u (unite),
+ * which change convoys of all companies.
+ */
+static const char *cmd_line_op(const args_t &a, json_t &j)
+{
+	player_t *player;
+	if (const char *err = get_agent_player(a, player)) {
+		return err;
+	}
+	const std::string op = arg_str(a, "op");
+	cbuffer_t param;
+	uint16 tool = TOOL_CHANGE_LINE;
+	vector_tpl<uint16> lines_before;
+	if (op == "c") {
+		const int type = parse_linetype(arg_str(a, "waytype"));
+		if (type == 0) {
+			return "waytype=<1..8 or road, rail, water, air, monorail, tram, maglev, narrowgauge> is required";
+		}
+		std::string schedule = arg_str(a, "schedule");
+		if (schedule.empty()) {
+			char empty[16];
+			snprintf(empty, sizeof(empty), "0|%d|", type);
+			schedule = empty;
+		}
+		if (const char *err = agent_check_schedule(player, type, schedule, true)) {
+			return err;
+		}
+		param.printf("c,0,%d,0,%s", type, schedule.c_str());
+		for (linehandle_t const &l : player->simlinemgmt.get_line_list()) {
+			lines_before.append(l.get_id());
+		}
+	}
+	else if (op == "g"  ||  op == "d"  ||  op == "w"  ||  op == "r") {
+		linehandle_t line;
+		if (const char *err = get_agent_line(a, player, line)) {
+			return err;
+		}
+		const unsigned id = line.get_id();
+		if (op == "g") {
+			std::string schedule = arg_str(a, "schedule");
+			if (schedule.empty()) {
+				return "schedule=<text> is required";
+			}
+			if (const char *err = agent_check_schedule(player, line->get_schedule()->get_type(), schedule, false)) {
+				return err;
+			}
+			param.printf("g,%u,%s", id, schedule.c_str());
+		}
+		else if (op == "d") {
+			param.printf("d,%u", id);
+		}
+		else if (op == "w") {
+			int withdraw;
+			if (const char *err = get_withdraw_arg(a, withdraw)) {
+				return err;
+			}
+			if (withdraw  &&  line->count_convoys() == 0) {
+				// the engine withdraws only lines with convoys
+				return agent_error("line %u has no convoys to withdraw", id);
+			}
+			param.printf("w,%u,%d", id, withdraw);
+		}
+		else {
+			const std::string name = arg_str(a, "name");
+			if (name.empty()  ||  name.size() > 255) {
+				return "name=<text> (1..255 bytes) is required";
+			}
+			for (unsigned char ch : name) {
+				if (ch < ' ') {
+					return "the name must not contain control characters";
+				}
+			}
+			param.printf("l%u,%s", id, name.c_str());
+			tool = TOOL_RENAME;
+		}
+	}
+	else {
+		return "op must be c (create), g (schedule), d (delete), w (withdraw) or r (rename)";
+	}
+
+	bool suspended = false;
+	if (const char *err = agent_simple_tool(tool, param, player, suspended)) {
+		return err;
+	}
+	agent_reply(j, suspended);
+	if (!suspended  &&  op == "c") {
+		// single player: the new line is the one that was not there before
+		linehandle_t created;
+		for (linehandle_t const &l : player->simlinemgmt.get_line_list()) {
+			if (!lines_before.is_contained(l.get_id())) {
+				created = l;
+			}
+		}
+		if (!created.is_bound()) {
+			return "the line was not created";
+		}
+		j.kv("line", (int)created.get_id());
+	}
+	return NULL;
+}
+
+
+/**
+ * agent: convoy_op player=N convoy=<id> op=l line=<id> | op=g schedule=<text> | op=x (sell) | op=d (to the nearest
+ * depot) | op=w withdraw=0|1
+ * The convoy and the line belong to the company; the schedule type of the line must fit the convoy. op=w sets the
+ * given value (the engine tool toggles): when the convoy already has it, nothing is sent ("changed":false); as in the
+ * game, an empty convoy that is withdrawn is sold at once, and convoys standing in a depot are not withdrawn (refused).
+ */
+static const char *cmd_convoy_op(const args_t &a, json_t &j)
+{
+	player_t *player;
+	if (const char *err = get_agent_player(a, player)) {
+		return err;
+	}
+	sint64 id = 0;
+	if (!agent_number(a, "convoy", id)) {
+		return "convoy=<id> is required";
+	}
+	convoihandle_t cnv = handle_of<convoi_t>(id);
+	if (!cnv.is_bound()) {
+		return "no convoy with this id";
+	}
+	if (cnv->get_owner() != player) {
+		return agent_error("convoy %d belongs to %s", (int)id, owner_text(cnv->get_owner() ? cnv->get_owner()->get_player_nr() : -1).c_str());
+	}
+	// schedule type of the convoy (as convoi_t::create_schedule would make it, without making one)
+	int type = 0;
+	if (cnv->get_schedule()) {
+		type = cnv->get_schedule()->get_type();
+	}
+	else if (cnv->get_vehicle_count() > 0) {
+		type = simline_t::waytype_to_linetype(cnv->front()->get_desc()->get_waytype());
+	}
+
+	const std::string op = arg_str(a, "op");
+	cbuffer_t param;
+	if (op == "l") {
+		linehandle_t line;
+		if (const char *err = get_agent_line(a, player, line)) {
+			return err;
+		}
+		if (type == 0) {
+			return agent_error("convoy %d has no vehicles", (int)id);
+		}
+		if (line->get_schedule()->get_type() != type) {
+			return agent_error("line %d (schedule type %d) does not fit convoy %d (schedule type %d)", (int)line.get_id(), (int)line->get_schedule()->get_type(), (int)id, type);
+		}
+		param.printf("l,%u,%u", (unsigned)id, (unsigned)line.get_id());
+	}
+	else if (op == "g") {
+		if (type == 0) {
+			return agent_error("convoy %d has no vehicles", (int)id);
+		}
+		std::string schedule = arg_str(a, "schedule");
+		if (schedule.empty()) {
+			return "schedule=<text> is required";
+		}
+		if (const char *err = agent_check_schedule(player, type, schedule, false)) {
+			return err;
+		}
+		param.printf("g,%u,%s", (unsigned)id, schedule.c_str());
+	}
+	else if (op == "x"  ||  op == "d") {
+		param.printf("%s,%u", op.c_str(), (unsigned)id);
+	}
+	else if (op == "w") {
+		int withdraw;
+		if (const char *err = get_withdraw_arg(a, withdraw)) {
+			return err;
+		}
+		if ((cnv->get_withdraw() ? 1 : 0) == withdraw) {
+			j.key("result").null();
+			j.kv("changed", false);
+			return NULL;
+		}
+		if (withdraw  &&  cnv->get_state() == convoi_t::INITIAL) {
+			// convoi_t::set_withdraw leaves convoys standing in a depot as they are
+			const grund_t *gr = world()->lookup(cnv->get_pos());
+			if (gr  &&  gr->get_depot()) {
+				return agent_error("convoy %d is standing in a depot: the engine does not withdraw it there (sell it with op=x)", (int)id);
+			}
+		}
+		param.printf("w,%u", (unsigned)id);
+	}
+	else {
+		return "op must be l (line), g (schedule), x (sell), d (go to depot) or w (withdraw)";
+	}
+
+	bool suspended = false;
+	if (const char *err = agent_simple_tool(TOOL_CHANGE_CONVOI, param, player, suspended)) {
+		return err;
+	}
+	agent_reply(j, suspended);
+	return NULL;
+}
+
+
+/**
+ * agent: plan_way player=N way=<way name> x,y[,z] x2,y2[,z2] [bridge=<name>] [tunnel=<name>] [straight=1]
+ * Dry run of tool_build_way: the route the way builder finds (as the tool searches it, with the company as builder) and
+ * its price, without building and without changing anything (also in network games: computed here only, never sent).
+ * {"ok":true,"tiles":[[x,y,z],...],"length":n,"cost":<money>,"bridges":[[[x,y,z],[x,y,z]],...],
+ *  "tunnels":[...],"param":"<param of agent_tool tool_build_way that builds this>"} or {"ok":false,"error":"...",
+ *  "reason":"..."} (the same text twice: clients that only look at "ok" and "error" get the reason too);
+ * bridges and tunnels are the new ones (start and end square).
+ */
+static const char *cmd_plan_way(const args_t &a, json_t &j)
+{
+	karte_t *welt = world();
+	player_t *player;
+	if (const char *err = get_agent_player(a, player)) {
+		return err;
+	}
+	const std::string way_name = arg_str(a, "way");
+	if (way_name.empty()) {
+		return "way=<way name> is required";
+	}
+	const way_desc_t *desc = way_builder_t::get_desc(way_name.c_str(), 0);
+	if (const char *err = agent_check_available(desc, "way", way_name.c_str())) {
+		return err;
+	}
+	if (desc->get_styp() == type_river) {
+		return "rivers cannot be planned";
+	}
+	koord3d start, end;
+	if (const char *err = get_tile_pos(a, start)) {
+		return err;
+	}
+	if (!has_arg(a, "x2")  ||  !has_arg(a, "y2")) {
+		return "missing tile coordinates x2,y2";
+	}
+	if (const char *err = get_tile_pos(a, end, "x2", "y2", "z2")) {
+		return err;
+	}
+	const std::string bridge_name = arg_str(a, "bridge");
+	const std::string tunnel_name = arg_str(a, "tunnel");
+	const bridge_desc_t *bridge = NULL;
+	const tunnel_desc_t *tunnel = NULL;
+	if (!bridge_name.empty()) {
+		bridge = bridge_builder_t::get_desc(bridge_name.c_str());
+		if (const char *err = agent_check_available(bridge, "bridge", bridge_name.c_str())) {
+			return err;
+		}
+		if (bridge->get_waytype() != desc->get_wtyp()) {
+			return make_error("bridge '%s' is not for this way", bridge_name.c_str());
+		}
+	}
+	if (!tunnel_name.empty()) {
+		tunnel = tunnel_builder_t::get_desc(tunnel_name.c_str());
+		if (const char *err = agent_check_available(tunnel, "tunnel", tunnel_name.c_str())) {
+			return err;
+		}
+		if (tunnel->get_waytype() != desc->get_wtyp()) {
+			return make_error("tunnel '%s' is not for this way", tunnel_name.c_str());
+		}
+	}
+	const bool straight = arg_bool(a, "straight", false);
+
+	// the type of construction as tool_build_way_t::calc_route sets it up
+	int bautyp = desc->get_wtyp();
+	if (desc->is_tram()) {
+		bautyp = way_builder_t::schiene_tram;
+	}
+	const bool elevated = desc->get_styp() == type_elevated  &&  desc->get_wtyp() != air_wt;
+	if (elevated) {
+		bautyp |= way_builder_t::elevated_flag;
+	}
+	reply_wrote_ok = true;
+	if (desc->get_wtyp() == air_wt  &&  desc->get_styp() == type_runway  &&  player == welt->get_active_player()) {
+		// the builder would show a message window for the active player
+		const koord s = start.get_2d(), e = end.get_2d();
+		if (!(welt->is_within_limits(s - koord(5, 5))  &&  welt->is_within_limits(s + koord(5, 5)))  ||  !(welt->is_within_limits(e - koord(5, 5))  &&  welt->is_within_limits(e + koord(5, 5)))) {
+			j.kv("ok", false);
+			j.kv("error", "too close to the map edge");
+			j.kv("reason", "too close to the map edge");
+			return NULL;
+		}
+	}
+	way_builder_t bauigel(player);
+	bauigel.init_builder((way_builder_t::bautyp_t)bautyp, desc, tunnel, bridge);
+	bauigel.set_keep_existing_faster_ways(true);
+
+	// a parallel way? (tool_build_way_t::calc_route)
+	const waytype_t wt = desc->get_wtyp();
+	bool assume_parallel = false;
+	if (const grund_t *gr = welt->lookup(start)) {
+		if (const weg_t *w = gr->get_weg(wt)) {
+			if (ribi_t::is_single(w->get_ribi_unmasked())) {
+				const koord zv = koord(ribi_t::rotate90(w->get_ribi_unmasked()));
+				if (const grund_t *g = welt->lookup(start + zv)) {
+					assume_parallel = g->get_weg(wt) != NULL;
+				}
+				if (const grund_t *g = welt->lookup(start - zv)) {
+					assume_parallel |= g->get_weg(wt) != NULL;
+				}
+			}
+		}
+		else {
+			const koord3d delta_z(0, 0, elevated ? 1 : 0);
+			for (int i = 0; i < 8  &&  !assume_parallel; i++) {
+				if (const grund_t *g = welt->lookup(start + koord::neighbours[i] + delta_z)) {
+					assume_parallel = g->get_weg(wt) != NULL;
+				}
+			}
+		}
+	}
+	if (assume_parallel) {
+		bool assume_parallel2 = false;
+		if (const grund_t *gr = welt->lookup(end)) {
+			if (!gr->get_weg(wt)) {
+				const koord3d delta_z(0, 0, elevated ? 1 : 0);
+				for (int i = 0; i < 8  &&  !assume_parallel2; i++) {
+					if (const grund_t *g = welt->lookup(end + koord::neighbours[i] + delta_z)) {
+						assume_parallel2 = g->get_weg(wt) != NULL;
+					}
+				}
+			}
+		}
+		assume_parallel &= assume_parallel2;
+	}
+	bauigel.set_prefer_parallel(assume_parallel);
+
+	const char *err;
+	{
+		// route search only: no sync step or display in between (the search may call INT_CHECK)
+		agent_no_interrupts_t no_interrupts;
+		err = straight ? bauigel.calc_straight_route(start, end) : bauigel.calc_route(start, end);
+	}
+	koord3d_vector_t const &route = bauigel.get_route();
+	if (route.get_count() < 2) {
+		j.kv("ok", false);
+		j.kv("error", err ? err : "no route found");
+		j.kv("reason", err ? err : "no route found");
+		return NULL;
+	}
+	// new bridges and tunnels: gaps in the route as way_builder_t::calc_costs counts them
+	vector_tpl<koord3d> bridges, tunnels;
+	for (uint32 i = 0; i + 1 < route.get_count(); i++) {
+		const koord d = (route[i + 1] - route[i]).get_2d();
+		if (d.x > 1  ||  d.y > 1  ||  d.x < -1  ||  d.y < -1) {
+			const grund_t *s = welt->lookup(route[i]);
+			const grund_t *e = welt->lookup(route[i + 1]);
+			if (s == NULL  ||  e == NULL  ||  s->get_weg_hang() != s->get_grund_hang()  ||  e->get_weg_hang() != e->get_grund_hang()) {
+				continue; // already a bridge or tunnel there
+			}
+			const bool is_bridge = s->get_grund_hang() == 0  ||  ribi_type(s->get_grund_hang()) == ribi_type(-d);
+			if ((is_bridge  &&  bridge == NULL)  ||  (!is_bridge  &&  tunnel == NULL)) {
+				j.kv("ok", false);
+				j.kv("error", "the route needs a bridge or tunnel, but none was given");
+				j.kv("reason", "the route needs a bridge or tunnel, but none was given");
+				return NULL;
+			}
+			vector_tpl<koord3d> &list = is_bridge ? bridges : tunnels;
+			list.append(route[i]);
+			list.append(route[i + 1]);
+		}
+	}
+	const sint64 cost = bauigel.calc_costs();
+
+	j.kv("ok", true);
+	j.key("tiles").arr();
+	for (uint32 i = 0; i < route.get_count(); i++) {
+		koord3d pos = route[i];
+		if (elevated) {
+			pos.z += bauigel.get_way_height_offset(welt->lookup(route[i]));
+		}
+		j.arr().num(pos.x).num(pos.y).num(pos.z).end_arr();
+	}
+	j.end_arr();
+	j.kv("length", (int)route.get_count());
+	j.kv("cost", money(cost));
+	for (int k = 0; k < 2; k++) {
+		vector_tpl<koord3d> &list = k == 0 ? bridges : tunnels;
+		j.key(k == 0 ? "bridges" : "tunnels").arr();
+		for (uint32 i = 0; i + 1 < list.get_count(); i += 2) {
+			j.arr();
+			j.arr().num(list[i].x).num(list[i].y).num(list[i].z).end_arr();
+			j.arr().num(list[i + 1].x).num(list[i + 1].y).num(list[i + 1].z).end_arr();
+			j.end_arr();
+		}
+		j.end_arr();
+	}
+	// what agent_tool tool=tool_build_way needs to build the same: straight without replacing ways (not ctrl)
+	std::string tool_param = std::string(desc->get_name()) + "," + (straight ? "s" : "");
+	if (bridge  ||  tunnel) {
+		tool_param += std::string(",0,") + (bridge ? bridge->get_name() : "") + (tunnel ? std::string(",") + tunnel->get_name() : std::string());
+	}
+	j.kv("param", tool_param.c_str());
+	return NULL;
+}
+
+
+/**
+ * agent: estimate kind=<way|bridge|tunnel|wayobj|roadsign|station|depot|vehicle> name=<desc name> [count=n] [length=n]
+ * [size=XxY] -> {"kind","name","price","maintenance","count","total",...}: price per unit (way, way object, bridge,
+ * tunnel: per square, total = price x length x count; station: per square, total = price x X x Y x count; depot,
+ * roadsign, vehicle: per piece), maintenance per unit and month. Vehicles add running_cost (per km), fixed_cost (per
+ * month), power, speed, capacity, freight, intro_year, obsolete, available. Changes nothing; no player needed.
+ */
+static const char *cmd_estimate(const args_t &a, json_t &j)
+{
+	karte_t *welt = world();
+	const std::string kind = arg_str(a, "kind");
+	const std::string name = arg_str(a, "name");
+	if (kind.empty()  ||  name.empty()) {
+		return "kind=<way|bridge|tunnel|wayobj|roadsign|station|depot|vehicle> and name=<object name> are required";
+	}
+	sint64 count = 1, length = 1;
+	if (has_arg(a, "count")  &&  (!agent_number(a, "count", count)  ||  count < 1  ||  count > 1000000)) {
+		return "count must be 1..1000000";
+	}
+	if (has_arg(a, "length")  &&  (!agent_number(a, "length", length)  ||  length < 1  ||  length > 1000000)) {
+		return "length must be 1..1000000";
+	}
+	const uint16 month = welt->get_timeline_year_month();
+	const obj_desc_timelined_t *timeline = NULL;
+	const char *desc_name = NULL;
+	sint64 price = 0, maintenance = 0, units = 1;
+	bool linear = false;
+	sint64 sx = 0, sy = 0;
+	const vehicle_desc_t *vehicle = NULL;
+	if (kind == "way") {
+		const way_desc_t *d = way_builder_t::get_desc(name.c_str(), 0);
+		if (d) { timeline = d; desc_name = d->get_name(); price = d->get_price(); maintenance = d->get_maintenance(); linear = true; }
+	}
+	else if (kind == "bridge") {
+		const bridge_desc_t *d = bridge_builder_t::get_desc(name.c_str());
+		if (d) { timeline = d; desc_name = d->get_name(); price = d->get_price(); maintenance = d->get_maintenance(); linear = true; }
+	}
+	else if (kind == "tunnel") {
+		const tunnel_desc_t *d = tunnel_builder_t::get_desc(name.c_str());
+		if (d) { timeline = d; desc_name = d->get_name(); price = d->get_price(); maintenance = d->get_maintenance(); linear = true; }
+	}
+	else if (kind == "wayobj") {
+		const way_obj_desc_t *d = wayobj_t::find_desc(name.c_str());
+		if (d) { timeline = d; desc_name = d->get_name(); price = d->get_price(); maintenance = d->get_maintenance(); linear = true; }
+	}
+	else if (kind == "roadsign") {
+		const roadsign_desc_t *d = roadsign_t::find_desc(name.c_str());
+		if (d) { timeline = d; desc_name = d->get_name(); price = d->get_price(); maintenance = d->get_maintenance(); }
+	}
+	else if (kind == "station"  ||  kind == "depot") {
+		const building_tile_desc_t *tile = hausbauer_t::find_tile(name.c_str(), 0);
+		const building_desc_t *d = tile ? tile->get_desc() : NULL;
+		if (d  &&  kind == "depot"  &&  !d->is_depot()) {
+			return make_error("'%s' is not a depot", name.c_str());
+		}
+		if (d  &&  kind == "station"  &&  (!d->is_transport_building()  ||  d->is_depot())) {
+			return make_error("'%s' is not a stop or station building", name.c_str());
+		}
+		if (d) {
+			timeline = d;
+			desc_name = d->get_name();
+			price = d->get_price(welt);
+			maintenance = d->get_maintenance(welt);
+			if (kind == "station") {
+				sx = d->get_x();
+				sy = d->get_y();
+				const std::string size = arg_str(a, "size");
+				if (!size.empty()) {
+					long x = 0, y = 0;
+					char rest = 0;
+					if (sscanf(size.c_str(), "%ldx%ld%c", &x, &y, &rest) != 2  ||  x < 1  ||  y < 1  ||  x > 64  ||  y > 64) {
+						return "size must be XxY, e.g. 1x3";
+					}
+					sx = x;
+					sy = y;
+				}
+				units = sx * sy;
+			}
+		}
+	}
+	else if (kind == "vehicle") {
+		vehicle = vehicle_builder_t::get_info(name.c_str());
+		if (vehicle) { timeline = vehicle; desc_name = vehicle->get_name(); price = vehicle->get_price(); maintenance = vehicle->get_fixed_cost(); }
+	}
+	else {
+		return "kind must be way, bridge, tunnel, wayobj, roadsign, station, depot or vehicle";
+	}
+	if (timeline == NULL) {
+		return agent_error("no %s named '%s'", kind.c_str(), name.c_str());
+	}
+	if (linear) {
+		units = length;
+	}
+	j.kv("kind", kind.c_str());
+	j.kv("name", desc_name);
+	j.kv("price", money(price));
+	j.kv("maintenance", money(welt->scale_with_month_length(maintenance)));
+	j.kv("count", count);
+	j.kv("total", money(price * units * count));
+	if (linear) {
+		j.kv("length", length);
+	}
+	if (kind == "station") {
+		j.key("size").arr().num(sx).num(sy).end_arr();
+	}
+	if (vehicle) {
+		j.kv("running_cost", money(vehicle->get_running_cost()));
+		j.kv("fixed_cost", money(welt->scale_with_month_length(vehicle->get_fixed_cost())));
+		j.kv("power", (uint32)vehicle->get_power());
+		j.kv("speed", (int)vehicle->get_topspeed());
+		j.kv("capacity", (int)vehicle->get_capacity());
+		const goods_desc_t *freight = vehicle->get_freight_type();
+		j.kv("freight", freight ? freight->get_name() : NULL);
+		j.kv("waytype", waytype_name(vehicle->get_waytype()));
+		j.kv("intro_year", (int)(vehicle->get_intro_year_month() / 12));
+		j.kv("obsolete", vehicle->is_retired(month));
+	}
+	j.kv("available", timeline->is_available(month));
+	return NULL;
+}
+
+
 enum command_kind_t
 {
 	CMD_READ,       ///< only reads the game and the GUI, allowed with -remote_control_readonly
 	CMD_READ_HEAVY, ///< like CMD_READ, but takes milliseconds: at most one per poll (see execute_requests)
 	CMD_TIME,       ///< pauses or speeds up the game: with -remote_control_readonly only with -remote_control_time
-	CMD_ACTION      ///< changes the game, the GUI or files (input, view, scripts, screenshots, ...)
+	CMD_ACTION,     ///< changes the game, the GUI or files (input, view, scripts, screenshots, ...)
+	CMD_AGENT       ///< agent commands for one company: with -remote_control_readonly only with -remote_control_agent
 };
 
 struct command_t
@@ -6621,12 +8688,21 @@ static const command_t commands[] = {
 	{ "vehicles3d",   cmd_vehicles3d,   CMD_READ },
 	{ "subscribe",    cmd_subscribe,    CMD_READ },
 	{ "unsubscribe",  cmd_unsubscribe,  CMD_READ },
+	{ "depot",        cmd_depot,        CMD_READ },
+	{ "agent_tool",   cmd_agent_tool,   CMD_AGENT },
+	{ "depot_op",     cmd_depot_op,     CMD_AGENT },
+	{ "line_op",      cmd_line_op,      CMD_AGENT },
+	{ "convoy_op",    cmd_convoy_op,    CMD_AGENT },
+	{ "plan_way",     cmd_plan_way,     CMD_AGENT },
+	{ "estimate",     cmd_estimate,     CMD_AGENT },
 };
 
 /// -remote_control_readonly: only CMD_READ and CMD_READ_HEAVY commands
 static bool read_only = false;
 /// -remote_control_time: CMD_TIME commands also with -remote_control_readonly
 static bool time_control = false;
+/// -remote_control_agent: CMD_AGENT commands also with -remote_control_readonly
+static bool agent_mode = false;
 
 
 static const command_t *find_command(const std::string &name)
@@ -6640,11 +8716,15 @@ static const command_t *find_command(const std::string &name)
 }
 
 
-/// the request is heavy: a CMD_READ_HEAVY command, or vehicles3d with extras=1 (searches up to 65536 squares)
+/// the request is heavy: a CMD_READ_HEAVY command, plan_way (route search), or vehicles3d with extras=1 (searches up
+/// to 65536 squares)
 static bool is_heavy_request(const std::string &line)
 {
 	const size_t space = line.find(' ');
 	const command_t *cmd = find_command(line.substr(0, space));
+	if (cmd  &&  cmd->fn == cmd_plan_way) {
+		return true;
+	}
 	if (cmd  &&  cmd->fn == cmd_vehicles3d  &&  space != std::string::npos) {
 		args_t args;
 		parse_args(line.substr(space + 1), args);
@@ -6679,6 +8759,7 @@ static void execute_request(const std::string &line, json_t &j)
 		args.erase(rid);
 	}
 	const char *err = "unknown command";
+	reply_wrote_ok = false;
 	if (has_nul) {
 		err = "arguments must not contain NUL characters";
 	}
@@ -6686,14 +8767,21 @@ static void execute_request(const std::string &line, json_t &j)
 		err = "no world loaded";
 	}
 	else if (const command_t *cmd = find_command(name)) {
-		const bool refused = read_only  &&  (cmd->kind == CMD_ACTION  ||  (cmd->kind == CMD_TIME  &&  !time_control));
-		err = refused ? "read-only remote control" : cmd->fn(args, j);
+		if (read_only  &&  cmd->kind == CMD_AGENT  &&  !agent_mode) {
+			err = "read-only remote control: agent commands need -remote_control_agent";
+		}
+		else if (read_only  &&  (cmd->kind == CMD_ACTION  ||  (cmd->kind == CMD_TIME  &&  !time_control))) {
+			err = "read-only remote control";
+		}
+		else {
+			err = cmd->fn(args, j);
+		}
 	}
 	if (err) {
 		j.kv("ok", false);
 		j.kv("error", err);
 	}
-	else {
+	else if (!reply_wrote_ok) {
 		j.kv("ok", true);
 	}
 	j.end_obj();
@@ -7496,13 +9584,14 @@ static const char *cmd_unsubscribe(const args_t &a, json_t &j)
 }
 
 
-bool remote_control_init(int port, bool readonly, bool time)
+bool remote_control_init(int port, bool readonly, bool time, bool agent)
 {
 	if (listen_socket != INVALID_SOCKET) {
 		return true;
 	}
 	read_only = readonly;
 	time_control = time;
+	agent_mode = agent;
 #if USE_WINSOCK
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -7531,7 +9620,8 @@ bool remote_control_init(int port, bool readonly, bool time)
 		listen_socket = INVALID_SOCKET;
 		return false;
 	}
-	dbg->message("remote_control_init", "remote control listening on 127.0.0.1:%d%s", port, read_only ? (time_control ? " (read-only, time control)" : " (read-only)") : "");
+	dbg->message("remote_control_init", "remote control listening on 127.0.0.1:%d%s%s%s", port, read_only ? " (read-only" : "",
+		read_only  &&  time_control ? ", time control" : "", read_only ? (agent_mode ? ", agent)" : ")") : (agent_mode ? " (agent)" : ""));
 	return true;
 }
 
@@ -7649,7 +9739,8 @@ static bool execute_next(remote_client_t &c, bool allow_heavy, bool &heavy)
 		}
 		c.greeted = true;
 		c.protocol = protocol;
-		j.obj().kv("ok", true).kv("protocol", protocol).kv("read_only", read_only).kv("time_control", !read_only  ||  time_control).end_obj();
+		j.obj().kv("ok", true).kv("protocol", protocol).kv("read_only", read_only).kv("time_control", !read_only  ||  time_control)
+			.kv("agent", !read_only  ||  agent_mode).end_obj();
 	}
 	else {
 		current_client = &c;

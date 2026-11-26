@@ -2,7 +2,8 @@
  * This file is part of the Simutrans project under the Artistic License.
  * (see LICENSE.txt)
  *
- * Simutrans-Horizon, 2026-11: new file, the -remote_control automation interface
+ * Simutrans-Horizon, 2026-11: new file, the -remote_control automation interface, with the agent mode
+ * (-remote_control_agent) for the AI team of the dashboard
  */
 
 #ifndef NETWORK_REMOTE_CONTROL_H
@@ -17,12 +18,14 @@
  * Listens on 127.0.0.1 only, at most 8 connections. Line based protocol:
  *  - the client first sends "HELLO simutrans-remote 1" or "HELLO simutrans-remote 2" (within
  *    5 seconds), anything else closes the connection; the reply is
- *    {"ok":true,"protocol":<1|2>,"read_only":false}
+ *    {"ok":true,"protocol":<1|2>,"read_only":false,"time_control":true,"agent":true}
  *  - every further line is "<command> <url encoded arguments>", e.g. "click x=100&y=200"
  *  - every request gets exactly one reply line, a JSON object with at least {"ok":true|false},
  *    in the order of the requests; the argument rid=<text> is echoed as "rid" in the reply
  *  - read-only mode allows only commands that do not change the game or the GUI, others
- *    get {"ok":false,"error":"read-only remote control"}
+ *    get {"ok":false,"error":"read-only remote control"}; with time_control also pause and
+ *    fast forward, with agent also the agent commands (allow-listed changes for one company,
+ *    e.g. for the AI team of the dashboard on a dedicated server)
  *  - protocol 2 only: after "subscribe topics=..." the game also sends event lines
  *    {"event":"<topic>","seq":N,"date":{..},"data":{..}} (no "ok" key) between whole replies
  *
@@ -36,8 +39,9 @@
 struct message_node_t;
 
 /// open the listening socket, returns false on error; read_only allows only commands that read,
-/// time_control allows pause and fast_forward too in a read-only remote control
-bool remote_control_init(int port, bool read_only = false, bool time_control = false);
+/// time_control allows pause and fast_forward too in a read-only remote control, agent the agent
+/// commands (agent_tool, depot_op, line_op, convoy_op, plan_way, estimate) in a read-only remote control
+bool remote_control_init(int port, bool read_only = false, bool time_control = false, bool agent = false);
 
 /// accept connections and execute pending requests, called from the main loops
 void remote_control_poll();
