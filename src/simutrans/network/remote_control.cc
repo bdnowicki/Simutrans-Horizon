@@ -3726,7 +3726,17 @@ static const char *cmd_station(const args_t &a, json_t &j)
 		halt = handle_of<haltestelle_t>(arg_int(a, "id", 0));
 	}
 	else if (has_arg(a, "x") && has_arg(a, "y")) {
-		halt = haltestelle_t::get_halt_koord_index(koord((sint16)arg_int(a, "x", 0), (sint16)arg_int(a, "y", 0)));
+		// the stop on a ground of the square (any level); get_halt_koord_index is only for loading old games: its
+		// table is gone after loading (crash) and it would create a halt
+		const koord k((sint16)arg_int(a, "x", 0), (sint16)arg_int(a, "y", 0));
+		if (const planquadrat_t *plan = world()->access(k)) {
+			for (uint8 b = 0; b < plan->get_boden_count()  &&  !halt.is_bound(); b++) {
+				const grund_t *g = plan->get_boden_bei(b);
+				if (g->is_halt()) {
+					halt = g->get_halt();
+				}
+			}
+		}
 	}
 	if (!halt.is_bound()) {
 		return "no station with this id / at this position";
