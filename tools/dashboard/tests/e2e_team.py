@@ -36,6 +36,19 @@ INIT = ("window.__csp=[];document.addEventListener('securitypolicyviolation',"
 XSS_TEXT = ('<img src=x onerror="window.__xss=(window.__xss||0)+1"><script>window.__xss=2</script>'
             ' **pogrubione** [klik](javascript:alert(1)) <b onmouseover="window.__xss=3">b</b>')
 
+AGENT_IDS = ("coordinator", "analyst", "accountant", "designer", "engineer", "logistician", "dispatcher", "fleet_manager")
+AVATAR_SRC = re.compile(r"^/img/team/(%s)(-icon)?\.svg$" % "|".join(AGENT_IDS))
+# every avatar box of a selector: its size and letter, and the picture in it (if any)
+AVATARS_JS = """(sel) => Array.from(document.querySelectorAll(sel)).map((s) => {
+    const i = s.querySelector('img.team-avatar-img');
+    const r = s.getBoundingClientRect();
+    return {pic: s.classList.contains('pic'), text: s.textContent, w: Math.round(r.width), h: Math.round(r.height),
+            src: i ? i.getAttribute('src') : null, alt: i ? i.getAttribute('alt') : null,
+            hidden: i ? i.getAttribute('aria-hidden') : null, iw: i ? i.getAttribute('width') : null,
+            ih: i ? i.getAttribute('height') : null, drag: i ? i.getAttribute('draggable') : null,
+            dec: i ? i.getAttribute('decoding') : null, loaded: i ? (i.complete && i.naturalWidth > 0) : false};
+})"""
+
 results, problems = [], []
 
 
@@ -437,6 +450,94 @@ def run_disabled(browser, ids, shots):
         p.close()
 
 
+def avatar_ok(a, src, size):
+    """An avatar box of the given size with the expected picture, decorative and not draggable."""
+    return (a["src"] == src and a["w"] == size and a["h"] == size and a["alt"] == "" and a["hidden"] == "true"
+            and a["iw"] == str(size) and a["ih"] == str(size) and a["drag"] == "false" and a["dec"] == "async")
+
+
+def run_avatars(browser, ids, shots):
+    """Pictures of the agents: portraits (/img/team/<id>.svg) from 24 px, role pictograms (<id>-icon.svg) below, served as
+    SVG; the letter circle stays under them (while loading) and instead of them (a missing file, an unknown agent)."""
+    p = Page(browser, BRIDGE_PORT, ids["tok_player"], routes=Mocks().install)
+    try:
+        p.tab_team()
+        p.wait("() => window.__team.chats.get('coordinator') && window.__team.chats.get('coordinator').loaded")
+        rows = p.js(AVATARS_JS, ".team-agent .team-avatar")
+        check("avatars: agent list shows the portraits (30 px)", len(rows) == 8 and all(
+            avatar_ok(a, "/img/team/%s.svg" % ag, 30) for a, ag in zip(rows, AGENT_IDS)), rows[:2])
+        head = p.js(AVATARS_JS, ".team-chat-head .team-avatar")
+        check("avatars: chat header shows the portrait (30 px)", len(head) == 1 and avatar_ok(head[0], "/img/team/coordinator.svg", 30),
+              head)
+        meta = p.js(AVATARS_JS, ".tmsg.assistant .tmsg-meta .team-avatar")
+        check("avatars: message meta shows the pictogram (20 px)", meta and all(avatar_ok(a, "/img/team/coordinator-icon.svg", 20)
+                                                                               for a in meta), meta[:1])
+        check("avatars: the letter stays in the box under the picture", meta and all(a["text"] == "K" for a in meta), meta[:1])
+        check("avatars: pictograms load", p.wait("() => { const a = document.querySelectorAll('.tmsg-meta .team-avatar');"
+                                                 " return a.length && Array.from(a).every((s) => s.classList.contains('pic')); }"),
+              p.js(AVATARS_JS, ".tmsg-meta .team-avatar")[:1])
+        check("avatars: portraits load", p.wait("() => document.querySelectorAll('.team-agent .team-avatar.pic').length === 8"),
+              [(a["src"], a["loaded"]) for a in p.js(AVATARS_JS, ".team-agent .team-avatar") if not a["pic"]])
+        sel = p.js("""() => import('/js/team/common.js').then((m) => [m.PORTRAIT_MIN, m.avatarSrc('analyst', 24),
+            m.avatarSrc('analyst', 23), m.avatarSrc('nobody', 30), m.avatarSrc('<img>', 18)])""")
+        check("avatars: size threshold 24 and unknown agents", sel == [24, "/img/team/analyst.svg", "/img/team/analyst-icon.svg", None, None],
+              sel)
+        files = p.js("""(names) => Promise.all(names.map((n) => fetch('/img/team/' + n, {credentials: 'same-origin'}).then((r) =>
+            [n, r.status, r.headers.get('Content-Type'), r.headers.get('Cache-Control')])))""",
+                     [a + s + ".svg" for a in AGENT_IDS for s in ("", "-icon")])
+        bad = [f for f in files if f[1] != 200 or not (f[2] or "").startswith("image/svg+xml") or "max-age=3600" not in (f[3] or "")]
+        check("avatars: 16 picture files served as image/svg+xml (cached)", len(files) == 16 and not bad, bad)
+        p.page.locator(".team-agents").screenshot(path=os.path.join(shots, "avatars-list-desktop-light.png"))
+        p.page.locator(".team-chat-head").screenshot(path=os.path.join(shots, "avatars-chat-head-light.png"))
+        # task board: pictograms at 18 px (tasks) and 22 px (pending questions)
+        p.page.locator(".team-views button", has_text="Tablica").click()
+        p.wait("() => !!document.querySelector('.team-board')")
+        tasks = p.js(AVATARS_JS, ".task-route .team-avatar")
+        check("avatars: task board shows pictograms (18 px)", len(tasks) >= 8 and all(
+            AVATAR_SRC.match(a["src"] or "") and a["src"].endswith("-icon.svg") and avatar_ok(a, a["src"], 18) for a in tasks), tasks[:2])
+        qs = p.js(AVATARS_JS, ".board-q .team-avatar")
+        check("avatars: pending questions show pictograms (22 px)", qs and all(
+            AVATAR_SRC.match(a["src"] or "") and a["src"].endswith("-icon.svg") and avatar_ok(a, a["src"], 22) for a in qs), qs[:2])
+        check("avatars: board pictograms load", p.wait("() => { const a = document.querySelectorAll('.team-board .team-avatar');"
+                                                       " return a.length && Array.from(a).every((s) => s.classList.contains('pic')); }"))
+        p.page.locator(".board-cols").screenshot(path=os.path.join(shots, "avatars-board-light.png"))
+        check("avatars: CSP clean", not p.js("() => window.__csp"), p.js("() => window.__csp"))
+        check("avatars: no console errors", not p.errors(), p.errors())
+    finally:
+        p.close()
+
+    # a portrait and a pictogram that cannot be loaded (an older deployment): the letter circle of the same size instead
+    def broken(ctx):
+        Mocks().install(ctx)
+        for name in ("analyst.svg", "coordinator-icon.svg"):
+            ctx.route("**/img/team/" + name, lambda r: r.fulfill(status=404, content_type="text/plain", body="not found"))
+    f = Page(browser, BRIDGE_PORT, ids["tok_player"], hash_="#team/coordinator", routes=broken)
+    try:
+        f.wait("() => window.__team.chats.get('coordinator') && window.__team.chats.get('coordinator').loaded")
+        check("fallback: letter instead of a missing portrait", f.wait(
+            "() => { const s = document.querySelector('.team-agent[data-agent=analyst] .team-avatar');"
+            " return s && !s.querySelector('img') && !s.classList.contains('pic'); }"),
+            f.js(AVATARS_JS, ".team-agent[data-agent=analyst] .team-avatar"))
+        an = f.js(AVATARS_JS, ".team-agent[data-agent=analyst] .team-avatar")[0]
+        check("fallback: same box and the letter A", an["w"] == 30 and an["h"] == 30 and an["text"] == "A", an)
+        check("fallback: letter instead of a missing pictogram", f.wait(
+            "() => { const a = document.querySelectorAll('.tmsg-meta .team-avatar');"
+            " return a.length && Array.from(a).every((s) => !s.querySelector('img') && s.textContent === 'K'); }"),
+            f.js(AVATARS_JS, ".tmsg-meta .team-avatar")[:1])
+        check("fallback: the other pictures still shown", f.wait(
+            "() => document.querySelectorAll('.team-agent .team-avatar.pic').length === 7"
+            " && !!document.querySelector('.team-chat-head .team-avatar.pic')"),
+            [(a["src"], a["pic"]) for a in f.js(AVATARS_JS, ".team-agent .team-avatar")])
+        f.agent("analyst")
+        hd = f.js(AVATARS_JS, ".team-chat-head .team-avatar")
+        check("fallback: a failed picture is not asked for again", hd and hd[0]["src"] is None and hd[0]["text"] == "A"
+              and hd[0]["w"] == 30, hd)
+        f.page.locator(".team-agents").screenshot(path=os.path.join(shots, "avatars-fallback-light.png"))
+        check("fallback: no script errors", not [c for c in f.console if c.startswith("pageerror")], f.console)
+    finally:
+        f.close()
+
+
 def run_enabled(browser, ids, shots):
     m = Mocks()
     p = Page(browser, BRIDGE_PORT, ids["tok_player"], routes=m.install)
@@ -818,8 +919,11 @@ def run_markup(browser, ids, shots):
         p.wait("() => !!document.querySelector('.team-project .pcard')")
         p.page.wait_for_timeout(500)
         check("xss: no script ran", p.js("() => window.__xss") is None, p.js("() => window.__xss"))
-        check("xss: no injected elements", p.js("() => document.querySelectorAll('.team img, .team script, .team b, .team svg:not(.icon)').length") == 0,
-              p.js("() => Array.from(document.querySelectorAll('.team img, .team script, .team b, .team svg:not(.icon)')).map((e) => e.outerHTML).slice(0, 3)"))
+        injected = "'.team img:not(.team-avatar-img), .team script, .team b, .team svg:not(.icon)'"
+        check("xss: no injected elements", p.js("() => document.querySelectorAll(%s).length" % injected) == 0,
+              p.js("() => Array.from(document.querySelectorAll(%s)).map((e) => e.outerHTML).slice(0, 3)" % injected))
+        srcs = p.js("() => Array.from(document.querySelectorAll('.team img.team-avatar-img')).map((e) => e.getAttribute('src'))")
+        check("xss: the only images are agent avatars", srcs and all(AVATAR_SRC.match(s or "") for s in srcs), srcs[:5])
         check("xss: CSP clean", not p.js("() => window.__csp"), p.js("() => window.__csp"))
         check("xss: no console errors", not p.errors(), p.errors())
     finally:
@@ -839,7 +943,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--shots", default=os.path.join(tempfile.gettempdir(), "e2e_team_shots"))
     ap.add_argument("--keep", action="store_true", help="keep the temporary directory (database, logs)")
-    ap.add_argument("--only", default="", help="comma separated phases: viewer,disabled,enabled,links,phone,markup")
+    ap.add_argument("--only", default="", help="comma separated phases: viewer,disabled,avatars,enabled,links,phone,markup")
     args = ap.parse_args()
     only = set(filter(None, args.only.split(",")))
     os.makedirs(args.shots, exist_ok=True)
@@ -858,6 +962,7 @@ def main():
             try:
                 for name, fn in (("viewer", lambda: run_viewer(browser, ids)),
                                  ("disabled", lambda: run_disabled(browser, ids, args.shots)),
+                                 ("avatars", lambda: run_avatars(browser, ids, args.shots)),
                                  ("enabled", lambda: run_enabled(browser, ids, args.shots)),
                                  ("links", lambda: run_links(browser, ids, args.shots)),
                                  ("phone", lambda: run_phone(browser, ids, args.shots))):

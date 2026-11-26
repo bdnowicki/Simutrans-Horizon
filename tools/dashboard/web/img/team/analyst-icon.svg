@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<defs><clipPath id="clip-analyst-icon"><circle cx="32" cy="32" r="32"/></clipPath></defs>
+<g clip-path="url(#clip-analyst-icon)">
+<rect width="64" height="64" fill="#1c7ed6"/>
+<path d="M15 14V49H51" fill="none" stroke="#fff" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M22 41L30 31L37 37L49.5 20M40.6 21.4L49.5 20L50.9 28.9" fill="none" stroke="#fff" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

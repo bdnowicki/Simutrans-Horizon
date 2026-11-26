@@ -1122,6 +1122,12 @@ Without the agent commands or the key the tab shows why the team is unavailable;
 | Dispatcher (`dispatcher`) | `deepseek-flash` | traffic: vehicles added to or withdrawn from lines, loading and waiting times, jams |
 | Fleet manager (`fleet_manager`) | `deepseek-flash` | buys, replaces and sells vehicles: old and obsolete fleet, the best models of the year |
 
+Each agent has a character portrait, shown from 24 px (the agent list, the head of the chat), and a role
+pictogram for the smaller places (messages, the task board, questions): `web/img/team/<id>.svg` and
+`web/img/team/<id>-icon.svg`, hand-written SVG on a circle of the agent's colour. While a picture loads,
+or when a file is missing (an older deployment), the avatar shows the first letter of the name in the
+same circle.
+
 Every agent has its own chat; the chats, tasks, questions and projects are shared by all player tokens of
 the company and invisible to other companies. Specialists hand work to each other only through the
 coordinator (as tasks on the board). The agents read the game through tools of the bridge that aggregate

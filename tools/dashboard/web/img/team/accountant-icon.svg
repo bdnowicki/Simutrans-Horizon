@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<defs><clipPath id="clip-accountant-icon"><circle cx="32" cy="32" r="32"/></clipPath></defs>
+<g clip-path="url(#clip-accountant-icon)">
+<rect width="64" height="64" fill="#a35200"/>
+<circle cx="32" cy="32" r="18" fill="#fff"/>
+<path d="M38.5 25.5C37 23.3 34.8 22.3 32 22.3C28 22.3 25.5 24.3 25.5 27.2C25.5 33.6 38.5 30.4 38.5 36.8C38.5 39.8 35.9 41.7 32 41.7C28.9 41.7 26.4 40.5 25 38.3M32 17.5V46.5" fill="none" stroke="#a35200" stroke-width="4" stroke-linecap="round"/>
+</g>
+</svg>

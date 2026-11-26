@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<defs><clipPath id="clip-logistician-icon"><circle cx="32" cy="32" r="32"/></clipPath></defs>
+<g clip-path="url(#clip-logistician-icon)">
+<rect width="64" height="64" fill="#0b7285"/>
+<path d="M18 45C28 49 39 47 43.5 39" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
+<circle cx="18" cy="45" r="5.5" fill="#fff"/>
+<circle cx="18" cy="45" r="2" fill="#0b7285"/>
+<path d="M44 37C38 30 35 26 35 20A9 9 0 1 1 53 20C53 26 50 30 44 37Z" fill="#fff"/>
+<circle cx="44" cy="20" r="3.5" fill="#0b7285"/>
+</g>
+</svg>
