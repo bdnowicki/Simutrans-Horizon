@@ -65,8 +65,10 @@ if [ -f "$restore" ]; then
 	fi
 fi
 
+# -lang en: a network server gives the loaded game its own language for the names it creates (new stops,
+# factory names in scenario texts); without it the language would only be English by fallback
 args=(-server "$GAME_PORT" -set_basedir "$BASE_DIR/" -objects "$PAKSET/" -set_userdir "$USER_DIR/"
-	-nosound -nomidi -remote_control_readonly "$REMOTE_PORT" -debug "$DEBUG_LEVEL")
+	-nosound -nomidi -lang en -remote_control_readonly "$REMOTE_PORT" -debug "$DEBUG_LEVEL")
 if [ "$TIME_CONTROL" = 1 ]; then
 	args+=(-remote_control_time)
 fi

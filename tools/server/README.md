@@ -7,7 +7,8 @@ announces itself on the public server list.
 
 - `Dockerfile` builds the engine on Debian (CMake, backend `none`) and copies the dashboard with its
   AI team (`tools/dashboard/team`). The image holds no pakset and no game.
-- `entrypoint.sh` starts the server (`-server 13353`, remote control `-remote_control_readonly 13360
+- `entrypoint.sh` starts the server (`-server 13353`, in English: `-lang en`, so new stops and the names in
+  scenario texts get English names; remote control `-remote_control_readonly 13360
   -remote_control_time`, with `SIMUTRANS_AGENTS=1` also `-remote_control_agent`, inside the container only)
   and the dashboard on port 13380 with its database in `user/dashboard/agents.sqlite` (access tokens and
   the AI team's history). On `docker stop` the server saves the game before it quits.
