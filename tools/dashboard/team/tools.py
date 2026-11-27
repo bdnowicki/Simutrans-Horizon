@@ -913,14 +913,29 @@ def t_tile_info(ctx, a):
             out["halt"] = clean(g.get("halt"))
         if g.get("text"):
             out["label"] = clean(g.get("text"), 60)
-        out["objects"] = [{"type": clean(o.get("type"), 30), "name": clean(o.get("name"), 60), "owner": o.get("owner")}
-                          for o in items_of(g, "objects")[:20]]
+        out["objects"] = [tile_object(o) for o in items_of(g, "objects")[:20]]
         grounds.append(out)
     data = {"grounds": grounds}
+    if any("dirs" in o for g in grounds for o in g["objects"]):
+        data["dirs"] = ("directions of a way (its connections) or of a sign/signal: letters n e s w; 2 = straight or "
+                        "a curve, 3-4 = a switch or crossing, 1 = a dead end. Signals and one-way signs need exactly 2")
     for k in ("city", "nearest_city"):
         if isinstance(reply.get(k), dict):
             data[k] = {"name": clean(reply[k].get("name")), "citizens": reply[k].get("citizens")}
     return data, "tile %d,%d: %d grounds" % (a["x"], a["y"], len(grounds))
+
+
+def tile_object(o):
+    """An object of the tile read: type, name, owner; ways, signs and way objects also their pak name (desc), waytype
+    and directions (dirs, e.g. "esw") when the game reports them."""
+    out = {"type": clean(o.get("type"), 30), "name": clean(o.get("name"), 60), "owner": o.get("owner")}
+    if isinstance(o.get("desc"), str) and o["desc"] != o.get("name"):
+        out["desc"] = clean(o["desc"], 60)
+    if isinstance(o.get("waytype"), str):
+        out["waytype"] = clean(o["waytype"], 20)
+    if isinstance(o.get("dirs"), str):
+        out["dirs"] = "".join(c for c in o["dirs"] if c in "nesw")[:4]
+    return out
 
 
 def goods_names(ctx, freight):
@@ -1213,8 +1228,10 @@ TOOLS = {
                      "h": I("height (default = w, at most 40)", minimum=1, maximum=40),
                      "layers": {"type": "array", "items": E("layer", MAP_LAYERS), "minItems": 1, "maxItems": 4,
                                 "description": "grids to include (default terrain, owner)"}}, ("x", "y"))),
-    "tile_info": (t_tile_info, "Everything on one square: grounds, ways, buildings, objects with owners, the "
-                  "city.", obj(XY, ("x", "y"))),
+    "tile_info": (t_tile_info, "Everything on one square: grounds (heights), ways with their directions (dirs: the "
+                  "connections n e s w; a switch has 3-4, a dead end 1), signs and signals with their names and "
+                  "directions, buildings, objects with owners, the city. Check a square here before you put a signal "
+                  "or sign on it.", obj(XY, ("x", "y"))),
     "catalog": (t_catalog, "Objects of the pakset available now (vehicles, ways, bridges, tunnels, stations, depots, "
                 "signs, way objects) of a waytype, with prices and monthly maintenance. Names are exactly what "
                 "projects need.", obj({

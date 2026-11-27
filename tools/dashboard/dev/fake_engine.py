@@ -416,6 +416,20 @@ BRIDGE_PRICES = {"fake_bridge": ("road", 5000, 60)}
 TUNNEL_PRICES = {"fake_tunnel": ("road", 8000, 80)}
 WAYOBJ_PRICES = {"fake_catenary": ("track", 800, 10)}
 SIGN_PRICES = {"fake_oneway": ("road", 300, 2), "fake_signal": ("track", 1500, 8)}
+SIGN_FLAGS = {d["name"]: d["flags"] for d in fake_descs()[0]["signs"]}
+SIGNAL_TYPE = 8 | 16 | 64 | 256     # roadsign_desc_t::is_signal_type()
+# the game's reasons of tool_build_roadsign_t as agent_tool replies them (translated to English, on one line)
+SIGN_REFUSED = "You cannot place rail signals here."
+SIGN_FOREIGN = "This piece of land is owned by another player!"
+NESW = ((0, -1, 1, "n"), (1, 0, 2, "e"), (0, 1, 4, "s"), (-1, 0, 8, "w"))   # dx, dy, direction bit, letter
+
+
+def dirs_text(ribi):
+    return "".join(c for _, _, bit, c in NESW if ribi & bit)
+
+
+def ribi_count(ribi):
+    return bin(ribi & 15).count("1")
 STATION_PRICES = {"FakeStop": ("road", 3000, 40), "Harbour": ("water", 6000, 80)}
 DEPOT_PRICES = {"FakeRoadDepot": ("road", 6000, 50), "FakeTrainDepot": ("track", 12000, 90)}
 # vehicle -> (price, running cost per km, fixed cost per month)
@@ -1862,20 +1876,31 @@ class Engine:
             g["halt"] = st["name"]
             g["objects"].append({"type": "building", "name": "FakeStop", "owner": st["owner"]})
         # ways (the synthetic roads and those of agent commands), what agents built on them, depots: the object
-        # types of the game's tile read
-        for _, owner, name in self.ways_at(x, y):
-            g["objects"].append({"type": "way", "name": name, "owner": owner})
+        # types of the game's tile read; ways, signs and way objects with desc, waytype and dirs like the game's
+        for waytype, owner, name in self.ways_at(x, y):
+            g["objects"].append({"type": "way", "name": name, "owner": owner, "desc": name, "waytype": waytype,
+                                 "dirs": dirs_text(self.way_ribi(x, y, waytype))})
         kinds = {"bridge": "bridge", "tunnel": "tunnel", "wayobj": "wayobj"}
         for o in self.w.objects.get((x, y), ()):
             if o["kind"] in kinds:
-                g["objects"].append({"type": kinds[o["kind"]], "name": o["name"], "owner": o["owner"]})
+                item = {"type": kinds[o["kind"]], "name": o["name"], "owner": o["owner"]}
+                if o["kind"] == "wayobj":
+                    wt = WAYOBJ_PRICES[o["name"]][0]
+                    item.update(desc=o["name"], waytype=wt, dirs=dirs_text(self.way_ribi(x, y, wt)))
+                g["objects"].append(item)
             elif o["kind"] == "sign":
-                g["objects"].append({"type": "signal" if SIGN_PRICES[o["name"]][0] == "track" else "roadsign",
-                                     "name": o["name"], "owner": o["owner"]})
+                signal = bool(SIGN_FLAGS.get(o["name"], 0) & SIGNAL_TYPE)
+                g["objects"].append({"type": "signal" if signal else "roadsign", "name": "Signal" if signal
+                                     else "Roadsign", "owner": o["owner"], "desc": o["name"],
+                                     "waytype": SIGN_PRICES[o["name"]][0], "dirs": dirs_text(o.get("dir", 0))})
         for d in self.w.depots:
             if (d["pos"][0], d["pos"][1]) == (x, y):
                 g["objects"].append({"type": "road_depot" if d["waytype"] == "road" else "rail_depot",
                                      "name": d["name"], "owner": d["owner"]})
+        if self.opts.no_tile_dirs:
+            for o in g["objects"]:
+                for k in ("desc", "waytype", "dirs"):
+                    o.pop(k, None)
         return {"grounds": [g]}
 
     def cmd_pause(self, a):
@@ -2087,8 +2112,96 @@ class Engine:
             w.terrain[i], w.owned[i] = HEIGHT_COLORS[5 + (x // 24 + y // 32) % 30], 0
         w.cell_gen[(y // MAP_CELL) * w.cells[0] + x // MAP_CELL] = w.map_gen
 
-    def add_object(self, x, y, kind, name, owner):
-        self.w.objects.setdefault((x, y), []).append({"kind": kind, "name": name, "owner": owner})
+    def add_object(self, x, y, kind, name, owner, **extra):
+        self.w.objects.setdefault((x, y), []).append(dict({"kind": kind, "name": name, "owner": owner}, **extra))
+
+    def way_object(self, x, y, waytype):
+        """the way of a waytype that agents built on a square, or None"""
+        for o in self.w.objects.get((x, y), ()):
+            if o["kind"] == "way" and WAY_PRICES.get(o["name"], ("road",))[0] == waytype:
+                return o
+        return None
+
+    def connect(self, tiles, waytype):
+        """the way builder joins the squares of its route one after the other: the direction bits on both sides"""
+        for a, b in zip(tiles, tiles[1:]):
+            for p, q in ((a, b), (b, a)):
+                o = self.way_object(p[0], p[1], waytype)
+                if o is not None:
+                    o["ribi"] = o.get("ribi", 0) | SIDE_BIT[(q[0] - p[0], q[1] - p[1])]
+
+    def way_ribi(self, x, y, waytype):
+        """the directions of the way of a waytype on a square (the game's unmasked ribi): the joins of an agent-built
+        way that still lead to a way of that waytype; a synthetic road joins every neighbouring road"""
+        o = self.way_object(x, y, waytype)
+        ribi = 0
+        for dx, dy, bit, _ in NESW:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < SIZE and 0 <= ny < SIZE_Y):
+                continue
+            if o is not None:
+                if o.get("ribi", 0) & bit and any(wt == waytype for wt, _, _ in self.ways_at(nx, ny)):
+                    ribi |= bit
+            elif waytype == "road" and self.is_road(nx, ny):
+                ribi |= bit
+        return ribi
+
+    def sign_click(self, nr, x, y, name):
+        """the effect of one click of the sign tool at x,y with the rules of the game's tool_build_roadsign_t
+        (check_pos_intern, place_sign_intern; simtool.cc): raises ValueError with the game's reason, or returns the
+        change (a function)"""
+        w = self.w
+        waytype, price, _ = SIGN_PRICES[name]
+        flags = SIGN_FLAGS.get(name, 0)
+        signal, one_way, choose = bool(flags & SIGNAL_TYPE), bool(flags & 1), bool(flags & 2)
+        way = next(((o, n) for wt, o, n in self.ways_at(x, y) if wt == waytype), None)
+        # a way of the waytype that the company may use (its own, public, nobody's)
+        if way is None or way[0] not in (nr, 1, -1):
+            raise ValueError(SIGN_REFUSED)
+        signs = [o for o in w.objects.get((x, y), ()) if o["kind"] == "sign"]
+        if any(bool(SIGN_FLAGS.get(o["name"], 0) & SIGNAL_TYPE) != signal for o in signs):
+            raise ValueError(SIGN_REFUSED)  # no signal next to a road sign and the other way round
+        ribi = self.way_ribi(x, y, waytype)
+        n = ribi_count(ribi)
+        if signal and n > 2:
+            raise ValueError(SIGN_REFUSED)  # no signals on switches
+        if (one_way or signal) and n != 2:
+            raise ValueError(SIGN_REFUSED)  # signals and one-way signs need exactly two directions
+        old = signs[0] if signs else None
+        if old is not None and old["owner"] not in (nr, -1):
+            raise ValueError(SIGN_FOREIGN)
+        if old is not None and not signal and old["name"] != name:
+            raise ValueError(SIGN_REFUSED)  # only signals are replaced
+
+        def build():
+            if old is None:
+                self.pay(nr, price)
+                d = ribi
+                if one_way or choose:
+                    d = next(bit for _, _, bit, _ in NESW if ribi & bit)
+                self.add_object(x, y, "sign", name, nr, dir=d)
+            elif signal and old["name"] == name:
+                # the same signal turns: two-way -> the last direction, then the other one, then both again
+                d, sig, i = ribi, old.get("dir", ribi), 0
+                bits = [bit for _, _, bit, _ in NESW]
+                if ribi_count(sig) != 2:
+                    while i < 4:
+                        if (d & bits[i]) == sig:
+                            i += 1
+                            break
+                        i += 1
+                while i < 4:
+                    if d & bits[i]:
+                        d = bits[i]
+                    i += 1
+                old["dir"] = d
+            elif signal:
+                self.pay(nr, price + SIGN_PRICES[old["name"]][1])
+                old["name"], old["owner"] = name, nr
+            elif one_way or choose:
+                old["dir"] = ~old.get("dir", 0) & ribi
+            return {}
+        return build
 
     def cmd_agent_tool(self, a):
         w = self.w
@@ -2167,6 +2280,8 @@ class Engine:
                         self.add_object(tx, ty, "bridge", bridge, nr)
                     if waytype == "road":
                         self.mark(tx, ty, True, nr)
+                # the route joins its squares, also existing ways of the waytype it passes (a branch makes a switch)
+                self.connect(tiles, waytype)
                 return {}
             return self.agent_done(build, {"tool": name, "player": nr, "from": [x, y], "to": [x2, y2], "way": way})
         if name in ("tool_build_bridge", "tool_build_tunnel"):
@@ -2207,6 +2322,14 @@ class Engine:
         if param not in table:
             raise ValueError("unknown %s '%s'" % (kind, param))
         waytype, price, _ = table[param]
+        if kind == "sign":
+            # one click on one square (two positions would place a row of signs: not imitated)
+            if two and (x2, y2) != (x, y):
+                raise ValueError("the fake engine places one sign per click")
+            self.sign_click(nr, x, y, param)  # the game's checks before the tool is sent (refusals answer at once)
+            # checked again when the click takes effect (--net: the square may have changed meanwhile)
+            return self.agent_done(lambda: self.sign_click(nr, x, y, param)(),
+                                   {"tool": name, "player": nr, "at": [x, y], kind: param})
         if waytype != "water" and not any(wt == waytype for wt, _, _ in self.ways_at(x, y)):
             raise ValueError("%s needs a %s way at %d,%d" % (param, waytype, x, y))
         if kind in ("station", "depot") and any(k in ("station", "depot") for k, _, _ in self.objects_at(x, y)):
@@ -2721,6 +2844,8 @@ def main():
     p.add_argument("--agent-cost-factor", type=float, default=1.0, metavar="F",
                    help="agent commands really cost F times the prices that estimate and plan_way tell (tests of the "
                         "executor's overrun stop)")
+    p.add_argument("--no-tile-dirs", action="store_true",
+                   help="imitate an engine whose tile read has no desc, waytype and dirs of ways, signs, way objects")
     opts = p.parse_args()
     if not 2 <= opts.players <= PLAYER_UNOWNED:
         p.error("--players takes 2..%d" % PLAYER_UNOWNED)

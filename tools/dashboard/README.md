@@ -1132,8 +1132,9 @@ Every agent has its own chat; the chats, tasks, questions and projects are share
 the company and invisible to other companies. Specialists hand work to each other only through the
 coordinator (as tasks on the board). The agents read the game through tools of the bridge that aggregate
 (top lists, sums, filters, at most about 8000 characters per result; details only of the company's own
-lines and convoys) and get the names that players typed (companies, lines, stations, messages) only as
-quoted data, never as instructions.
+lines and convoys; `tile_info` shows a square with the directions of its ways and signs, which the
+designer and engineer read before they place signals) and get the names that players typed (companies,
+lines, stations, messages) only as quoted data, never as instructions.
 
 ### Chat, questions and the board
 
@@ -1168,7 +1169,16 @@ title, a rationale and up to 40 operations of these types (each a JSON object wi
 
 The bridge checks the project (the role's operation types, the owners of every object used, names of
 objects available now) and estimates it with the game: the way builder's dry run (`plan_way`) for routes
-and their price, the price lists (`estimate`) for buildings and vehicles, removals at an upper bound. The
+and their price, the price lists (`estimate`) for buildings and vehicles, removals at an upper bound.
+Signs and signals (`build_roadsign`) are checked on their square with the rules of the game's sign tool,
+read from `tile` (the directions of the way): a way of the sign's waytype that the company may use (its
+own, a public one or one of nobody), exactly two directions for signals and one-way signs (straight or
+a curve; never a switch, crossing or dead end), three or four for traffic lights, no signal on a square
+with a road sign and no road sign on one with a signal, no sign of another company to change. The same
+signal on the square is only turned by the click (no cost, a warning), the same one-way sign reversed,
+another signal replaced; a square that an earlier operation of the project builds or changes is
+checked by the game only when it is built (a warning), and so is everything with an older game that
+does not report the directions yet. The
 project card shows the operations as sentences with their cost, the total, the cash now and after, the
 maintenance per month and warnings; "Show on map" draws the plan over the 2D map (ways, bridges, tunnels,
 stations, depots, signs, removals, the stops of new lines) and "Show in 3D" as semi-transparent ghosts in
@@ -1178,7 +1188,9 @@ approval, also by another player at the same moment, gets 409).
 
 The bridge, not the language model, then carries the project out operation by operation with the agent
 commands of the game, as the company of the token, and checks each one by reading the game again (in a
-network game up to 20 s per operation). Rules in code:
+network game up to 20 s per operation; a sign by any change of the signs on its square, since a click on
+the same signal turns it without adding one). An operation the game refuses fails with the game's own
+reason (e.g. `agent_tool refused: You cannot place rail signals here.`). Rules in code:
 
 * A project does not start when the company's cash minus the estimate would be below 0.
 * It stops at the first operation that fails; the later ones are skipped. Done operations are not undone.
@@ -1464,7 +1476,13 @@ depot each), `--net` (changing agent commands answer `{"pending":true}` and take
 `--net-delay S`), `--net-client` with `--locked N` (companies protected on this client),
 `--forbid-tool NAME` (a scenario refusal) and `--agent-cost-factor F` (real costs F times the prices, for
 the 20 % rule). The agent commands build, buy and sell in the fake world (ways appear on the map and in the
-3D export, costs are booked into `finance`); `fake_agent_state` returns what they did.
+3D export, costs are booked into `finance`); `fake_agent_state` returns what they did. `tile` reports the
+directions of ways (`dirs`, the joins of the built routes: a branch makes a switch) and the `desc`,
+`waytype` and `dirs` of ways, signs and way objects like the game; the sign tool follows the game's rules
+(refusals on switches, dead ends, other waytypes and next to the other kind of sign with the game's
+reasons `You cannot place rail signals here.` and `This piece of land is owned by another player!`, a
+click on the same signal turns it, on the same one-way sign reverses it, one sign per click).
+`--no-tile-dirs` imitates a game whose `tile` has no `desc`, `waytype` and `dirs` yet.
 `dev/fake_llm.py --port 13389 [--script FILE] [--log FILE] [--key KEY]` is an OpenAI-compatible fake of the
 DeepSeek API (streaming, usage, scripted replies with reasoning and tool calls, error codes; it enforces
 DeepSeek's rules for thinking mode); start the bridge with `DEEPSEEK_BASE_URL=http://127.0.0.1:13389` and any

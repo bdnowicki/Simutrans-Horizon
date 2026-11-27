@@ -97,6 +97,33 @@ WAYTYPE_ENUM = ("road", "rail", "track", "water", "air", "monorail", "tram", "ma
 WAYISH = ("way", "bridge", "tunnel")
 MOVING = ("cursor", "cloud", "pedestrian", "citycar", "road_vehicle", "rail_vehicle", "monorail_vehicle",
           "maglev_vehicle", "narrowgauge_vehicle", "ship", "aircraft", "movingobj")
+SIGNS = ("roadsign", "signal")
+
+# flags of signs in the catalogue (desc_list "signs"; descriptor/roadsign_desc.h:49-59): one-way, choose, private way;
+# is_signal_type() is any of SIGN_SIGNAL, SIGN_PRE_SIGNAL, SIGN_LONGBLOCK_SIGNAL, SIGN_PRIORITY_SIGNAL (:177-185)
+SIGN_ONE_WAY, SIGN_CHOOSE, SIGN_PRIVATE = 1, 2, 4
+SIGN_SIGNAL_TYPE = 8 | 16 | 64 | 256
+# directions of the `tile` read ("dirs", e.g. "esw") as the game's bits n 1, e 2, s 4, w 8 (dataobj/ribi.h)
+DIRS = "nesw"
+
+
+def ribi_of(dirs):
+    """The direction bits of a "dirs" text of the tile read ("" = none)."""
+    return sum(1 << k for k, c in enumerate(DIRS) if c in dirs)
+
+
+# ribi_t::is_twoway / is_threeway / is_straight (dataobj/ribi.h:255-260): exactly two directions (straight or a
+# curve); three or four (a switch or crossing); one direction or a straight line
+def is_twoway(r):
+    return bool((0x1668 >> r) & 1)
+
+
+def is_threeway(r):
+    return bool((0xE880 >> r) & 1)
+
+
+def is_straight(r):
+    return bool((0x0536 >> r) & 1)
 
 
 class ProjectError(TeamError):
@@ -248,7 +275,13 @@ OP_HELP = {
     "build_station": "build_station {at, building, rotation?}: a stop/station building on a way of the company "
                      "(or a public road)",
     "build_depot": "build_depot {at, building}: a depot at the end of a way",
-    "build_roadsign": "build_roadsign {at, sign}: a road sign or signal on a way",
+    "build_roadsign": "build_roadsign {at, sign}: a road sign or signal on a way of the sign's waytype at the square "
+                      "(the company's own, a public way or one of nobody; without z the ground surface). Check the "
+                      "square with tile_info first: the way's dirs must fit - signals and one-way signs only where "
+                      "the way has exactly two directions (straight or a curve, e.g. \"ew\", \"ne\"), never on a "
+                      "switch or crossing (3-4 directions, e.g. \"esw\") or a dead end (1); traffic lights only on "
+                      "junctions (3-4). A signal and a road sign never share a square; the same signal there is "
+                      "only turned (no new one), another signal is replaced",
     "build_wayobj": "build_wayobj {from, to, wayobj}: a way object (e.g. overhead line) along the existing ways "
                     "from A to B",
     "remove": "remove {at, kind?}: remove one object of the company at a square (kind: signal, roadsign, wayobj, "
@@ -283,7 +316,7 @@ _PROPS = {
     "straight": {"type": "boolean", "description": "only a straight way from A to B"},
     "building": {"type": "string", "description": "exact name of the stop/station or depot building"},
     "rotation": {"type": "integer", "minimum": 0, "maximum": 3, "description": "layout of the station building"},
-    "sign": {"type": "string", "description": "exact name of the road sign or signal"},
+    "sign": {"type": "string", "description": "exact name of the road sign or signal (catalog kind sign)"},
     "wayobj": {"type": "string", "description": "exact name of the way object"},
     "kind": {"type": "string", "enum": sorted(REMOVE_KINDS), "description": "what to remove at the square"},
     "waytype": {"type": "string", "enum": list(WAYTYPE_ENUM),
@@ -375,6 +408,8 @@ class _Checker:
         self.preview = []
         self.plans = {}               # str(op index) -> what the executor needs (build_way param, replace depot)
         self.desc_waytypes = None
+        self.desc_dicts = {}          # (catalogue kind, name) -> the desc_list entry
+        self.touched = {}             # (x, y) -> index of the first op that builds or changes the square
 
     def err(self, i, op_type, text):
         self.errors.append("ops[%d] (%s): %s" % (i, op_type, text) if i is not None else text)
@@ -627,8 +662,8 @@ class _Checker:
             return None
         return r
 
-    def waytype_of(self, kind, name):
-        """The waytype of a way, bridge, tunnel, sign or way object from the catalogue (desc_list), or None."""
+    def catalogue(self):
+        """Loads the catalogue (desc_list) of ways, bridges, tunnels, signs and way objects once."""
         if self.desc_waytypes is None:
             self.desc_waytypes = {}
             r = self.read("desc_list", {"kinds": "ways,bridges,tunnels,signs,wayobjs"})
@@ -637,7 +672,24 @@ class _Checker:
                     for d in r.get(k) or ():
                         if isinstance(d, dict) and isinstance(d.get("name"), str):
                             self.desc_waytypes[(k, d["name"])] = d.get("waytype")
+                            self.desc_dicts[(k, d["name"])] = d
+
+    def waytype_of(self, kind, name):
+        """The waytype of a way, bridge, tunnel, sign or way object from the catalogue (desc_list), or None."""
+        self.catalogue()
         return self.desc_waytypes.get((kind, name))
+
+    def desc_dict(self, kind, name):
+        """The catalogue entry (desc_list) of a way, bridge, tunnel, sign or way object, or None."""
+        self.catalogue()
+        return self.desc_dicts.get((kind, name))
+
+    def touch(self, i, squares, neighbours=False):
+        """Ops[i] builds or changes these squares (with neighbours: also the directions of the ways next to them, as a
+        removed way or a new depot changes them); later sign checks skip such squares."""
+        for p in squares:
+            for dx, dy in ((0, 0), (0, -1), (1, 0), (0, 1), (-1, 0)) if neighbours else ((0, 0),):
+                self.touched.setdefault((p[0] + dx, p[1] + dy), i)
 
     def existing_route(self, a, b, waytype):
         """The squares from a to b along the existing way of a waytype, as the way builder routes it (plan_way with
@@ -749,6 +801,7 @@ class _Checker:
         bridge = self.desc(i, t, "bridge", op["bridge"]) if op.get("bridge") else None
         tunnel = self.desc(i, t, "tunnel", op["tunnel"]) if op.get("tunnel") else None
         if way is None or (op.get("bridge") and bridge is None) or (op.get("tunnel") and tunnel is None):
+            self.touch(i, l_path(op["from"], op["to"]))   # no sign errors that only follow from this one
             return
         args = dict(pos_args(op["from"]), **pos_args(op["to"], "2"))
         args["way"] = op["way"]
@@ -764,6 +817,7 @@ class _Checker:
         if e or len(tiles) < 2:
             self.err(i, t, "no route from %s to %s: %s" % (pos_text(op["from"]), pos_text(op["to"]),
                                                            e or "the game found no route"))
+            self.touch(i, l_path(op["from"], op["to"]))
             return
         param = plan.get("param")
         if not isinstance(param, str) or not param:
@@ -795,15 +849,19 @@ class _Checker:
                                                 extra)
         self.item(i, label, plan.get("cost") or 0, maint)
         self.show(i, "way", tiles, label, wt)
+        self.touch(i, tiles)
         for a, b in bridges:
             self.show(i, "bridge", straight_squares(a, b), "%s %s -> %s" % (op.get("bridge") or "bridge",
                                                                             pos_text(a), pos_text(b)), wt)
+            self.touch(i, straight_squares(a, b))
         for a, b in tunnels:
             self.show(i, "tunnel", straight_squares(a, b), "%s %s -> %s" % (op.get("tunnel") or "tunnel",
                                                                             pos_text(a), pos_text(b)), wt)
+            self.touch(i, straight_squares(a, b))
 
     def _build_station(self, i, op, built_depots, line_types):
         t = "build_station"
+        self.touch(i, [op["at"]])
         r = self.desc(i, t, "station", op["building"])
         if r is None:
             return
@@ -814,6 +872,7 @@ class _Checker:
         self.show(i, "station", [self.z_at(op["at"], prefer_way=True)], label)
 
     def _build_depot(self, i, op, built_depots, line_types):
+        self.touch(i, [op["at"]], neighbours=True)   # the depot connects the way next to it
         r = self.desc(i, "build_depot", "depot", op["building"])
         if r is None:
             return
@@ -823,12 +882,171 @@ class _Checker:
         self.show(i, "depot", [self.z_at(op["at"], prefer_way=True)], label)
 
     def _build_roadsign(self, i, op, built_depots, line_types):
-        r = self.desc(i, "build_roadsign", "roadsign", op["sign"])
+        t = "build_roadsign"
+        r = self.desc(i, t, "roadsign", op["sign"])
         if r is None:
+            self.touch(i, [op["at"]])
             return
-        label = "%s at %s" % (op["sign"], pos_text(op["at"]))
-        self.item(i, label, r.get("total") or 0, r.get("maintenance") or 0)
+        price = float(r.get("total") or 0)
+        effect = self.sign_square(i, op, price)
+        self.touch(i, [op["at"]])
+        if effect is None:
+            return
+        what, cost = effect
+        label = "%s at %s%s" % (op["sign"], pos_text(op["at"]), {"turn": " (turns the signal there)",
+                                                                  "reverse": " (reverses the sign there)",
+                                                                  "replace": " (replaces the signal there)"}.get(what, ""))
+        self.item(i, label, cost, (r.get("maintenance") or 0) if what in ("new", "replace") else 0)
         self.show(i, "roadsign", [self.z_at(op["at"], prefer_way=True)], label, self.waytype_of("signs", op["sign"]))
+
+    def sign_square(self, i, op, price):
+        """What one click of the game's sign tool does on op["at"], with the rules of tool_build_roadsign_t (simtool.cc,
+        master e37a36d): ("new", price), ("turn", 0) for the same signal, ("reverse", 0) for the same one-way or choose
+        sign, ("replace", price + old price) for another signal; None when the game would refuse it (the error is
+        recorded). Squares an earlier op of the project builds or changes, signs the catalogue does not know and an
+        engine without "dirs" in `tile` are not (fully) checked: a warning says so."""
+        t = "build_roadsign"
+        at, name = op["at"], op["sign"]
+        x, y = at[0], at[1]
+        k = self.touched.get((x, y))
+        if k is not None:
+            self.warn("ops[%d] (%s): ops[%d] builds or changes the square %d,%d before, so the game checks the place of "
+                      "the sign only when it is built" % (i, t, k, x, y))
+            return "new", price
+        sign = self.desc_dict("signs", name)
+        if sign is None or not isinstance(sign.get("waytype"), str):
+            self.warn("ops[%d] (%s): the catalogue of the game does not list '%s' with its waytype, so its place is "
+                      "not checked" % (i, t, name))
+            return "new", price
+        flags = sign.get("flags") if _is_int(sign.get("flags")) else 0
+        signal = bool(flags & SIGN_SIGNAL_TYPE)                    # roadsign_desc_t::is_signal_type()
+        one_way, choose, private = bool(flags & SIGN_ONE_WAY), bool(flags & SIGN_CHOOSE), bool(flags & SIGN_PRIVATE)
+        light = not signal and bool(sign.get("traffic_light"))    # is_traffic_light()
+        wt = sign.get("waytype")
+        kind = "signal" if signal else "sign"
+        reply = self.read("tile", {"x": x, "y": y})
+        e = error_of(reply)
+        if e:
+            self.err(i, t, "cannot read the square %d,%d: %s" % (x, y, e))
+            return None
+        grounds = [g for g in reply.get("grounds") or () if isinstance(g, dict) and isinstance(g.get("pos"), dict)]
+        # the tool works on the ground at x,y,z, without z on the surface (remote_control.cc get_tile_pos)
+        if len(at) == 3:
+            g = next((g for g in grounds if g["pos"].get("z") == at[2]), None)
+        else:
+            g = next((g for g in grounds if g.get("surface")), None)
+        if g is None:
+            self.err(i, t, "there is no ground at %s (heights of the square: %s)"
+                     % (pos_text(at), ", ".join(str(g["pos"].get("z")) for g in grounds) or "none"))
+            return None
+        z = g["pos"].get("z", 0)
+        here = "%d,%d,%d" % (x, y, z)
+        objs = [o for o in g.get("objects") or () if isinstance(o, dict) and o.get("type") not in MOVING]
+
+        def way_wt(o):
+            v = o.get("waytype")
+            return v if isinstance(v, str) else self.waytype_of("ways", o.get("desc") or o.get("name"))
+
+        def fits(o):
+            # tool_intern_koord_to_weg_grund (simtool.cc:350-364): a tram sign needs a tram track, other signs a way
+            # of their waytype (grund_t::hat_weg: a tram track is a track way too)
+            v = way_wt(o)
+            return v == "tram" if wt == "tram" else (v == wt or (wt == "track" and v == "tram"))
+
+        ways = [o for o in objs if o.get("type") == "way"]
+        way = next((o for o in ways if fits(o)), None)
+        if way is None:
+            if any(way_wt(o) is None for o in ways):
+                self.warn("ops[%d] (%s): the waytype of the ways at %s is not known, so the place of the %s is not "
+                          "checked" % (i, t, here, kind))
+                return "new", price
+            elsewhere = [gg["pos"].get("z") for gg in grounds if gg is not g and any(
+                isinstance(o, dict) and o.get("type") == "way" and fits(o) for o in gg.get("objects") or ())]
+            self.err(i, t, "'%s' needs a %s way at %s; the square has %s%s" % (
+                name, wt, here, ", ".join("%s (%s)" % (o.get("desc") or o.get("name"), way_wt(o)) for o in ways)
+                or "no way", "; there is one at z=%s: give at [%d, %d, z]" % (elsewhere[0], x, y) if elsewhere else ""))
+            return None
+        # ... that the company may use: weg_t::get_removal_error (weg.cc:765-771, obj_t::check_owner simobj.cc:129-135)
+        # passes for its own ways, public ways (1) and ways of nobody (-1)
+        if way.get("owner") not in (self.company, 1, -1):
+            self.err(i, t, "the %s way at %s belongs to company %s: the game puts signs only on the company's own "
+                           "ways, public ways and ways of nobody" % (way_wt(way), here, way.get("owner")))
+            return None
+        # no signal next to a road sign and no road sign next to a signal (simtool.cc:5962-5965)
+        types = [o.get("type") for o in objs]
+        if signal and "roadsign" in types:
+            self.err(i, t, "a road sign stands at %s: the game puts no signal on a square with a road sign (remove "
+                           "it first)" % here)
+            return None
+        if not signal and "signal" in types:
+            self.err(i, t, "a signal stands at %s: the game puts no road sign on a square with a signal" % here)
+            return None
+        dirs = way.get("dirs")
+        if not isinstance(dirs, str):
+            self.warn("ops[%d] (%s): the game does not report the directions of ways (an older engine), so the square "
+                      "%s is not checked for switches and dead ends" % (i, t, here))
+        else:
+            r = ribi_of(dirs)
+            shown = dirs or "none"
+            way_desc = self.desc_dict("ways", way.get("desc") or way.get("name")) or {}
+            if way_wt(way) == "air" and way_desc.get("system") == "runway":            # simtool.cc:5971-5974
+                self.err(i, t, "%s is a runway: the game puts no signs on runways" % here)
+                return None
+            if signal and is_threeway(r):                                               # simtool.cc:5976-5979
+                self.err(i, t, "%s is a switch or crossing (way directions %s): the game puts no signals on switches; "
+                               "use a square with two directions (straight track or a curve) before or behind it "
+                               "(tile_info shows the directions as dirs)" % (here, shown))
+                return None
+            if private and not is_straight(r):                                          # simtool.cc:5981-5984
+                self.err(i, t, "'%s' is a private-way sign and needs a straight way; %s has the directions %s"
+                         % (name, here, shown))
+                return None
+            needs_two = one_way or signal                                               # simtool.cc:5986-5994
+            if not ((not needs_two and not light) or (needs_two and is_twoway(r)) or (light and is_threeway(r))):
+                if needs_two and not light:
+                    self.err(i, t, "%s needs a way with exactly two directions (straight or a curve); %s has %s%s"
+                             % ("a signal" if signal else "the one-way sign '%s'" % name, here, shown,
+                                " (a dead end)" if len(dirs) == 1 else " (no connection)" if not dirs
+                                else " (a junction)"))
+                else:
+                    self.err(i, t, "the traffic light '%s' needs a junction of three or four directions; %s has %s"
+                             % (name, here, shown))
+                return None
+        # a sign of the same kind there already (simtool.cc:5996-6000, place_sign_intern 6017-6117)
+        existing = next((o for o in objs if o.get("type") == ("signal" if signal else "roadsign")), None)
+        if existing is None:
+            return "new", price
+        if existing.get("owner") not in (self.company, -1):                           # obj_t::check_owner
+            self.err(i, t, "the %s at %s belongs to company %s: the game does not let this company change it"
+                     % (existing.get("type"), here, existing.get("owner")))
+            return None
+        edesc = existing.get("desc")
+        if not isinstance(edesc, str):
+            self.warn("ops[%d] (%s): a %s stands at %s already: the game turns it when it is the same one, replaces "
+                      "another signal and refuses another road sign (this engine does not tell which one it is)"
+                      % (i, t, existing.get("type"), here))
+            return "new", price
+        now = existing.get("dirs") if isinstance(existing.get("dirs"), str) else "?"
+        if signal:
+            if edesc == name:
+                self.warn("ops[%d] (%s): the same signal stands at %s already (directions %s): the click only turns "
+                          "it, nothing is built and nothing is paid" % (i, t, here, now))
+                return "turn", 0.0
+            old = self.price_of("roadsign", edesc) or 0.0
+            self.warn("ops[%d] (%s): the signal %s at %s is replaced by %s (the game charges the new signal and the "
+                      "removal of the old one)" % (i, t, edesc, here, name))
+            return "replace", price + old
+        if edesc != name:
+            self.err(i, t, "the road sign %s stands at %s: the game replaces only signals; remove it first (remove with "
+                           "kind roadsign)" % (edesc, here))
+            return None
+        if one_way or choose:
+            self.warn("ops[%d] (%s): the same sign stands at %s already (directions %s): the click only reverses it, "
+                      "nothing is paid" % (i, t, here, now))
+            return "reverse", 0.0
+        self.err(i, t, "the same sign %s stands at %s already: a click changes nothing (leave this op out)"
+                 % (name, here))
+        return None
 
     def _build_wayobj(self, i, op, built_depots, line_types):
         t = "build_wayobj"
@@ -909,6 +1127,7 @@ class _Checker:
         cost = 0.0 if error_of(r) else self.removal_cost(r, kind=op.get("kind"), single=True)
         self.item(i, label, cost)
         self.show(i, "remove", [self.z_at(op["at"])], label)
+        self.touch(i, [op["at"]], neighbours=True)   # a removed way changes the directions of the ways next to it
 
     def _remove_way(self, i, op, built_depots, line_types):
         wt = REMOVE_WAYTYPE_NAME[REMOVE_WAYTYPES[op["waytype"]]]
@@ -927,6 +1146,7 @@ class _Checker:
         label = "remove %s way %s -> %s (%d squares)" % (op["waytype"], pos_text(a), pos_text(b), len(tiles))
         self.item(i, label, cost)
         self.show(i, "remove", tiles, label, wt)
+        self.touch(i, tiles, neighbours=True)
 
     def _stop_tiles(self, stops):
         return [self.z_at(s["at"], prefer_halt=True) for s in stops]

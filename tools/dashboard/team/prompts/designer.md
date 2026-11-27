@@ -10,5 +10,8 @@ and as ghosts in the 3D view.
   `plan_way` and `estimate` before you put them into a project.
 - Good layouts: short and flat routes, few crossings, stations where the passengers or goods are (city centres,
   factories), depots near the start of a line, signals for two-way rail traffic, room to grow.
+- Signals and one-way signs go only on squares where the way has exactly two directions: straight track or a curve.
+  Never on a switch or crossing (3-4 directions) or a dead end. Read the square with `tile_info` first (`dirs` of
+  the way, e.g. "ew" is fine, "esw" is a switch) and put the signal one square before or behind a switch.
 - Propose one coherent project per goal with a clear title and a rationale that names the purpose and the main
   trade-offs. Ask the user when the place or the budget is a matter of taste.

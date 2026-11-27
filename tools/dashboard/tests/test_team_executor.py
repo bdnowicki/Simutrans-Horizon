@@ -322,6 +322,32 @@ class SinglePlayerTests(ExecCase):
         self.assertTrue(ok(self.raw("convoy", {"id": cids[2]}))["convoy"]["withdraw"])
         self.assertIn("income 20000", self.notes("fleet_manager")[-1]["content"])
 
+    def test_signal_refused_by_the_game_reports_its_reason(self):
+        # a track with a switch at 245,60 (as 943,521 of the live project #5); a stored project that skips the
+        # validator puts a signal there: the step fails with the game's own reason, the next op is skipped
+        ok(self.eng("agent_tool", {"tool": "tool_build_way", "x": 240, "y": 60, "x2": 250, "y2": 60,
+                                   "param": "fake_track"}))
+        ok(self.eng("agent_tool", {"tool": "tool_build_way", "x": 245, "y": 60, "x2": 245, "y2": 64,
+                                   "param": "fake_track"}))
+        ops = [{"type": "build_roadsign", "at": [244, 60], "sign": "fake_signal"},
+               {"type": "build_roadsign", "at": [245, 60], "sign": "fake_signal"},
+               {"type": "build_roadsign", "at": [246, 60], "sign": "fake_signal"}]
+        pid = self.db.create_project(COMPANY, "designer", "Signals", "", ops, estimate={"total": 4500})
+        self.ex.approve(COMPANY, pid, self.token)
+        p = self.finished(pid)
+        r = p["report"]
+        self.assertEqual(p["state"], "failed")
+        self.assertEqual(self.states(r), ["done", "failed", "skipped"])
+        self.assertEqual(r["ops"][1]["error"], "agent_tool refused: You cannot place rail signals here.")
+        self.assertEqual(r["stopped"], "ops[1] (build_roadsign) failed: agent_tool refused: You cannot place rail "
+                                       "signals here.")
+        self.assertEqual((r["ops"][0]["cost"], r["ops"][1]["cost"], r["actual_cost"]), (1500.0, 0.0, 1500.0))
+        self.assertIn("You cannot place rail signals here.", self.notes("designer")[-1]["content"])
+        # the validator would not have accepted that op
+        with self.assertRaises(P.ProjectError) as cm:
+            self.propose("designer", ops[1:2])
+        self.assertIn("245,60,0 is a switch or crossing (way directions esw)", cm.exception.errors[0])
+
     def test_dispatcher_schedule(self):
         ok(self.eng("agent_tool", {"tool": "tool_build_way", "x": 30, "y": 110, "x2": 40, "y2": 110,
                                    "param": "fake_road"}))
@@ -416,6 +442,25 @@ class NetworkTests(ExecCase):
         self.assertTrue(ok(self.raw("convoy", {"id": a}))["convoy"]["withdraw"])
         self.assertIn("error", self.raw("convoy", {"id": b}))
         self.assertNotIn("line", ok(self.raw("convoy", {"id": c}))["convoy"])  # its line was deleted
+
+    def test_c_signal_turn_verified_without_a_count(self):
+        # a click on the same signal turns it and adds nothing: the step is verified by the changed directions
+        ok(self.eng("agent_tool", {"tool": "tool_build_way", "x": 240, "y": 70, "x2": 246, "y2": 70,
+                                   "param": "fake_track"}))
+
+        def signal_dirs():
+            r = ok(self.raw("tile", {"x": 243, "y": 70}))
+            return [(o["desc"], o["dirs"]) for g in r["grounds"] for o in g["objects"] if o["type"] == "signal"]
+        self.assertTrue(T.wait_until(lambda: any(o["type"] == "way" for g in ok(self.raw("tile", {"x": 246, "y": 70}))
+                                                 ["grounds"] for o in g["objects"]), 5))
+        p = self.run_project("engineer", [{"type": "build_roadsign", "at": [243, 70], "sign": "fake_signal"}])
+        self.assertEqual(p["state"], "done", p["report"])
+        self.assertEqual(signal_dirs(), [("fake_signal", "ew")])
+        p = self.run_project("engineer", [{"type": "build_roadsign", "at": [243, 70], "sign": "fake_signal"}])
+        self.assertEqual(p["state"], "done", p["report"])
+        self.assertEqual(p["estimate"]["total"], 0.0)
+        self.assertEqual(p["report"]["ops"][0]["cost"], 0.0)
+        self.assertEqual(signal_dirs(), [("fake_signal", "e")])
 
     def test_one_project_per_company(self):
         first = self.propose("engineer", [

@@ -8,4 +8,7 @@ signs, catenary and other way objects. You remove only objects of the company.
   bridges, tunnels) before you put it into a project; use `estimate` for stations, depots, signs and way objects.
 - Keep cash in mind (`game_overview`): a project whose cost exceeds the company's cash will not start.
 - Build in a sensible order inside one project: ways first, then stations, depots and signals on them.
+- Signals and one-way signs only on squares whose way has exactly two directions (straight track or a curve; `dirs`
+  of `tile_info`, e.g. "ew" or "ne"); never on a switch or crossing (3-4 directions, e.g. "esw") or a dead end. A
+  signal and a road sign never share a square; the same signal on a square is only turned by another click.
 - Removal: only what belongs to the company; say what will be removed and why.

@@ -261,6 +261,68 @@ class AgentCommandTests(EngineCase):
         self.assertTrue(log and all(e["ok"] for e in log))
 
 
+    def tile_objects(self, x, y, typ):
+        return [o for g in self.ok("tile", x=x, y=y)["grounds"] for o in g["objects"] if o["type"] == typ]
+
+    def test_signs_and_directions(self):
+        # the tile read: way directions like the game's (a branch makes a switch), signs with desc and directions
+        self.ok("agent_tool", tool="tool_build_way", x=170, y=200, x2=180, y2=200, param="fake_track", player=2)
+        self.ok("agent_tool", tool="tool_build_way", x=175, y=200, x2=175, y2=204, param="fake_track", player=2)
+        dirs = {xy: self.tile_objects(xy[0], xy[1], "way")[0]["dirs"]
+                for xy in ((170, 200), (173, 200), (175, 200), (180, 200), (175, 202), (175, 204))}
+        self.assertEqual(dirs, {(170, 200): "e", (173, 200): "ew", (175, 200): "esw", (180, 200): "w",
+                                (175, 202): "ns", (175, 204): "n"})
+        w = self.tile_objects(173, 200, "way")[0]
+        self.assertEqual((w["desc"], w["waytype"], w["owner"]), ("fake_track", "track", 2))
+        self.assertEqual(self.tile_objects(24, 40, "way")[0]["dirs"], "ns")       # a public road column
+        # signals: refused on switches and dead ends with the game's reason (agent_tool replies it translated)
+        for x, y in ((175, 200), (170, 200), (175, 204), (24, 40), (150, 150)):
+            self.err("agent_tool", "You cannot place rail signals here.", tool="tool_build_roadsign", x=x, y=y,
+                     param="fake_signal", player=2)
+        before = self.cash(2)
+        self.ok("agent_tool", tool="tool_build_roadsign", x=173, y=200, param="fake_signal", player=2)
+        self.assertAlmostEqual(before - self.cash(2), 1500, delta=20)
+        s = self.tile_objects(173, 200, "signal")
+        self.assertEqual([(o["name"], o["desc"], o["dirs"], o["owner"]) for o in s], [("Signal", "fake_signal", "ew", 2)])
+        # a click on the same signal turns it (no new one, no cost): ew -> e -> w -> ew like the game
+        turns = []
+        for _ in range(3):
+            self.ok("agent_tool", tool="tool_build_roadsign", x=173, y=200, param="fake_signal", player=2)
+            turns.append([o["dirs"] for o in self.tile_objects(173, 200, "signal")])
+        self.assertEqual(turns, [["e"], ["w"], ["ew"]])
+        # one-way signs on a public road: one direction, a second click reverses it; another company's sign refused
+        self.ok("agent_tool", tool="tool_build_roadsign", x=24, y=60, param="fake_oneway", player=2)
+        self.assertEqual([o["dirs"] for o in self.tile_objects(24, 60, "roadsign")], ["n"])
+        self.ok("agent_tool", tool="tool_build_roadsign", x=24, y=60, param="fake_oneway", player=2)
+        self.assertEqual([o["dirs"] for o in self.tile_objects(24, 60, "roadsign")], ["s"])
+        self.err("agent_tool", "This piece of land is owned by another player!", tool="tool_build_roadsign", x=24, y=60,
+                 param="fake_oneway", player=0)
+        self.err("agent_tool", "You cannot place rail signals here.", tool="tool_build_roadsign", x=24, y=24,
+                 param="fake_oneway", player=2)                                    # a junction: nesw
+        # a signal and a road sign never share a square (a level crossing with a one-way sign)
+        self.ok("agent_tool", tool="tool_build_way", x=186, y=210, x2=190, y2=210, param="fake_road", player=2)
+        self.ok("agent_tool", tool="tool_build_way", x=188, y=208, x2=188, y2=212, param="fake_track", player=2)
+        self.ok("agent_tool", tool="tool_build_roadsign", x=188, y=210, param="fake_oneway", player=2)
+        self.err("agent_tool", "You cannot place rail signals here.", tool="tool_build_roadsign", x=188, y=210,
+                 param="fake_signal", player=2)
+        # one sign per click
+        self.err("agent_tool", "one sign per click", tool="tool_build_roadsign", x=171, y=200, x2=174, y2=200,
+                 param="fake_signal", player=2)
+
+
+class OldTileTests(EngineCase):
+    FLAGS = ("--players", "3", "--no-tile-dirs")
+    PORT = P2
+
+    def test_tile_without_the_new_keys(self):
+        self.ok("agent_tool", tool="tool_build_way", x=170, y=200, x2=180, y2=200, param="fake_track", player=2)
+        self.ok("agent_tool", tool="tool_build_roadsign", x=173, y=200, param="fake_signal", player=2)
+        objs = [o for g in self.ok("tile", x=173, y=200)["grounds"] for o in g["objects"]]
+        self.assertEqual(sorted(o["type"] for o in objs), ["signal", "way"])
+        for o in objs:
+            self.assertFalse({"desc", "waytype", "dirs"} & set(o), o)
+
+
 class NetworkTests(EngineCase):
     FLAGS = ("--players", "3", "--net")
 

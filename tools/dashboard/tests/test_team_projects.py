@@ -544,5 +544,169 @@ class EstimateTests(ProjectCase):
                                         "vehicles": ["Fake coach"]}], "does not fit a road depot")
 
 
+def build_sign_squares(eng, raw):
+    """Tracks, a crossing and signs for the sign checks (fake world; public road columns and rows at 24, 56, ...):
+    company 2: a track 200..210 x 100 with a branch 205,100 -> 205,105 (205,100 a switch "esw", 210,100 and 205,105
+    dead ends), a signal at 207,100, a road 218..222 x 100 crossed by a track 220,98 -> 220,102 with a one-way sign
+    on the crossing, a one-way sign on the public road at 24,48; company 0: a track 200..206 x 110 and a one-way sign
+    on the public road at 24,52."""
+    ok(eng("agent_tool", {"tool": "tool_build_way", "x": 200, "y": 100, "x2": 210, "y2": 100, "param": "fake_track"}))
+    ok(eng("agent_tool", {"tool": "tool_build_way", "x": 205, "y": 100, "x2": 205, "y2": 105, "param": "fake_track"}))
+    ok(eng("agent_tool", {"tool": "tool_build_roadsign", "x": 207, "y": 100, "param": "fake_signal"}))
+    ok(eng("agent_tool", {"tool": "tool_build_way", "x": 218, "y": 100, "x2": 222, "y2": 100, "param": "fake_road"}))
+    ok(eng("agent_tool", {"tool": "tool_build_way", "x": 220, "y": 98, "x2": 220, "y2": 102, "param": "fake_track"}))
+    ok(eng("agent_tool", {"tool": "tool_build_roadsign", "x": 220, "y": 100, "param": "fake_oneway"}))
+    ok(eng("agent_tool", {"tool": "tool_build_roadsign", "x": 24, "y": 48, "param": "fake_oneway"}))
+    ok(raw("agent_tool", {"tool": "tool_build_way", "x": 200, "y": 110, "x2": 206, "y2": 110, "param": "fake_track",
+                          "player": 0}))
+    ok(raw("agent_tool", {"tool": "tool_build_roadsign", "x": 24, "y": 52, "param": "fake_oneway", "player": 0}))
+
+
+def sign_op(at, sign="fake_signal"):
+    return {"type": "build_roadsign", "at": at, "sign": sign}
+
+
+class SignTests(ProjectCase):
+    """The place of a sign or signal is checked with the game's rules before a project is accepted (the failed step
+    of the live project #5: a rail signal on a switch)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        build_sign_squares(cls.eng, cls.raw)
+
+    def dirs(self, x, y, typ="way", waytype=None):
+        objs = [o for g in ok(self.raw("tile", {"x": x, "y": y}))["grounds"] for o in g["objects"]
+                if o["type"] == typ and (waytype is None or o.get("waytype") == waytype)]
+        return objs[0].get("dirs") if objs else None
+
+    def test_the_squares(self):
+        # the tile read reports the directions like the game: switch, straight, dead ends, the crossing
+        self.assertEqual([self.dirs(205, 100), self.dirs(203, 100), self.dirs(210, 100), self.dirs(205, 105)],
+                         ["esw", "ew", "w", "n"])
+        self.assertEqual((self.dirs(220, 100, waytype="road"), self.dirs(220, 100, waytype="track")), ("ew", "ns"))
+        self.assertEqual((self.dirs(24, 40), self.dirs(24, 24)), ("ns", "nesw"))
+
+    def test_signal_on_a_switch_refused(self):
+        errors = self.refused("designer", [sign_op([205, 100, 0])],
+                              "ops[0] (build_roadsign): 205,100,0 is a switch or crossing (way directions esw): the "
+                              "game puts no signals on switches", "tile_info")
+        self.assertEqual(len(errors), 1)
+        # without z the surface: the same
+        self.refused("engineer", [sign_op([205, 100])], "205,100,0 is a switch or crossing")
+
+    def test_signal_on_straight_track_and_curve_accepted(self):
+        p = self.propose("designer", [sign_op([203, 100])])
+        self.assertEqual(p["state"], "proposed")
+        self.assertEqual([it["cost"] for it in p["estimate"]["items"]], [1500.0])
+        self.assertEqual(p["estimate"]["maintenance_month"], 8)
+        self.assertFalse([w for w in p["estimate"]["warnings"] if "build_roadsign" in w])
+        self.assertEqual(p["preview"]["items"][0]["kind"], "roadsign")
+        self.assertEqual(p["preview"]["items"][0]["waytype"], "track")
+
+    def test_dead_ends_and_missing_ways_refused(self):
+        self.refused("engineer", [sign_op([210, 100]), sign_op([205, 105]), sign_op([150, 140]), sign_op([24, 40]),
+                                  sign_op([203, 100, 3]), sign_op([24, 24], "fake_oneway")],
+                     "ops[0] (build_roadsign): a signal needs a way with exactly two directions (straight or a curve); "
+                     "210,100,0 has w (a dead end)",
+                     "ops[1] (build_roadsign): a signal needs a way with exactly two directions",
+                     "ops[2] (build_roadsign): 'fake_signal' needs a track way at 150,140,0; the square has no way",
+                     "ops[3] (build_roadsign): 'fake_signal' needs a track way at 24,40,0; the square has fake_road (road)",
+                     "ops[4] (build_roadsign): there is no ground at 203,100,3 (heights of the square: 0)",
+                     "ops[5] (build_roadsign): the one-way sign 'fake_oneway' needs a way with exactly two directions",
+                     "24,24,0 has nesw (a junction)")
+
+    def test_owners(self):
+        # signs on public roads are allowed (the game lets every company use them), not on other companies' ways
+        p = self.propose("engineer", [sign_op([24, 44], "fake_oneway")])
+        self.assertEqual(p["estimate"]["items"][0]["cost"], 300.0)
+        self.refused("engineer", [sign_op([203, 110])], "the track way at 203,110,0 belongs to company 0")
+        self.refused("engineer", [sign_op([24, 52], "fake_oneway")],
+                     "the roadsign at 24,52,0 belongs to company 0: the game does not let this company change it")
+
+    def test_existing_signs(self):
+        # the same signal: a click only turns it (no cost, a warning); the same one-way sign: reversed
+        p = self.propose("engineer", [sign_op([207, 100]), sign_op([24, 48], "fake_oneway")])
+        est = p["estimate"]
+        self.assertEqual([it["cost"] for it in est["items"]], [0.0, 0.0])
+        self.assertEqual(est["total"], 0.0)
+        self.assertIn("(turns the signal there)", est["items"][0]["label"])
+        self.assertTrue(any("ops[0] (build_roadsign): the same signal stands at 207,100,0 already (directions ew): "
+                            "the click only turns it" in w for w in est["warnings"]), est["warnings"])
+        self.assertTrue(any("ops[1] (build_roadsign): the same sign stands at 24,48,0 already" in w
+                            and "reverses" in w for w in est["warnings"]), est["warnings"])
+        # a signal and a road sign never share a square (the level crossing at 220,100 has a one-way sign)
+        self.refused("engineer", [sign_op([220, 100])],
+                     "a road sign stands at 220,100,0: the game puts no signal on a square with a road sign")
+
+    def test_square_changed_by_an_earlier_op(self):
+        # the way is built by the same project: the square cannot be read yet, the check is skipped with a warning
+        p = self.propose("engineer", [{"type": "build_way", "from": [230, 100], "to": [236, 100], "way": "fake_track"},
+                                      sign_op([233, 100])])
+        self.assertTrue(any("ops[1] (build_roadsign): ops[0] builds or changes the square 233,100 before" in w
+                            for w in p["estimate"]["warnings"]), p["estimate"]["warnings"])
+        self.assertEqual(p["estimate"]["items"][1]["cost"], 1500.0)
+        # a removal next to a square changes its directions too: skipped as well
+        p = self.propose("engineer", [{"type": "remove", "at": [206, 100]}, sign_op([205, 100])])
+        self.assertTrue(any("ops[1] (build_roadsign): ops[0] builds or changes the square 205,100" in w
+                            for w in p["estimate"]["warnings"]), p["estimate"]["warnings"])
+
+    def test_op_help_names_the_rule(self):
+        desc = P.ops_schema("engineer")["items"]["properties"]["type"]["description"]
+        self.assertIn("never on a switch or crossing", desc)
+        self.assertIn("tile_info", desc)
+
+
+class TileInfoToolTests(unittest.TestCase):
+    """The team's tile_info tool passes the directions and pak names of ways and signs on (no game needed)."""
+
+    def test_dirs_and_desc(self):
+        from team import tools as team_tools
+
+        class Ctx:
+            def read(self, command, args):
+                assert command == "tile"
+                return {"grounds": [{"pos": {"x": 943, "y": 521, "z": -2}, "type": "Rail_400_Tracks", "surface": True,
+                                     "water": False, "slope": 0, "objects": [
+                                         {"type": "way", "name": "Rail_400_Tracks", "owner": 0,
+                                          "desc": "Rail_400_Tracks", "waytype": "track", "dirs": "esw"},
+                                         {"type": "signal", "name": "Signal", "owner": 0,
+                                          "desc": "Modern_Signals_right", "waytype": "track", "dirs": "e<x>"},
+                                         {"type": "building", "name": "Stop", "owner": 0}]}]}
+        data, summary = team_tools.t_tile_info(Ctx(), {"x": 943, "y": 521})
+        objs = data["grounds"][0]["objects"]
+        self.assertEqual(objs[0], {"type": "way", "name": "Rail_400_Tracks", "owner": 0, "waytype": "track",
+                                   "dirs": "esw"})
+        self.assertEqual(objs[1], {"type": "signal", "name": "Signal", "owner": 0, "desc": "Modern_Signals_right",
+                                   "waytype": "track", "dirs": "e"})
+        self.assertEqual(objs[2], {"type": "building", "name": "Stop", "owner": 0})
+        self.assertIn("3-4 = a switch", data["dirs"])
+        self.assertIn("directions", team_tools.TOOLS["tile_info"][1])
+
+
+class OldEngineSignTests(ProjectCase):
+    """An engine whose tile read has no dirs and desc yet (before this check): warnings, no refusals."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.proc = start_fake(cls, "--no-tile-dirs")
+        cls.eng = staticmethod(company_engine(cls.raw, COMPANY))
+        build_sign_squares(cls.eng, cls.raw)
+
+    def test_warnings_instead_of_refusals(self):
+        self.assertNotIn("dirs", next(o for g in ok(self.raw("tile", {"x": 205, "y": 100}))["grounds"]
+                                      for o in g["objects"] if o["type"] == "way"))
+        p = self.propose("designer", [sign_op([205, 100]), sign_op([207, 100])])
+        warnings = p["estimate"]["warnings"]
+        self.assertTrue(any("ops[0] (build_roadsign): the game does not report the directions of ways (an older "
+                            "engine)" in w for w in warnings), warnings)
+        self.assertTrue(any("ops[1] (build_roadsign): a signal stands at 207,100,0 already" in w
+                            and "does not tell which one" in w for w in warnings), warnings)
+        self.assertEqual([it["cost"] for it in p["estimate"]["items"]], [1500.0, 1500.0])
+        # what the older engine can tell is still checked: ways, waytypes (from the catalogue) and owners
+        self.refused("designer", [sign_op([24, 40])], "needs a track way at 24,40,0")
+        self.refused("designer", [sign_op([203, 110])], "belongs to company 0")
+
+
 if __name__ == "__main__":
     unittest.main()

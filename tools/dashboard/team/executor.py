@@ -299,14 +299,36 @@ class _Run:
             self.wait(check, "the depot at %s" % P.pos_text(at))
         return {"at": at}
 
+    def signs_at(self, pos):
+        """The signs and signals on a square (all grounds) as a comparable list of (z, type, desc or name, dirs,
+        owner); None when unreadable. A click of the sign tool adds one, turns the same signal (dirs change), reverses
+        a one-way sign or replaces another signal (desc changes): any of these changes the list."""
+        r = self.read("tile", {"x": pos[0], "y": pos[1]})
+        if r is None:
+            return None
+        out = []
+        for g in r.get("grounds") or ():
+            if not isinstance(g, dict):
+                continue
+            z = (g.get("pos") or {}).get("z", 0)
+            for o in g.get("objects") or ():
+                if isinstance(o, dict) and o.get("type") in P.SIGNS:
+                    out.append((z, o.get("type"), str(o.get("desc") or o.get("name")), str(o.get("dirs")),
+                                o.get("owner")))
+        return sorted(out)
+
     def op_build_roadsign(self, i, op):
         at = op["at"]
-        n0 = self.count(at, ("roadsign", "signal"))
+        before = self.signs_at(at)
+        # one click: the sign tool works on a single square with one position (two positions mean a row of signs)
         r = self.send("agent_tool", dict(P.pos_args(at), tool="tool_build_roadsign", param=op["sign"]))
         if is_pending(r):
             def check():
-                n = self.count(at, ("roadsign", "signal"))
-                return n0 is not None and n is not None and n > n0
+                # not a count: a click on the same signal turns it without adding one
+                now = self.signs_at(at)
+                if before is not None and now is not None and now != before:
+                    return True
+                return self.spent_now() > 0
             self.wait(check, "the sign at %s" % P.pos_text(at))
         return {"at": at}
 
