@@ -3,7 +3,8 @@
  * (see LICENSE.txt)
  *
  * Simutrans-Horizon, 2026-11: tool availability honours the option "Show future objects",
- *                             tool visibility rules for -remote_control
+ *                             tool visibility rules for -remote_control,
+ *                             two_click_tool_t::check_first_click() for -remote_control
  */
 
 #include <string>
@@ -1434,6 +1435,21 @@ bool two_click_tool_t::is_work_here_keeps_game_state(player_t* player, koord3d p
 		// set starting position only
 		return true;
 	}
+}
+
+
+// Simutrans-Horizon: is_valid_pos of a first click without its preview, see simmenu.h
+uint8 two_click_tool_t::check_first_click(player_t* player, koord3d pos, const char*& error)
+{
+	error = NULL;
+	if (!is_first_click()) {
+		return 0;
+	}
+	const uint8 value = is_valid_pos(player, pos, error, koord3d::invalid);
+	// a first click shows no preview: remove the dummy grounds and markers is_valid_pos may have added (there is no
+	// start marker before the first click)
+	cleanup(false);
+	return value;
 }
 
 

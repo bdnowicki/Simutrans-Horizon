@@ -1427,6 +1427,63 @@ static const char *cmd_screen_pos(const args_t &a, json_t &j)
 }
 
 
+static const char *waytype_name(waytype_t wt);
+static const char *way_waytype_name(const way_desc_t *desc);
+
+
+/// directions as letters in the order n, e, s, w (e.g. "ew", "esw", "nesw"; "" for none)
+static std::string ribi_letters(ribi_t::ribi r)
+{
+	static const char letters[4] = { 'n', 'e', 's', 'w' };
+	std::string s;
+	for (int i = 0; i < 4; i++) {
+		if (r & ribi_t::nesw[i]) {
+			s += letters[i];
+		}
+	}
+	return s;
+}
+
+
+/// tile: the pak name, waytype and directions of a way, sign, signal or way object (nothing for other objects)
+static void write_tile_object_details(json_t &j, const obj_t *obj)
+{
+	switch (obj->get_typ()) {
+		case obj_t::way: {
+			const weg_t *w = static_cast<const weg_t *>(obj);
+			if (const way_desc_t *desc = w->get_desc()) {
+				j.kv("desc", desc->get_name());
+				j.kv("waytype", way_waytype_name(desc));
+			}
+			// the connections of the way, unmasked (one-way signs and signals hide none)
+			j.kv("dirs", ribi_letters(w->get_ribi_unmasked()).c_str());
+			break;
+		}
+		case obj_t::roadsign:
+		case obj_t::signal: {
+			const roadsign_t *rs = static_cast<const roadsign_t *>(obj);
+			if (const roadsign_desc_t *desc = rs->get_desc()) {
+				j.kv("desc", desc->get_name());
+				j.kv("waytype", waytype_name(desc->get_wtyp()));
+			}
+			j.kv("dirs", ribi_letters(rs->get_dir()).c_str());
+			break;
+		}
+		case obj_t::wayobj: {
+			const wayobj_t *wo = static_cast<const wayobj_t *>(obj);
+			if (const way_obj_desc_t *desc = wo->get_desc()) {
+				j.kv("desc", desc->get_name());
+				j.kv("waytype", waytype_name(desc->get_wtyp()));
+			}
+			j.kv("dirs", ribi_letters(wo->get_dir()).c_str());
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+
 static const char *cmd_tile(const args_t &a, json_t &j)
 {
 	karte_t *welt = world();
@@ -1464,6 +1521,7 @@ static const char *cmd_tile(const args_t &a, json_t &j)
 			j.kv("type", obj_type_name(obj->get_typ()));
 			j.kv("name", obj->get_name());
 			j.kv("owner", owner_of(obj->get_owner_nr()));
+			write_tile_object_details(j, obj);
 			j.end_obj();
 		}
 		j.end_arr();
@@ -2455,11 +2513,102 @@ static const char *parse_work_tool(const std::string &s, uint16 &id)
 
 
 /**
+ * A text of the game on one line: the line breaks of the narrow message windows become spaces, a word broken with a
+ * hyphen at the end of a line is joined again ("aufge-\nstellt"), runs of white space become one space, no space at
+ * the ends.
+ */
+static std::string one_line(const char *text)
+{
+	std::string out;
+	bool space = false;
+	for (const char *p = text ? text : ""; *p; p++) {
+		const unsigned char c = (unsigned char)*p;
+		if (c == ' '  ||  c == '\n'  ||  c == '\r'  ||  c == '\t') {
+			const size_t n = out.size();
+			if (c == '\n'  &&  !space  &&  n >= 2  &&  out[n - 1] == '-'  &&  islower((unsigned char)out[n - 2])  &&  islower((unsigned char)p[1])) {
+				out.erase(n - 1); // the hyphen of a broken word
+				continue;
+			}
+			space = n > 0;
+			continue;
+		}
+		if (space) {
+			out += ' ';
+			space = false;
+		}
+		out += (char)c;
+	}
+	return out;
+}
+
+
+/// the reply text of a tool's reason (the untranslated text a tool returns): translated, on one line
+static const char *tool_reason(const char *reason)
+{
+	error_buffer = one_line(translator::translate(reason));
+	if (error_buffer.empty()) {
+		error_buffer = "the tool did not work here (no reason given)";
+	}
+	return error_buffer.c_str();
+}
+
+
+/**
+ * The reply of cmd_tool and cmd_agent_tool when their checks found that a click at pos would not change the game: the
+ * tool's own reason, translated and on one line, and "needs a second position" only when the click would set the
+ * start of a two-click tool. Like the checks themselves it only calls is_valid_pos (two_click_tool_t::
+ * check_first_click), never work(), and leaves no start or preview behind, so nothing changes on this machine alone:
+ * safe on a network server.
+ */
+static const char *tool_no_effect(tool_t *tool, player_t *player, koord3d pos)
+{
+	char where[48];
+	snprintf(where, sizeof(where), "%d,%d,%d", (int)pos.x, (int)pos.y, (int)pos.z);
+	if (tool->is_work_keeps_game_state()) {
+		return "this tool does not change the game (it only shows or selects something)";
+	}
+	two_click_tool_t *two = dynamic_cast<two_click_tool_t *>(tool);
+	if (two == NULL) {
+		return make_error("the tool does nothing at %s", where);
+	}
+	const char *reason = NULL;
+	if (two->check_first_click(player, pos, reason) != 0) {
+		// a valid start: one click there only sets it
+		return make_error("this tool needs a second position x2,y2: one click at %s only sets the start (x2,y2 = x,y works for this square alone)", where);
+	}
+	if (reason == NULL  ||  *reason == 0) {
+		return make_error("the tool cannot work at %s (it gave no reason)", where);
+	}
+	return tool_reason(reason);
+}
+
+
+/**
+ * cmd_tool, cmd_agent_tool: a two-click tool is deleted after its command, also when a check after
+ * is_work_here_keeps_game_state refuses or the second click fails. Its start marker and the preview of is_valid_pos
+ * (the dummy ground of the tunnel tool) must not stay on the map then; when work() already reset the tool, there is
+ * nothing left to remove.
+ */
+struct tool_preview_cleanup_t
+{
+	two_click_tool_t *tool;
+	explicit tool_preview_cleanup_t(tool_t *t) : tool(dynamic_cast<two_click_tool_t *>(t)) {}
+	~tool_preview_cleanup_t()
+	{
+		if (tool) {
+			tool->cleanup(true);
+		}
+	}
+};
+
+
+/**
  * Applies a build/remove tool at map positions like command_x.work() of the script API does:
  * tool=<name or id> x,y[,z] [x2,y2[,z2]] [param=<default parameter>] [player=<nr>] [ctrl=1] [shift=1].
  * The player defaults to the active player; players protected by a password are refused.
- * Single player: {"result":null} or an error. Network game: the tool goes through the server
- * like a click ({"pending":true}), its result is shown in the game.
+ * Single player: {"result":null} or an error (the tool's own reason, translated, on one line).
+ * Network game: the tool goes through the server like a click ({"pending":true}), its result is
+ * shown in the game.
  */
 static const char *cmd_tool(const args_t &a, json_t &j)
 {
@@ -2504,6 +2653,7 @@ static const char *cmd_tool(const args_t &a, json_t &j)
 		tool->flags |= tool_t::WFL_SHIFT;
 	}
 	tool->callback_id = 0;
+	const tool_preview_cleanup_t preview_cleanup(tool.get());
 
 	// the same checks as script_api::param<call_tool_work>::push (script/api/api_command.cc)
 	const uint8 flags = tool->flags; // init() may reset them
@@ -2515,14 +2665,14 @@ static const char *cmd_tool(const args_t &a, json_t &j)
 	}
 	tool->flags = flags;
 	if (tool->is_work_keeps_game_state()  ||  (!twoclick  &&  tool->is_work_here_keeps_game_state(player, start))) {
-		return "Tool has no effects (it cannot work at this position, or it needs a second position x2,y2)";
+		return tool_no_effect(tool.get(), player, start);
 	}
 	if (twoclick) {
 		if (dynamic_cast<two_click_tool_t *>(tool.get()) == NULL) {
 			return "Cannot call this tool with two coordinates";
 		}
 		if (!tool->is_work_here_keeps_game_state(player, start)) {
-			return "First click has side effects";
+			return "First click has side effects (one click at x,y already does the work: leave out x2,y2)";
 		}
 	}
 
@@ -2537,8 +2687,8 @@ static const char *cmd_tool(const args_t &a, json_t &j)
 		err = welt->call_work_api(tool.get(), player, twoclick ? end : start, suspended);
 	}
 	if (err) {
-		// copied, the text may belong to the tool, which is deleted on return
-		return *err ? make_error("%s", err) : "the tool did not work here (no reason given)";
+		// copied (the text may belong to the tool, which is deleted on return), translated, on one line
+		return *err ? tool_reason(err) : "the tool did not work here (no reason given)";
 	}
 	if (suspended) {
 		j.kv("pending", true);
@@ -7550,7 +7700,8 @@ static const char *agent_check_tool_param(uint16 nr, bool has_param, const std::
  * Like the command tool, for the infrastructure tools of agent_tools only: build way, bridge, tunnel, way object,
  * station, roadsign, depot; remove way, way object; the remover. Objects to build must be available now. Before a
  * removal the command predicts everything the tool would remove (whole bridges and tunnels too) and refuses ("cannot
- * remove ...") unless all of it belongs to the company.
+ * remove ...") unless all of it belongs to the company. A tool that refuses answers with its own reason, translated and
+ * on one line (e.g. a signal on a switch: "You cannot place rail signals here.").
  */
 static const char *cmd_agent_tool(const args_t &a, json_t &j)
 {
@@ -7602,8 +7753,10 @@ static const char *cmd_agent_tool(const args_t &a, json_t &j)
 		tool->flags |= tool_t::WFL_SHIFT;
 	}
 	tool->callback_id = 0;
+	// a refusal after the checks below must not leave a start or preview on the map (of this machine only)
+	const tool_preview_cleanup_t preview_cleanup(tool.get());
 
-	// the same checks as cmd_tool
+	// the same checks as cmd_tool (a refusal names the tool's own reason, found without changing anything)
 	const uint8 flags = tool->flags; // init() may reset them
 	if (!tool->is_init_keeps_game_state()) {
 		return "Initializing tool has side effects";
@@ -7613,14 +7766,14 @@ static const char *cmd_agent_tool(const args_t &a, json_t &j)
 	}
 	tool->flags = flags;
 	if (tool->is_work_keeps_game_state()  ||  (!twoclick  &&  tool->is_work_here_keeps_game_state(player, start))) {
-		return "Tool has no effects (it cannot work at this position, or it needs a second position x2,y2)";
+		return tool_no_effect(tool.get(), player, start);
 	}
 	if (twoclick) {
 		if (dynamic_cast<two_click_tool_t *>(tool.get()) == NULL) {
 			return "Cannot call this tool with two coordinates";
 		}
 		if (!tool->is_work_here_keeps_game_state(player, start)) {
-			return "First click has side effects";
+			return "First click has side effects (one click at x,y already does the work: leave out x2,y2)";
 		}
 	}
 
@@ -7665,8 +7818,8 @@ static const char *cmd_agent_tool(const args_t &a, json_t &j)
 		err = welt->call_work_api(tool.get(), player, twoclick ? end : start, suspended);
 	}
 	if (err) {
-		// copied, the text may belong to the tool, which is deleted on return
-		return *err ? make_error("%s", err) : "the tool did not work here (no reason given)";
+		// copied (the text may belong to the tool, which is deleted on return), translated, on one line
+		return *err ? tool_reason(err) : "the tool did not work here (no reason given)";
 	}
 	agent_reply(j, suspended);
 	return NULL;

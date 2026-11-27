@@ -3,7 +3,8 @@
  * (see LICENSE.txt)
  *
  * Simutrans-Horizon, 2026-11: tool visibility rules for -remote_control, toolbar_t::get_tools(),
- *                             check_tool_availability() declared here
+ *                             check_tool_availability() declared here,
+ *                             two_click_tool_t::check_first_click() for -remote_control
  */
 
 #ifndef TOOL_SIMMENU_H
@@ -482,6 +483,16 @@ public:
 	bool move_has_effects() const OVERRIDE { return true; }
 
 	bool is_work_here_keeps_game_state(player_t *, koord3d) OVERRIDE;
+
+	/**
+	 * Simutrans-Horizon: what a first click at @p pos would do, without doing it (for the remote control, which
+	 * explains a refused click also on a network server, where nothing may change on one machine alone).
+	 * @returns the value of is_valid_pos for a first click: 0 = not here (@p error: the tool's untranslated reason,
+	 *          or NULL), 1 = works with this click, 2 = only sets the start, 3 = both; 0 if the tool already has a start.
+	 * Like is_work_here_keeps_game_state it only calls is_valid_pos, and it removes the preview that is_valid_pos may
+	 * add (the dummy ground of tool_build_tunnel_t), so the map is left as it was.
+	 */
+	uint8 check_first_click(player_t *player, koord3d pos, const char *&error);
 
 	/**
 	 * @returns true if cleanup() needs to be called before another tool can be executed

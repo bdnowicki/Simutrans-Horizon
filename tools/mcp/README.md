@@ -97,7 +97,7 @@ Commands marked with a section are described below.
 | `tool_visibility` | action | `tool= visibility=show\|hide\|default [waytype= param=]`, or `clear=1`; see Tool visibility |
 | `unlock_game`, `remove_password` | action | see Tool visibility; single player only |
 | `tile_at`, `screen_pos` | read | conversion between screen position and tile |
-| `tile` | read | `x y [z]` everything on one tile |
+| `tile` | read | `x y` everything on one tile: grounds and their objects, ways with their directions (see below) |
 | `map` | read | `x y w h [layers= features=]` character grids (`map_view`) |
 | `players` | read | paging as below |
 | `cities`, `stations`, `convoys`, `lines`, `factories` | read | paging, see below |
@@ -206,10 +206,33 @@ tool_rotate_building tool_merge_stop tool_set_owner`, case does not matter), an 
 (`tool_exec_script`, `tool_exec_two_click_script`) are refused. `player` defaults to the active
 player; a player protected by a password is refused (unlock it in the game first). Scenario rules
 apply as for the player. `ctrl=1`/`shift=1` act as if the key was held. Replies: `{"result":null}`
-when the tool worked, `{"ok":false,"error":"<text of the game>"}` when it did not (a tool that fails
-without a text gives `the tool did not work here (no reason given)`). In network games the tool
-goes to the server like a click and the reply is `{"pending":true}`; a refusal then shows up in the
-game.
+when the tool worked, `{"ok":false,"error":"<text of the game>"}` when it did not: the tool's own
+reason, translated into the game's language and on one line (e.g. a rail signal on a switch: `You
+cannot place rail signals here.`; a tool that fails without a text gives `the tool did not work here
+(no reason given)`, or `the tool cannot work at x,y,z (it gave no reason)`). The tool is checked
+before anything is sent: when one position cannot do anything there, the reply is the tool's reason;
+`this tool needs a second position x2,y2: one click at x,y,z only sets the start ...` comes only from
+two-click tools for which that click would just set the start (way objects, way removal, the tunnel
+tool underground; `x2,y2 = x,y` works for one square). Two positions where the first click already
+does the work give `First click has side effects (one click at x,y already does the work: leave out
+x2,y2)`. These checks only ask the tool (`is_valid_pos`) and leave no start marker or preview behind,
+so nothing changes on a network server alone. In network games the tool goes to the server like a
+click and the reply is `{"pending":true}`; a refusal then shows up in the game.
+
+`tile x= y=` (read): every ground of the square from the bottom up, `{"grounds":[{"pos":{"x","y","z"},
+"type":"<ground>","surface":bool,"water":bool,"slope":N,"text":"<label>"?,"halt":"<stop>"?,
+"objects":[{"type":"way","name":"..","owner":N},...]}],"city"|"nearest_city":{"name","citizens"}}`
+(`owner` -1 = nobody, 1 = the public player). Ways (`type` `way`) also have `desc` (the pak name),
+`waytype` (`road`, `track`, `tram`, `water`, `monorail`, `maglev`, `narrowgauge`, `air`,
+`powerline`) and `dirs`, the directions the way connects to, as letters in the order n e s w:
+`"ew"` or `"ns"` straight, `"ne"` a curve, `"esw"` or `"nesw"` a switch or crossing, `"w"` a dead end,
+`""` none (unmasked: one-way signs and signals hide nothing). Signs and signals (`roadsign`,
+`signal`; their `name` is only `Roadsign`/`Signal`) and way objects (`wayobj`) have `desc`, `waytype`
+and `dirs` too: the directions a sign or signal stands for (a new signal on straight track `"ew"`,
+a click on it turns it to `"e"`, then `"w"`, then `"ew"` again; a traffic light the open directions
+of its phase), the directions of an overhead line. The game puts rail signals and one-way signs only
+on squares whose way has exactly two directions (no switches, crossings or dead ends), traffic lights
+only on junctions of three or four, never a signal and a road sign on the same square.
 
 ### Agent commands
 
@@ -244,7 +267,12 @@ Common rules (all but `estimate`):
 `tool_remove_wayobj` and `tool_remover`; every other tool gets `... is not allowed for agents ...`.
 The build tools need the name of an object that is available now (`param` of `tool_build_way`:
 `<way>[,[a][k][s][t][,<max length>,<bridge>[,<tunnel>]]]`, `s` = straight; `tool_build_station`:
-`<name>[,<rotation>]`). Before a removal the command predicts everything the tool would remove and
+`<name>[,<rotation>]`). A tool that refuses answers as with `tool`: with its own reason, translated and
+on one line (`tool_build_roadsign` with one position on a switch: `You cannot place rail signals
+here.`), checked before anything is sent, without any change of the game on this machine (a network
+server); "needs a second position" only for two-click tools whose one click would just set a start.
+`tool_build_roadsign` with one position puts up (or turns, see `tile`) one sign; two positions place
+signs along the route. Before a removal the command predicts everything the tool would remove and
 refuses with `cannot remove <what> '<name>' at x,y,z: it belongs to <owner>` unless all of it
 belongs to the company: the remover takes one thing per click in the game's order (a marker, a city
 car - then refused, try again -, a powerline, a sign, the stop building, a way object, a whole bridge,
